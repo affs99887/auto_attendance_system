@@ -170,3 +170,5 @@ cython_debug/
 # PyPI configuration file
 .pypirc
 /.idea/
+/temp_screenshot.png
+/scheduled_tasks.json
