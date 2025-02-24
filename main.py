@@ -1,0 +1,1880 @@
+import cv2
+import pyautogui
+import pytesseract
+import schedule
+import time
+from datetime import datetime, timedelta
+from PIL import Image
+import os
+from dotenv import load_dotenv
+import pyperclip
+import asyncio
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, CallbackQueryHandler
+import sys
+import logging
+from logging.handlers import RotatingFileHandler
+import traceback
+import psutil
+from chinese_calendar import is_workday, is_holiday
+from tasks import TaskManager
+from punch_records import PunchRecordManager
+import telegram
+import win32gui
+import win32con
+import numpy as np
+import re
+
+# 加载环境变量
+load_dotenv()
+
+class TelegramBot:
+    def __init__(self, chat_id):
+        self.token = os.getenv('TELEGRAM_BOT_TOKEN')
+        self.chat_id = chat_id
+        self.app = None
+        self.log_file = 'attendance_system.log'
+        self.attendance_system = None
+        # 添加重试相关配置
+        self.max_retries = 3
+        self.retry_delay = 5  # 秒
+        self.connection_error_count = 0
+        self.max_connection_errors = 10
+        self.last_connection_error = None
+        # 添加轮询监控
+        self.last_update_time = datetime.now()
+        self.update_timeout = 600  # 5分钟无更新则重启轮询
+        self.polling_task = None
+        self.is_polling = False
+        # 添加连接池配置
+        self.connection_pool_size = 100  # 增加连接池大小
+        self.connection_timeout = 30
+        self.pool_timeout = 30
+        self.read_timeout = 30
+        self.write_timeout = 30
+        self.connect_timeout = 30
+        self.pool_maxsize = 100
+
+    async def start_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """处理/start命令"""
+        await update.message.reply_text(
+            "欢迎使用打卡机器人！\n"
+            "支持的命令：\n"
+            "/punch_in - 上班打卡\n"
+            "/punch_out - 下班打卡\n"
+            "/status - 查看状态\n"
+            "/errors - 查看最近错误日志\n"
+            "/kill - 查看并管理定时任务\n"
+            "/kill <任务ID> - 直接删除指定任务"
+        )
+
+    async def punch_in_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """处理上班打卡命令"""
+        if str(update.message.chat_id) != self.chat_id:
+            await update.message.reply_text("您没有权限使用此机器人")
+            return
+        
+        # 检查命令发送时间是否超过5分钟
+        command_time = update.message.date
+        current_time = datetime.now(command_time.tzinfo)  # 使用相同时区
+        time_diff = (current_time - command_time).total_seconds() / 60  # 转换为分钟
+        
+        if time_diff > 5:
+            await update.message.reply_text(f"命令已过期（发送时间：{command_time.strftime('%H:%M:%S')}）\n为确保安全，超过5分钟的命令将不会执行。")
+            return
+        
+        await update.message.reply_text("正在执行上班打卡...")
+        await self.attendance_system.punch_in()
+        # 打卡完成后返回状态
+        await self.status_command(update, context)
+
+    async def punch_out_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """处理下班打卡命令"""
+        if str(update.message.chat_id) != self.chat_id:
+            await update.message.reply_text("您没有权限使用此机器人")
+            return
+        
+        # 检查命令发送时间是否超过5分钟
+        command_time = update.message.date
+        current_time = datetime.now(command_time.tzinfo)  # 使用相同时区
+        time_diff = (current_time - command_time).total_seconds() / 60  # 转换为分钟
+        
+        if time_diff > 5:
+            await update.message.reply_text(f"命令已过期（发送时间：{command_time.strftime('%H:%M:%S')}）\n为确保安全，超过5分钟的命令将不会执行。")
+            return
+        
+        await update.message.reply_text("正在执行下班打卡...")
+        await self.attendance_system.punch_out()
+        # 打卡完成后返回状态
+        await self.status_command(update, context)
+
+    async def status_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """处理状态查询命令"""
+        if str(update.message.chat_id) != self.chat_id:
+            await update.message.reply_text("您没有权限使用此机器人")
+            return
+        
+        try:
+            # 获取系统状态信息
+            current_time = datetime.now()
+            
+            # 获取今日打卡记录
+            punch_in_time = self.attendance_system.today_punch_records['punch_in_time']
+            punch_out_time = self.attendance_system.today_punch_records['punch_out_time']
+            
+            # 获取系统资源使用情况
+            memory = psutil.virtual_memory()
+            cpu_percent = psutil.cpu_percent()
+            
+            # 获取程序运行时间
+            process = psutil.Process()
+            uptime = datetime.now() - datetime.fromtimestamp(process.create_time())
+            hours, remainder = divmod(uptime.total_seconds(), 3600)
+            minutes, seconds = divmod(remainder, 60)
+            
+            # 检查是否在工作时间内和日期类型
+            is_work_time = self.attendance_system.is_work_time(current_time)
+            current_date = current_time.date()
+            is_holiday_today = is_holiday(current_date)
+            is_workday_today = is_workday(current_date)
+            
+            # 格式化状态消息
+            status_text = (
+                "🤖 打卡系统状态\n"
+                "━━━━━━━━━━━━━━━\n"
+                f"📅 当前时间：{current_time.strftime('%Y-%m-%d %H:%M:%S')}\n"
+                f"📌 今日类型：{'🏖️ 节假日' if is_holiday_today else '💼 工作日' if is_workday_today else '🎉 休息日'}\n"
+                f"⏰ 工作状态：{'🟢 工作时间' if is_work_time else '🔴 非工作时间'}\n\n"
+                
+                "📍 今日打卡记录\n"
+                f"上班打卡：{'✅ ' + punch_in_time.strftime('%H:%M:%S') if punch_in_time else '❌ 未打卡'}\n"
+                f"下班打卡：{'✅ ' + punch_out_time.strftime('%H:%M:%S') if punch_out_time else '❌ 未打卡'}\n\n"
+                
+                "⚙️ 系统信息\n"
+                f"运行时长：{int(hours)}小时{int(minutes)}分钟\n"
+                f"内存使用：{memory.percent}%\n"
+                f"CPU使用：{cpu_percent}%\n"
+                f"心跳状态：{'🟢 正常' if self.attendance_system.heartbeat_miss_count == 0 else '🟡 警告'}\n\n"
+                
+                "📋 配置信息\n"
+                f"上班时间：{self.attendance_system.work_start_time}\n"
+                f"下班时间：{self.attendance_system.work_end_time}\n"
+                f"迟到阈值：{self.attendance_system.late_threshold}分钟\n"
+                f"早退阈值：{self.attendance_system.early_leave_threshold}分钟\n"
+            )
+            
+            # 获取定时任务列表
+            saved_tasks = self.attendance_system.task_manager.get_tasks()
+            if saved_tasks:
+                status_text += "\n⏱ 定时任务列表\n"
+                for task in saved_tasks:
+                    if task['type'] == 'punch_out':
+                        next_run = datetime.strptime(task['scheduled_time'], "%H:%M").replace(
+                            year=current_time.year,
+                            month=current_time.month,
+                            day=current_time.day
+                        )
+                        # 如果时间已过，显示明天的时间
+                        if next_run < current_time:
+                            next_run = next_run + timedelta(days=1)
+                        status_text += f"➤ [任务 #{task['id']}] 下班打卡：{next_run.strftime('%Y-%m-%d %H:%M')}\n"
+            else:
+                status_text += "\n⏱ 暂无定时任务\n"
+            
+            await update.message.reply_text(status_text)
+            
+        except Exception as e:
+            error_msg = f"获取状态信息时发生错误: {str(e)}"
+            logging.error(error_msg)
+            await update.message.reply_text(error_msg)
+
+    async def get_recent_errors(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """处理/errors命令，获取最近的错误日志"""
+        if str(update.message.chat_id) != self.chat_id:
+            await update.message.reply_text("您没有权限使用此机器人")
+            return
+            
+        try:
+            # 尝试不同的编码方式读取日志
+            encodings = ['utf-8', 'gbk', 'gb2312', 'gb18030', 'latin1']
+            logs = []
+            
+            for encoding in encodings:
+                try:
+                    with open(self.log_file, 'r', encoding=encoding) as f:
+                        logs = f.readlines()
+                    break  # 如果成功读取，跳出循环
+                except UnicodeDecodeError:
+                    continue  # 如果当前编码失败，尝试下一个
+                except Exception as e:
+                    continue
+            
+            if not logs:
+                await update.message.reply_text("无法读取日志文件，请检查文件是否存在或权限是否正确")
+                return
+                
+            # 筛选出ERROR和CRITICAL级别的日志
+            error_logs = [log for log in logs if 'ERROR' in log or 'CRITICAL' in log]
+            
+            if not error_logs:
+                await update.message.reply_text("没有发现错误日志")
+                return
+                
+            # 只保留最近的50条错误日志（按时间正序）
+            recent_logs = error_logs[-50:]
+            
+            # 格式化日志消息
+            log_message = "最近的错误日志（按时间正序）：\n\n"
+            log_message += "".join(recent_logs)
+            
+            # 如果消息太长，分段发送
+            if len(log_message) > 4000:
+                for i in range(0, len(log_message), 4000):
+                    chunk = log_message[i:i + 4000]
+                    await update.message.reply_text(chunk)
+            else:
+                await update.message.reply_text(log_message)
+                
+        except FileNotFoundError:
+            await update.message.reply_text("日志文件不存在")
+        except Exception as e:
+            error_msg = f"获取日志时发生错误: {str(e)}\n"
+            error_msg += "请检查日志文件权限和编码格式"
+            await update.message.reply_text(error_msg)
+
+    async def send_message(self, title, content):
+        """发送Telegram消息"""
+        if not self.app:
+            return False
+            
+        for retry in range(self.max_retries):
+            try:
+                message = f"{title}\n\n{content}"
+                await self.app.bot.send_message(chat_id=self.chat_id, text=message)
+                # 成功发送后重置错误计数
+                self.connection_error_count = 0
+                self.last_connection_error = None
+                return True
+            except telegram.error.NetworkError as e:
+                self.connection_error_count += 1
+                self.last_connection_error = datetime.now()
+                error_msg = f"发送Telegram消息时发生网络错误 (尝试 {retry + 1}/{self.max_retries}): {str(e)}"
+                print(error_msg)
+                logging.error(error_msg)
+                
+                # 如果不是最后一次重试，等待后继续
+                if retry < self.max_retries - 1:
+                    await asyncio.sleep(self.retry_delay * (retry + 1))
+                    continue
+                    
+                # 如果错误次数过多，可能需要重启程序
+                if self.connection_error_count >= self.max_connection_errors:
+                    error_msg = "网络错误次数过多，准备重启程序..."
+                    print(error_msg)
+                    logging.critical(error_msg)
+                    if self.attendance_system:
+                        await self.attendance_system.restart_program()
+                    return False
+            except Exception as e:
+                error_msg = f"发送Telegram消息时发生其他错误: {str(e)}"
+                print(error_msg)
+                logging.error(error_msg)
+                if retry < self.max_retries - 1:
+                    await asyncio.sleep(self.retry_delay * (retry + 1))
+                    continue
+                return False
+                
+        return False
+
+    async def kill_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """处理/kill命令，用于删除定时任务"""
+        if str(update.message.chat_id) != self.chat_id:
+            await update.message.reply_text("您没有权限使用此机器人")
+            return
+
+        try:
+            # 检查是否有参数
+            if context.args:
+                # 直接删除指定ID的任务
+                try:
+                    task_id = int(context.args[0])
+                    await self._delete_task(task_id, update.message)
+                except ValueError:
+                    await update.message.reply_text("任务ID必须是数字")
+                return
+
+            # 如果没有参数，显示所有任务和删除按钮
+            saved_tasks = self.attendance_system.task_manager.get_tasks()
+            if not saved_tasks:
+                await update.message.reply_text(
+                    "暂无定时任务\n"
+                    "您可以通过以下方式创建定时任务：\n"
+                    "1. 执行下班打卡时，如果未满足工作时长，系统会自动创建定时任务\n"
+                    "2. 等待系统自动检测并创建定时任务"
+                )
+                return
+
+            # 创建任务列表和按钮
+            keyboard = []
+            message_text = "当前的定时任务列表：\n\n"
+            for task in saved_tasks:
+                if task['type'] == 'punch_out':
+                    next_run = datetime.strptime(task['scheduled_time'], "%H:%M").replace(
+                        year=datetime.now().year,
+                        month=datetime.now().month,
+                        day=datetime.now().day
+                    )
+                    # 如果时间已过，显示明天的时间
+                    if next_run < datetime.now():
+                        next_run = next_run + timedelta(days=1)
+                    message_text += f"➤ [任务 #{task['id']}] 下班打卡：{next_run.strftime('%Y-%m-%d %H:%M')}\n"
+                    keyboard.append([
+                        InlineKeyboardButton(
+                            f"删除任务 #{task['id']}",
+                            callback_data=f"kill_{task['id']}"
+                        )
+                    ])
+
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            await update.message.reply_text(message_text, reply_markup=reply_markup)
+
+        except Exception as e:
+            error_msg = f"处理删除任务命令时发生错误: {str(e)}"
+            logging.error(error_msg)
+            await update.message.reply_text(error_msg)
+
+    async def _delete_task(self, task_id, message):
+        """删除指定ID的任务"""
+        task = self.attendance_system.task_manager.get_task_by_id(task_id)
+        if not task:
+            await message.reply_text(f"未找到ID为 {task_id} 的任务")
+            return
+
+        if self.attendance_system.task_manager.remove_task_by_id(task_id):
+            # 清除schedule中的任务
+            schedule.clear()
+            
+            # 重新加载剩余的任务
+            saved_tasks = self.attendance_system.task_manager.get_tasks()
+            for saved_task in saved_tasks:
+                if saved_task['type'] == 'punch_out':
+                    async def retry_punch_out_job():
+                        await self.attendance_system.punch_out()
+                    schedule.every().day.at(saved_task['scheduled_time']).do(retry_punch_out_job)
+
+            await message.reply_text(
+                f"已删除任务:\n"
+                f"ID: {task['id']}\n"
+                f"类型: {task['type']}\n"
+                f"计划时间: {task['scheduled_time']}\n"
+                f"创建时间: {task['created_at']}"
+            )
+        else:
+            await message.reply_text("删除任务失败")
+
+    async def button_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """处理按钮回调"""
+        query = update.callback_query
+        await query.answer()  # 响应按钮点击
+
+        try:
+            if str(query.message.chat_id) != self.chat_id:
+                await query.message.reply_text("您没有权限使用此机器人")
+                return
+
+            # 解析回调数据
+            if query.data.startswith('kill_'):
+                task_id = int(query.data.split('_')[1])
+                task = self.attendance_system.task_manager.get_task_by_id(task_id)
+                
+                if not task:
+                    await query.message.reply_text(f"未找到ID为 {task_id} 的任务")
+                    return
+
+                if self.attendance_system.task_manager.remove_task_by_id(task_id):
+                    # 清除schedule中的任务
+                    schedule.clear()
+                    
+                    # 重新加载剩余的任务
+                    saved_tasks = self.attendance_system.task_manager.get_tasks()
+                    for saved_task in saved_tasks:
+                        if saved_task['type'] == 'punch_out':
+                            async def retry_punch_out_job():
+                                await self.attendance_system.punch_out()
+                            schedule.every().day.at(saved_task['scheduled_time']).do(retry_punch_out_job)
+
+                    # 发送删除成功的消息
+                    await query.message.reply_text(
+                        f"✅ 已删除任务:\n"
+                        f"ID: {task['id']}\n"
+                        f"类型: {task['type']}\n"
+                        f"计划时间: {task['scheduled_time']}\n"
+                        f"创建时间: {task['created_at']}"
+                    )
+                    
+                    # 更新任务列表消息
+                    if not saved_tasks:
+                        await query.message.edit_text("所有任务已删除")
+                        return
+
+                    keyboard = []
+                    message_text = "当前的定时任务列表：\n\n"
+                    for remaining_task in saved_tasks:
+                        if remaining_task['type'] == 'punch_out':
+                            next_run = datetime.strptime(remaining_task['scheduled_time'], "%H:%M").replace(
+                                year=datetime.now().year,
+                                month=datetime.now().month,
+                                day=datetime.now().day
+                            )
+                            # 如果时间已过，显示明天的时间
+                            if next_run < datetime.now():
+                                next_run = next_run + timedelta(days=1)
+                            message_text += f"➤ [任务 #{remaining_task['id']}] 下班打卡：{next_run.strftime('%Y-%m-%d %H:%M')}\n"
+                            keyboard.append([
+                                InlineKeyboardButton(
+                                    f"删除任务 #{remaining_task['id']}",
+                                    callback_data=f"kill_{remaining_task['id']}"
+                                )
+                            ])
+
+                    if keyboard:
+                        reply_markup = InlineKeyboardMarkup(keyboard)
+                        await query.message.edit_text(message_text, reply_markup=reply_markup)
+                    else:
+                        await query.message.edit_text("所有任务已删除")
+                else:
+                    await query.message.reply_text("❌ 删除任务失败")
+
+        except Exception as e:
+            error_msg = f"处理按钮回调时发生错误: {str(e)}"
+            logging.error(error_msg)
+            await query.message.reply_text(error_msg)
+
+    async def start_polling(self):
+        """启动消息轮询"""
+        if self.is_polling:
+            return
+            
+        self.is_polling = True
+        try:
+            # 使用更大的连接池和更长的超时时间
+            await self.app.updater.start_polling(
+                allowed_updates=Update.ALL_TYPES,
+                drop_pending_updates=True,
+                poll_interval=1.0,
+                timeout=self.connection_timeout,
+                read_timeout=self.read_timeout,
+                write_timeout=self.write_timeout,
+                connect_timeout=self.connect_timeout,
+                pool_timeout=self.pool_timeout
+            )
+            logging.info("Telegram Bot 轮询已启动")
+        except Exception as e:
+            self.is_polling = False
+            logging.error(f"启动轮询时发生错误: {str(e)}")
+            # 尝试清理连接池
+            try:
+                await self.cleanup_connections()
+            except Exception as cleanup_error:
+                logging.error(f"清理连接池时发生错误: {str(cleanup_error)}")
+            raise
+
+    async def cleanup_connections(self):
+        """清理连接池"""
+        try:
+            if hasattr(self.app.bot.request, '_client'):
+                await self.app.bot.request._client.aclose()
+            if hasattr(self.app.updater, '_last_update_id'):
+                self.app.updater._last_update_id = None
+        except Exception as e:
+            logging.error(f"清理连接时发生错误: {str(e)}")
+
+    async def stop_polling(self):
+        """停止消息轮询"""
+        if not self.is_polling:
+            return
+            
+        try:
+            await self.app.updater.stop()
+            self.is_polling = False
+            # 清理连接
+            await self.cleanup_connections()
+            logging.info("Telegram Bot 轮询已停止")
+        except Exception as e:
+            logging.error(f"停止轮询时发生错误: {str(e)}")
+
+    async def restart_polling(self):
+        """重启消息轮询"""
+        logging.info("正在重启 Telegram Bot 轮询...")
+        await self.stop_polling()
+        await asyncio.sleep(5)  # 等待5秒后重启
+        
+        # 重新创建应用实例
+        try:
+            if self.app:
+                await self.app.shutdown()
+            self.app = Application.builder().token(self.token).pool_timeout(self.pool_timeout).connect_timeout(self.connect_timeout).read_timeout(self.read_timeout).write_timeout(self.write_timeout).connection_pool_size(self.connection_pool_size).pool_maxsize(self.pool_maxsize).get_updates_connection_pool_size(self.connection_pool_size).build()
+            
+            # 重新注册处理器
+            self.app.add_handler(CommandHandler('start', self.start_command))
+            self.app.add_handler(CommandHandler('punch_in', self.punch_in_command))
+            self.app.add_handler(CommandHandler('punch_out', self.punch_out_command))
+            self.app.add_handler(CommandHandler('status', self.status_command))
+            self.app.add_handler(CommandHandler('errors', self.get_recent_errors))
+            self.app.add_handler(CommandHandler('kill', self.kill_command))
+            self.app.add_handler(CallbackQueryHandler(self.button_callback))
+            
+            # 初始化并启动
+            await self.app.initialize()
+            await self.app.start()
+            await self.start_polling()
+            
+        except Exception as e:
+            logging.error(f"重新创建应用实例时发生错误: {str(e)}")
+            raise
+            
+        self.last_update_time = datetime.now()
+        logging.info("Telegram Bot 轮询重启完成")
+
+    async def monitor_connection(self):
+        """监控连接状态"""
+        while True:
+            try:
+                current_time = datetime.now()
+                time_since_last_update = (current_time - self.last_update_time).total_seconds()
+                
+                if time_since_last_update > self.update_timeout:
+                    logging.warning(f"已超过 {self.update_timeout} 秒未收到更新，准备重启轮询...")
+                    await self.restart_polling()
+                    
+                # 每60秒进行一次测试请求
+                try:
+                    await self.app.bot.get_me()
+                    self.connection_error_count = 0
+                except Exception as e:
+                    self.connection_error_count += 1
+                    logging.error(f"连接测试失败 ({self.connection_error_count}/{self.max_connection_errors}): {str(e)}")
+                    
+                    if self.connection_error_count >= self.max_connection_errors:
+                        logging.critical("连接错误次数过多，准备重启轮询...")
+                        await self.restart_polling()
+                        self.connection_error_count = 0
+                
+                await asyncio.sleep(60)
+            except Exception as e:
+                logging.error(f"监控连接时发生错误: {str(e)}")
+                await asyncio.sleep(60)
+
+    def run(self, attendance_system):
+        """运行Telegram机器人"""
+        self.attendance_system = attendance_system
+        # 配置应用程序，添加连接池和超时设置
+        self.app = Application.builder().token(self.token).pool_timeout(self.pool_timeout).connect_timeout(self.connect_timeout).read_timeout(self.read_timeout).write_timeout(self.write_timeout).connection_pool_size(self.connection_pool_size).pool_maxsize(self.pool_maxsize).get_updates_connection_pool_size(self.connection_pool_size).build()
+        
+        # 注册命令处理器
+        self.app.add_handler(CommandHandler('start', self.start_command))
+        self.app.add_handler(CommandHandler('punch_in', self.punch_in_command))
+        self.app.add_handler(CommandHandler('punch_out', self.punch_out_command))
+        self.app.add_handler(CommandHandler('status', self.status_command))
+        self.app.add_handler(CommandHandler('errors', self.get_recent_errors))
+        self.app.add_handler(CommandHandler('kill', self.kill_command))
+        
+        # 注册按钮回调处理器
+        self.app.add_handler(CallbackQueryHandler(self.button_callback))
+        
+        # 添加更新时间记录
+        async def update_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+            self.last_update_time = datetime.now()
+            self.connection_error_count = 0  # 重置错误计数
+            
+        self.app.add_handler(MessageHandler(filters.ALL, update_handler))
+        
+        # 启动机器人
+        self.app.run_polling(
+            allowed_updates=Update.ALL_TYPES,
+            drop_pending_updates=True,
+            poll_interval=1.0,
+            timeout=self.connection_timeout,
+            read_timeout=self.read_timeout,
+            write_timeout=self.write_timeout,
+            connect_timeout=self.connect_timeout,
+            pool_timeout=self.pool_timeout
+        )
+
+class AttendanceSystem:
+    def __init__(self):
+        # 设置pytesseract路径
+        pytesseract.pytesseract.tesseract_cmd = os.getenv('TESSERACT_PATH', r'C:\Program Files\Tesseract-OCR\tesseract.exe')
+        
+        # 配置信息
+        self.username = os.getenv('LOGIN_USERNAME')
+        self.password = os.getenv('LOGIN_PASSWORD')
+        self.login_url = os.getenv('LOGIN_URL')
+        
+        # 创建Telegram机器人实例
+        self.bot = TelegramBot(os.getenv('TELEGRAM_CHAT_ID'))
+        
+        # 截图保存路径
+        self.screenshot_path = 'logs/temp_screenshot.png'
+        
+        # 添加重试次数配置
+        self.max_retries = 3
+        self.retry_interval = 5  # 秒
+        
+        # 浏览器窗口标题
+        self.browser_title = "Microsoft Edge"
+        
+        # 安全位置图片路径
+        self.safe_place_path = 'templates/safe_place.png'
+        self.safe_place_path2 = 'templates/safe_place2.png'
+        
+        # 用于存储当前进度消息
+        self.current_message = ""
+        self.message_id = None
+        
+        # 添加心跳检测相关属性
+        self.last_heartbeat = datetime.now()
+        self.heartbeat_interval = 300  # 5分钟检测一次
+        self.max_heartbeat_miss = 3    # 最多允许连续失败3次
+        self.heartbeat_miss_count = 0
+        
+        # 配置日志记录
+        self.setup_logging()
+        
+        # 添加错误恢复相关属性
+        self.error_count = 0
+        self.max_errors = 5
+        self.error_reset_interval = 3600  # 1小时重置错误计数
+        self.last_error_reset = datetime.now()
+        
+        # 添加打卡时间配置
+        self.work_start_time = os.getenv('WORK_START_TIME', "09:00")  # 正常上班时间
+        self.work_end_time = os.getenv('WORK_END_TIME', "17:30")      # 正常下班时间
+        self.late_threshold = int(os.getenv('LATE_THRESHOLD', "15"))   # 晚到阈值（分钟）
+        self.early_leave_threshold = int(os.getenv('EARLY_LEAVE_THRESHOLD', "15"))  # 早退阈值（分钟）
+        
+        # 初始化任务管理器和打卡记录管理器
+        self.task_manager = TaskManager()
+        self.punch_record_manager = PunchRecordManager()
+        
+        # 加载今日打卡记录
+        today_record = self.punch_record_manager.get_today_record()
+        self.today_punch_records = {
+            'punch_in_time': datetime.strptime(today_record['punch_in_time'], '%H:%M:%S') if today_record['punch_in_time'] else None,
+            'punch_out_time': datetime.strptime(today_record['punch_out_time'], '%H:%M:%S') if today_record['punch_out_time'] else None
+        }
+        
+        # 设置每日状态推送时间
+        self.daily_status_time = os.getenv('DAILY_STATUS_TIME', "08:20")  # 每日状态推送时间
+        
+        # 初始化定时任务
+        self.init_schedule_tasks()
+
+    def setup_logging(self):
+        """配置日志记录"""
+        # 确保logs目录存在
+        os.makedirs('logs', exist_ok=True)
+        
+        log_formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+        
+        # 创建日志过滤器
+        class TelegramFilter(logging.Filter):
+            def filter(self, record):
+                # 过滤掉 getUpdates 请求的日志
+                return not (record.levelname == 'INFO' and 'getUpdates' in record.getMessage())
+        
+        # 配置文件处理器
+        file_handler = RotatingFileHandler(
+            'logs/attendance_system.log',
+            maxBytes=5*1024*1024,  # 5MB
+            backupCount=3,
+            encoding='utf-8'  # 指定编码为UTF-8
+        )
+        file_handler.setFormatter(log_formatter)
+        file_handler.addFilter(TelegramFilter())
+        
+        # 配置控制台处理器
+        console_handler = logging.StreamHandler(sys.stdout)
+        console_handler.setFormatter(log_formatter)
+        console_handler.addFilter(TelegramFilter())
+        
+        # 配置根日志记录器
+        root_logger = logging.getLogger()
+        root_logger.setLevel(logging.INFO)
+        
+        # 移除所有现有的处理器
+        for handler in root_logger.handlers[:]:
+            root_logger.removeHandler(handler)
+            
+        root_logger.addHandler(file_handler)
+        root_logger.addHandler(console_handler)
+
+    def update_progress(self, new_line):
+        """更新进度消息"""
+        self.current_message += f"\n{new_line}"
+        return self.current_message
+
+    async def send_notification(self, title, content):
+        """发送/更新Telegram消息"""
+        message = self.update_progress(f"{title}: {content}")
+        if self.message_id:
+            try:
+                await self.bot.app.bot.edit_message_text(
+                    chat_id=self.bot.chat_id,
+                    message_id=self.message_id,
+                    text=message
+                )
+            except Exception as e:
+                print(f"更新消息失败: {str(e)}")
+        else:
+            try:
+                message = await self.bot.app.bot.send_message(
+                    chat_id=self.bot.chat_id,
+                    text=message
+                )
+                self.message_id = message.message_id
+            except Exception as e:
+                print(f"发送消息失败: {str(e)}")
+
+    def get_browser_window(self):
+        """获取浏览器窗口句柄"""
+        def callback(hwnd, windows):
+            if not win32gui.IsWindowVisible(hwnd):
+                return True
+            
+            title = win32gui.GetWindowText(hwnd)
+            # Edge浏览器的各种可能标题
+            edge_titles = [
+                "Microsoft Edge",
+                "InPrivate",
+                "新建标签页",
+                "New Tab",
+                self.login_url  # 登录页面的URL
+            ]
+            
+            if any(edge_title in title for edge_title in edge_titles):
+                # 确保窗口不是最小化的
+                placement = win32gui.GetWindowPlacement(hwnd)
+                if placement[1] != win32con.SW_SHOWMINIMIZED:
+                    windows.append(hwnd)
+            return True
+            
+        windows = []
+        win32gui.EnumWindows(callback, windows)
+        
+        if not windows:
+            logging.error("未找到Edge浏览器窗口，已搜索的标题包括：Microsoft Edge, InPrivate, 新建标签页, New Tab")
+            return None
+            
+        # 返回最后打开的窗口（通常是最新的）
+        return windows[-1]
+
+    def take_screenshot(self):
+        """截取浏览器窗口"""
+        try:
+            # 获取浏览器窗口句柄
+            hwnd = self.get_browser_window()
+            if not hwnd:
+                logging.error("未找到浏览器窗口，无法进行截图")
+                return None
+                
+            try:
+                # 获取窗口位置和大小
+                rect = win32gui.GetWindowRect(hwnd)
+                x, y, width, height = rect[0], rect[1], rect[2] - rect[0], rect[3] - rect[1]
+                
+                if width <= 0 or height <= 0:
+                    logging.error(f"窗口大小异常 - 宽: {width}, 高: {height}")
+                    return None
+                
+                # 获取屏幕尺寸
+                screen_width, screen_height = pyautogui.size()
+                
+                # 调整坐标确保在屏幕范围内
+                x = max(0, min(x, screen_width - width))
+                y = max(0, min(y, screen_height - height))
+                width = min(width, screen_width - x)
+                height = min(height, screen_height - y)
+                
+                # 截取指定区域
+                screenshot = pyautogui.screenshot(region=(x, y, width, height))
+                
+                # 转换为OpenCV格式
+                screenshot_cv = cv2.cvtColor(np.array(screenshot), cv2.COLOR_RGB2BGR)
+                
+                return screenshot_cv
+                    
+            except Exception as e:
+                logging.error(f"获取窗口信息或截图时发生错误: {str(e)}")
+                return None
+                
+        except Exception as e:
+            logging.error(f"截图过程发生错误: {str(e)}")
+            return None
+
+    def find_element_by_image(self, template_path, threshold=0.8):
+        """通过图像模板匹配找到元素位置，增加重试机制"""
+        for attempt in range(self.max_retries):
+            screen = self.take_screenshot()
+            if screen is None:
+                print(f"截图失败，{attempt + 1} 次重试...")
+                time.sleep(self.retry_interval)
+                continue
+                
+            template = cv2.imread(template_path)
+            if template is None:
+                raise FileNotFoundError(f"模板图片未找到: {template_path}")
+                
+            # 获取模板尺寸
+            template_height, template_width = template.shape[:2]
+            
+            result = cv2.matchTemplate(screen, template, cv2.TM_CCOEFF_NORMED)
+            min_val, max_val, min_loc, max_loc = cv2.minMaxLoc(result)
+            
+            if max_val >= threshold:
+                # 获取浏览器窗口位置
+                hwnd = self.get_browser_window()
+                if hwnd:
+                    window_x, window_y = win32gui.GetWindowRect(hwnd)[:2]
+                    # 返回相对于屏幕的绝对坐标
+                    center_x = window_x + max_loc[0] + template_width // 2
+                    center_y = window_y + max_loc[1] + template_height // 2
+                    return (center_x, center_y)
+                
+            if attempt < self.max_retries - 1:
+                print(f"未找到元素 {template_path}（匹配度：{max_val:.2f}），{attempt + 1} 次重试...")
+                time.sleep(self.retry_interval)
+                
+        return None
+    
+    def find_element_with_label(self, template_path, label_template_path, threshold=0.8):
+        """通过标签和输入框的组合来定位元素"""
+        for attempt in range(self.max_retries):
+            screen = self.take_screenshot()
+            if screen is None:
+                print(f"截图失败，{attempt + 1} 次重试...")
+                time.sleep(self.retry_interval)
+                continue
+            
+            # 先找标签位置
+            label_template = cv2.imread(label_template_path)
+            if label_template is None:
+                raise FileNotFoundError(f"标签模板图片未找到: {label_template_path}")
+            
+            label_result = cv2.matchTemplate(screen, label_template, cv2.TM_CCOEFF_NORMED)
+            label_min_val, label_max_val, label_min_loc, label_max_loc = cv2.minMaxLoc(label_result)
+            
+            if label_max_val >= threshold:
+                # 找到标签后，在其右侧区域查找输入框
+                input_template = cv2.imread(template_path)
+                if input_template is None:
+                    raise FileNotFoundError(f"输入框模板图片未找到: {template_path}")
+                
+                # 获取输入框模板尺寸
+                input_height, input_width = input_template.shape[:2]
+                
+                # 计算查找区域（标签右侧）
+                label_width = label_template.shape[1]
+                search_region = screen[
+                    max(0, label_max_loc[1] - 10):min(screen.shape[0], label_max_loc[1] + input_template.shape[0] + 10),
+                    label_max_loc[0] + label_width:min(screen.shape[1], label_max_loc[0] + label_width + 300)
+                ]
+                
+                if search_region.size > 0:
+                    result = cv2.matchTemplate(search_region, input_template, cv2.TM_CCOEFF_NORMED)
+                    min_val, max_val, min_loc, max_loc = cv2.minMaxLoc(result)
+                    
+                    if max_val >= threshold:
+                        # 获取浏览器窗口位置
+                        hwnd = self.get_browser_window()
+                        if hwnd:
+                            window_x, window_y = win32gui.GetWindowRect(hwnd)[:2]
+                            # 返回相对于屏幕的绝对坐标
+                            center_x = window_x + label_max_loc[0] + label_width + max_loc[0] + input_width // 2
+                            center_y = window_y + label_max_loc[1] + max_loc[1] + input_height // 2
+                            return (center_x, center_y)
+            
+            if attempt < self.max_retries - 1:
+                print(f"未找到元素组合（匹配度：{label_max_val:.2f}），{attempt + 1} 次重试...")
+                time.sleep(self.retry_interval)
+        
+        return None
+    
+    def input_text(self, text):
+        """使用剪贴板输入文本"""
+        pyperclip.copy(text)  # 复制文本到剪贴板
+        pyautogui.hotkey('ctrl', 'v')  # 粘贴
+        time.sleep(0.5)  # 等待粘贴完成
+    
+    async def click_safe_place(self):
+        """点击安全位置"""
+        await self.send_notification("安全位置", "查找第一个安全位置...")
+        safe_loc = self.find_element_by_image(self.safe_place_path)
+        if safe_loc:
+            await self.send_notification("安全位置", "找到第一个安全位置，进行点击...")
+            pyautogui.click(safe_loc)
+            time.sleep(0.5)
+            return True
+            
+        await self.send_notification("安全位置", "未找到第一个安全位置，尝试第二个安全位置...")
+        safe_loc2 = self.find_element_by_image(self.safe_place_path2)
+        if safe_loc2:
+            await self.send_notification("安全位置", "找到第二个安全位置，进行点击...")
+            pyautogui.click(safe_loc2)
+            time.sleep(0.5)
+            return True
+            
+        await self.send_notification("安全位置", "两个安全位置都未找到")
+        return False
+    
+    async def login(self):
+        """登录系统"""
+        try:
+            await self.send_notification("登录流程", "开始登录流程...")
+            
+            # 输入用户名
+            await self.send_notification("登录流程", "开始查找用户名输入框...")
+            username_loc = self.find_element_with_label(
+                'templates/input_field.png',
+                'templates/username_label.png'
+            )
+            if username_loc:
+                await self.send_notification("登录流程", "找到用户名输入框，开始输入...")
+                pyautogui.click(username_loc)
+                self.input_text(self.username)  # 使用剪贴板输入
+                await self.send_notification("登录流程", f"用户名 {self.username} 输入完成")
+            else:
+                await self.send_notification("登录流程", "未找到用户名输入框")
+                return False
+            
+            # 点击安全位置
+            await self.send_notification("登录流程", "用户名输入完成，点击安全位置...")
+            if not await self.click_safe_place():
+                await self.send_notification("登录流程", "无法找到安全位置，继续执行...")
+            
+            time.sleep(1)
+            
+            # 输入密码
+            await self.send_notification("登录流程", "开始查找密码输入框...")
+            password_loc = self.find_element_with_label(
+                'templates/input_field.png',
+                'templates/password_label.png'
+            )
+            if password_loc:
+                await self.send_notification("登录流程", "找到密码输入框，开始输入...")
+                pyautogui.click(password_loc)
+                self.input_text(self.password)  # 使用剪贴板输入
+                await self.send_notification("登录流程", "密码输入完成")
+            else:
+                await self.send_notification("登录流程", "未找到密码输入框")
+                return False
+            
+            # 点击安全位置
+            await self.send_notification("登录流程", "密码输入完成，点击安全位置...")
+            if not await self.click_safe_place():
+                await self.send_notification("登录流程", "无法找到安全位置，继续执行...")
+            
+            time.sleep(1)
+            
+            # 点击登录按钮
+            await self.send_notification("登录流程", "开始查找登录按钮...")
+            login_button_loc = self.find_element_by_image('templates/login_button.png')
+            if login_button_loc:
+                await self.send_notification("登录流程", "找到登录按钮，点击登录...")
+                pyautogui.click(login_button_loc)
+                await self.send_notification("登录流程", "登录按钮点击完成")
+            else:
+                await self.send_notification("登录流程", "未找到登录按钮")
+                return False
+            
+            time.sleep(5)  # 等待登录完成
+            await self.send_notification("登录流程", "登录流程完成")
+            return True
+            
+        except Exception as e:
+            error_msg = f"登录过程发生错误: {str(e)}"
+            await self.send_notification("登录流程", error_msg)
+            return False
+
+    async def get_remaining_time(self):
+        """获取剩余时间并计算还需工作时间"""
+        try:
+            # 查找剩余时间模板
+            await self.send_notification("时间识别", "开始查找剩余时间...")
+            left_time_loc = self.find_element_by_image('templates/left_time.png')
+            if left_time_loc:
+                await self.send_notification("时间识别", "找到剩余时间位置，开始截取区域...")
+                
+                # 获取浏览器窗口截图
+                screen = self.take_screenshot()
+                if screen is None:
+                    await self.send_notification("时间识别", "截图失败")
+                    return None
+                
+                # 获取浏览器窗口位置
+                hwnd = self.get_browser_window()
+                if not hwnd:
+                    await self.send_notification("时间识别", "未找到浏览器窗口")
+                    return None
+                
+                window_x, window_y = win32gui.GetWindowRect(hwnd)[:2]
+                
+                # 计算相对于浏览器窗口的坐标
+                relative_x = left_time_loc[0] - window_x
+                relative_y = left_time_loc[1] - window_y
+                
+                # 扩大截取区域，确保能完整捕获时间文本
+                time_region = screen[
+                    max(0, relative_y - 15):min(screen.shape[0], relative_y + 35),
+                    relative_x:min(screen.shape[1], relative_x + 200)
+                ]
+                
+                # 保存临时文件用于OCR识别
+                cv2.imwrite('time_region.png', time_region)
+                
+                await self.send_notification("时间识别", "开始OCR识别...")
+                # 使用OCR识别时间文本，添加配置参数
+                custom_config = r'--oem 3 --psm 6 -c preserve_interword_spaces=1'
+                time_text = pytesseract.image_to_string(
+                    Image.open('time_region.png'),
+                    lang='chi_sim',  # 使用中文简体识别
+                    config=custom_config
+                )
+                os.remove('time_region.png')  # 删除临时文件
+                
+                await self.send_notification("时间识别", f"OCR识别结果: {time_text}")
+                
+                # 提取小时和分钟，使用更灵活的正则表达式
+                # 匹配"仅"字后面的数字和时间单位
+                time_pattern = r'[仅仅]?(\d+)\s*[小时時].*?(\d+)\s*分[钟鐘]'
+                time_match = re.search(time_pattern, time_text)
+                
+                if time_match:
+                    hours = int(time_match.group(1))
+                    minutes = int(time_match.group(2))
+                    await self.send_notification("时间识别", f"已工作时间: {hours}小时{minutes}分钟")
+                    
+                    # 计算还需工作的时间（8小时16分钟 - 已工作时间）
+                    total_minutes = 8 * 60 + 16  # 8小时16分钟转换为分钟
+                    worked_minutes = hours * 60 + minutes
+                    remaining_minutes = total_minutes - worked_minutes
+                    
+                    remaining_hours = remaining_minutes // 60
+                    remaining_mins = remaining_minutes % 60
+                    
+                    result = f"{remaining_hours}小时{remaining_mins}分钟"
+                    await self.send_notification("时间识别", f"计算结果 - 还需工作: {result}")
+                    return result
+                else:
+                    await self.send_notification("时间识别", f"无法从文本中提取时间: {time_text}")
+            else:
+                await self.send_notification("时间识别", "未找到剩余时间位置")
+            return None
+        except Exception as e:
+            await self.send_notification("时间识别", f"获取剩余时间失败: {str(e)}")
+            return None
+
+    async def schedule_retry_punch_out(self, delay_minutes):
+        """设置定时重试下班打卡"""
+        try:
+            retry_time = datetime.now() + timedelta(minutes=delay_minutes)
+            schedule.clear()  # 清除之前的所有定时任务
+            
+            async def punch_out_job():
+                try:
+                    await self.punch_out()
+                    # 打卡完成后发送状态信息
+                    await self.send_daily_status()
+                    # 删除已执行的任务
+                    self.task_manager.clear_tasks()
+                    schedule.clear()
+                except Exception as e:
+                    logging.error(f"执行定时下班打卡任务时发生错误: {str(e)}")
+                
+            # 设置定时任务
+            schedule.every().day.at(retry_time.strftime("%H:%M")).do(lambda: asyncio.create_task(punch_out_job()))
+            time_str = retry_time.strftime("%H:%M")
+            
+            # 保存定时任务到文件
+            self.task_manager.clear_tasks()  # 清除之前的任务
+            task_id = self.task_manager.add_task('punch_out', time_str)
+            
+            await self.send_notification("定时设置", f"已清除之前的定时任务")
+            await self.send_notification("定时设置", f"设置新的定时任务 #{task_id}: {time_str}")
+            
+            return time_str
+        except Exception as e:
+            await self.send_notification("定时设置", f"设置定时任务失败: {str(e)}")
+            return None
+
+    def init_schedule_tasks(self):
+        """初始化定时任务"""
+        # 清除所有现有任务
+        schedule.clear()
+        
+        # 设置每天早上的状态推送
+        async def daily_status_job():
+            await self.send_daily_status()
+        schedule.every().day.at(self.daily_status_time).do(lambda: asyncio.create_task(daily_status_job()))
+        
+        # 从文件加载保存的定时任务
+        saved_tasks = self.task_manager.get_tasks()
+        for task in saved_tasks:
+            if task['type'] == 'punch_out':
+                async def punch_out_job():
+                    try:
+                        await self.punch_out()
+                        # 打卡完成后发送状态信息
+                        await self.send_daily_status()
+                        # 删除已执行的任务
+                        self.task_manager.clear_tasks()
+                        schedule.clear()
+                        # 重新初始化每日状态推送任务
+                        schedule.every().day.at(self.daily_status_time).do(lambda: asyncio.create_task(daily_status_job()))
+                    except Exception as e:
+                        logging.error(f"执行定时下班打卡任务时发生错误: {str(e)}")
+                schedule.every().day.at(task['scheduled_time']).do(lambda: asyncio.create_task(punch_out_job()))
+
+    async def send_daily_status(self):
+        """发送每日状态信息"""
+        try:
+            # 构建与 /status 命令相同的状态信息
+            current_time = datetime.now()
+            
+            # 获取系统资源使用情况
+            memory = psutil.virtual_memory()
+            cpu_percent = psutil.cpu_percent()
+            
+            # 获取程序运行时间
+            process = psutil.Process()
+            uptime = datetime.now() - datetime.fromtimestamp(process.create_time())
+            hours, remainder = divmod(uptime.total_seconds(), 3600)
+            minutes, seconds = divmod(remainder, 60)
+            
+            # 检查是否在工作时间内和日期类型
+            is_work_time = self.is_work_time(current_time)
+            current_date = current_time.date()
+            is_holiday_today = is_holiday(current_date)
+            is_workday_today = is_workday(current_date)
+            
+            # 格式化状态消息
+            status_text = (
+                "🤖 打卡系统状态\n"
+                "━━━━━━━━━━━━━━━\n"
+                f"📅 当前时间：{current_time.strftime('%Y-%m-%d %H:%M:%S')}\n"
+                f"📌 今日类型：{'🏖️ 节假日' if is_holiday_today else '💼 工作日' if is_workday_today else '🎉 休息日'}\n"
+                f"⏰ 工作状态：{'🟢 工作时间' if is_work_time else '🔴 非工作时间'}\n\n"
+                
+                "📍 今日打卡记录\n"
+                f"上班打卡：{'✅ ' + self.today_punch_records['punch_in_time'].strftime('%H:%M:%S') if self.today_punch_records['punch_in_time'] else '❌ 未打卡'}\n"
+                f"下班打卡：{'✅ ' + self.today_punch_records['punch_out_time'].strftime('%H:%M:%S') if self.today_punch_records['punch_out_time'] else '❌ 未打卡'}\n\n"
+                
+                "⚙️ 系统信息\n"
+                f"运行时长：{int(hours)}小时{int(minutes)}分钟\n"
+                f"内存使用：{memory.percent}%\n"
+                f"CPU使用：{cpu_percent}%\n"
+                f"心跳状态：{'🟢 正常' if self.heartbeat_miss_count == 0 else '🟡 警告'}\n\n"
+                
+                "📋 配置信息\n"
+                f"上班时间：{self.work_start_time}\n"
+                f"下班时间：{self.work_end_time}\n"
+                f"迟到阈值：{self.late_threshold}分钟\n"
+                f"早退阈值：{self.early_leave_threshold}分钟\n"
+            )
+            
+            # 获取定时任务列表
+            saved_tasks = self.task_manager.get_tasks()
+            if saved_tasks:
+                status_text += "\n⏱ 定时任务列表\n"
+                for task in saved_tasks:
+                    if task['type'] == 'punch_out':
+                        next_run = datetime.strptime(task['scheduled_time'], "%H:%M").replace(
+                            year=current_time.year,
+                            month=current_time.month,
+                            day=current_time.day
+                        )
+                        # 如果时间已过，显示明天的时间
+                        if next_run < current_time:
+                            next_run = next_run + timedelta(days=1)
+                        status_text += f"➤ [任务 #{task['id']}] 下班打卡：{next_run.strftime('%Y-%m-%d %H:%M')}\n"
+            else:
+                status_text += "\n⏱ 暂无定时任务\n"
+            
+            await self.bot.send_message("系统状态", status_text)
+            
+        except Exception as e:
+            logging.error(f"发送每日状态信息时发生错误: {str(e)}")
+            
+    async def _do_punch(self, punch_type="上班"):
+        """通用打卡方法"""
+        try:
+            # 重置消息
+            self.current_message = f"开始{punch_type}打卡流程"
+            self.message_id = None
+            
+            # 使用 Edge InPrivate 模式打开新窗口
+            await self.send_notification("打卡流程", "开始打开浏览器...")
+            os.system('start msedge --inprivate --new-window "{}"'.format(self.login_url))
+            time.sleep(3)  # 增加等待时间，确保页面完全加载
+            
+            # 获取当前窗口截图用于错误处理
+            screen = self.take_screenshot()
+            
+            # 检查是否有警告弹窗
+            await self.send_notification("打卡流程", "检查是否存在警告弹窗...")
+            alert_loc = self.find_element_by_image('templates/alert.png', threshold=0.7)  # 降低匹配阈值
+            if alert_loc:
+                await self.send_notification("打卡流程", "检测到警告弹窗，处理中...")
+                # 查找并点击更多按钮
+                await self.send_notification("打卡流程", "尝试查找更多按钮...")
+                more_button_loc = self.find_element_by_image('templates/more_button.png', threshold=0.5)
+                if not more_button_loc:
+                    error_msg = "检测到警告弹窗但未找到更多按钮，终止打卡流程"
+                    await self.send_notification("打卡流程", error_msg)
+                    # 发送失败截图
+                    if screen is not None:
+                        screenshot_path = 'punch_error.png'
+                        cv2.imwrite(screenshot_path, screen)
+                        try:
+                            with open(screenshot_path, 'rb') as photo:
+                                await self.bot.app.bot.send_photo(
+                                    chat_id=self.bot.chat_id,
+                                    photo=photo,
+                                    caption=f"{punch_type}打卡失败 - {error_msg}"
+                                )
+                            os.remove(screenshot_path)
+                        except Exception as e:
+                            await self.send_notification("打卡流程", f"截图发送失败: {str(e)}")
+                    return False
+                
+                await self.send_notification("打卡流程", "找到更多按钮，点击中...")
+                pyautogui.click(more_button_loc)
+                time.sleep(1)
+                
+                # 更新截图
+                screen = self.take_screenshot()
+                
+                # 查找并点击继续按钮
+                await self.send_notification("打卡流程", "尝试查找继续按钮...")
+                continue_button_loc = self.find_element_by_image('templates/continue2.png', threshold=0.5)
+                if not continue_button_loc:
+                    error_msg = "点击更多按钮后未找到继续按钮，终止打卡流程"
+                    await self.send_notification("打卡流程", error_msg)
+                    # 发送失败截图
+                    if screen is not None:
+                        screenshot_path = 'punch_error.png'
+                        cv2.imwrite(screenshot_path, screen)
+                        try:
+                            with open(screenshot_path, 'rb') as photo:
+                                await self.bot.app.bot.send_photo(
+                                    chat_id=self.bot.chat_id,
+                                    photo=photo,
+                                    caption=f"{punch_type}打卡失败 - {error_msg}"
+                                )
+                            os.remove(screenshot_path)
+                        except Exception as e:
+                            await self.send_notification("打卡流程", f"截图发送失败: {str(e)}")
+                    return False
+                
+                await self.send_notification("打卡流程", "点击继续按钮...")
+                pyautogui.click(continue_button_loc)
+                time.sleep(1)
+            else:
+                await self.send_notification("打卡流程", "未检测到警告弹窗，继续执行...")
+            
+            # 更新截图
+            screen = self.take_screenshot()
+            
+            if await self.login():
+                await self.send_notification("打卡流程", "登录成功，等待系统加载...")
+                time.sleep(3)
+                
+                # 更新截图
+                screen = self.take_screenshot()
+                
+                # 根据打卡类型选择不同的按钮模板
+                button_template = 'templates/punch_button.png' if punch_type == "上班" else 'templates/punch_out_button.png'
+                await self.send_notification("打卡流程", "开始查找打卡按钮...")
+                punch_button_loc = self.find_element_by_image(button_template)
+                if punch_button_loc:
+                    await self.send_notification("打卡流程", "找到打卡按钮，开始打卡...")
+                    pyautogui.click(punch_button_loc)
+                    time.sleep(2)  # 等待打卡结果显示
+                    
+                    # 更新截图
+                    screen = self.take_screenshot()
+                    if screen is None:
+                        await self.send_notification("打卡流程", "截图失败")
+                        return False
+                    
+                    current_time = datetime.now()
+                    punch_success = False
+                    
+                    # 检查异常打卡情况
+                    if punch_type == "上班":
+                        if self._is_late_punch_in(current_time):
+                            await self.send_notification(
+                                "打卡异常",
+                                f"⚠️ 检测到迟到打卡！打卡时间：{current_time.strftime('%H:%M')}"
+                            )
+                        self.today_punch_records['punch_in_time'] = current_time
+                        # 保存打卡记录
+                        self.punch_record_manager.update_record(
+                            current_time.strftime('%Y-%m-%d'),
+                            "上班",
+                            current_time.strftime('%H:%M:%S')
+                        )
+                        punch_success = True
+                    else:  # 下班打卡
+                        # 检查是否存在unable_escape情况
+                        await self.send_notification("打卡流程", "检查是否满足下班条件...")
+                        unable_escape_loc = self.find_element_by_image('templates/unable_escape.png')
+                        if unable_escape_loc:
+                            # 获取剩余工作时间
+                            remaining_time = await self.get_remaining_time()
+                            if remaining_time:
+                                error_msg = f"未满足下班条件，还需工作: {remaining_time}"
+                                
+                                # 从剩余时间中提取分钟数
+                                import re
+                                time_match = re.match(r'(\d+)小时(\d+)分钟', remaining_time)
+                                if time_match:
+                                    hours = int(time_match.group(1))
+                                    minutes = int(time_match.group(2))
+                                    total_minutes = hours * 60 + minutes
+                                    
+                                    # 设置定时重试，直接使用计算出的时间
+                                    retry_time = await self.schedule_retry_punch_out(total_minutes)
+                                    error_msg += f"\n已设置在 {retry_time} 自动重试下班打卡"
+                            else:
+                                error_msg = "未满足下班条件，无法获取剩余时间"
+                            await self.send_notification("打卡流程", error_msg)
+                            
+                            # 保存并发送当前的浏览器窗口截图
+                            screenshot_path = 'punch_out_unable.png'
+                            cv2.imwrite(screenshot_path, screen)
+                            try:
+                                with open(screenshot_path, 'rb') as photo:
+                                    await self.bot.app.bot.send_photo(
+                                        chat_id=self.bot.chat_id,
+                                        photo=photo,
+                                        caption=f"下班打卡失败 - {error_msg}"
+                                    )
+                                os.remove(screenshot_path)  # 删除临时截图
+                            except Exception as e:
+                                await self.send_notification("打卡流程", f"截图发送失败: {str(e)}")
+                            return False
+                        else:
+                            # 只有在没有unable_escape时才记录下班时间
+                            if self._is_early_leave(current_time):
+                                await self.send_notification(
+                                    "打卡异常",
+                                    f"⚠️ 检测到早退打卡！打卡时间：{current_time.strftime('%H:%M')}"
+                                )
+                            self.today_punch_records['punch_out_time'] = current_time
+                            # 保存打卡记录
+                            self.punch_record_manager.update_record(
+                                current_time.strftime('%Y-%m-%d'),
+                                "下班",
+                                current_time.strftime('%H:%M:%S')
+                            )
+                            punch_success = True
+                    
+                    if punch_success:
+                        # 识别并更新打卡记录
+                        await self.get_punch_records_from_page()
+                        
+                        # 打卡完成后发送状态信息
+                        await self.send_daily_status()
+                        
+                        # 保存并发送当前的浏览器窗口截图
+                        screenshot_path = f'logs/punch_{"in" if punch_type == "上班" else "out"}_result.png'
+                        cv2.imwrite(screenshot_path, screen)
+                        
+                        success_msg = f"{punch_type}打卡成功 - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+                        await self.send_notification("打卡流程", success_msg)
+                        
+                        # 发送截图，增加重试机制
+                        max_retries = 3
+                        retry_delay = 5
+                        for retry in range(max_retries):
+                            try:
+                                if os.path.exists(screenshot_path):
+                                    with open(screenshot_path, 'rb') as photo:
+                                        await self.bot.app.bot.send_photo(
+                                            chat_id=self.bot.chat_id,
+                                            photo=photo,
+                                            caption=f"{punch_type}打卡结果截图"
+                                        )
+                                    os.remove(screenshot_path)  # 删除临时截图
+                                    break
+                                else:
+                                    await self.send_notification("打卡流程", f"截图文件不存在: {screenshot_path}")
+                            except telegram.error.NetworkError as e:
+                                if retry < max_retries - 1:
+                                    await self.send_notification("打卡流程", f"发送截图时发生网络错误，{retry + 1}/{max_retries} 次重试: {str(e)}")
+                                    await asyncio.sleep(retry_delay * (retry + 1))
+                                else:
+                                    await self.send_notification("打卡流程", f"发送截图失败，网络错误: {str(e)}")
+                            except Exception as e:
+                                await self.send_notification("打卡流程", f"发送截图失败: {str(e)}")
+                                break
+                else:
+                    error_msg = "未找到打卡按钮"
+                    await self.send_notification("打卡流程", error_msg)
+                    # 发送失败截图
+                    if screen is not None:
+                        screenshot_path = 'punch_error.png'
+                        cv2.imwrite(screenshot_path, screen)
+                        try:
+                            with open(screenshot_path, 'rb') as photo:
+                                await self.bot.app.bot.send_photo(
+                                    chat_id=self.bot.chat_id,
+                                    photo=photo,
+                                    caption=f"{punch_type}打卡失败 - {error_msg}"
+                                )
+                            os.remove(screenshot_path)
+                        except Exception as e:
+                            await self.send_notification("打卡流程", f"截图发送失败: {str(e)}")
+                    return False
+            else:
+                error_msg = "登录失败，无法进行打卡"
+                await self.send_notification("打卡流程", error_msg)
+                # 发送失败截图
+                if screen is not None:
+                    screenshot_path = 'punch_error.png'
+                    cv2.imwrite(screenshot_path, screen)
+                    try:
+                        with open(screenshot_path, 'rb') as photo:
+                            await self.bot.app.bot.send_photo(
+                                chat_id=self.bot.chat_id,
+                                photo=photo,
+                                caption=f"{punch_type}打卡失败 - {error_msg}"
+                            )
+                        os.remove(screenshot_path)
+                    except Exception as e:
+                        await self.send_notification("打卡流程", f"截图发送失败: {str(e)}")
+                return False
+        except Exception as e:
+            error_msg = f"{punch_type}打卡流程发生错误: {str(e)}"
+            await self.send_notification("打卡流程", error_msg)
+            # 发送失败截图
+            if screen is not None:
+                screenshot_path = 'punch_error.png'
+                cv2.imwrite(screenshot_path, screen)
+                try:
+                    with open(screenshot_path, 'rb') as photo:
+                        await self.bot.app.bot.send_photo(
+                            chat_id=self.bot.chat_id,
+                            photo=photo,
+                            caption=f"{punch_type}打卡失败 - {error_msg}"
+                        )
+                    os.remove(screenshot_path)
+                except Exception as e:
+                    await self.send_notification("打卡流程", f"截图发送失败: {str(e)}")
+            await self.handle_error(e, f"{punch_type}打卡流程")
+
+    async def punch_in(self):
+        """上班打卡"""
+        await self._do_punch("上班")
+
+    async def punch_out(self):
+        """下班打卡"""
+        await self._do_punch("下班")
+
+    def cleanup(self):
+        """清理资源"""
+        # 保存当前的定时任务到文件
+        scheduled_jobs = schedule.get_jobs()
+        self.task_manager.clear_tasks()
+        for job in scheduled_jobs:
+            if "punch_out" in str(job.job_func):
+                next_run = job.next_run
+                if next_run:
+                    time_str = next_run.strftime("%H:%M")
+                    self.task_manager.add_task('punch_out', time_str)
+
+    async def check_heartbeat(self):
+        """心跳检测"""
+        try:
+            current_time = datetime.now()
+            time_diff = (current_time - self.last_heartbeat).total_seconds()
+            
+            if time_diff > self.heartbeat_interval:
+                await self.send_notification("系统状态", "执行心跳检测...")
+                
+                # 尝试执行一个简单的操作来验证系统状态
+                hwnd = self.get_browser_window()
+                if hwnd:
+                    # 获取窗口位置和大小
+                    rect = win32gui.GetWindowRect(hwnd)
+                    x, y, width, height = rect[0], rect[1], rect[2] - rect[0], rect[3] - rect[1]
+                    
+                    if width > 0 and height > 0:
+                        # 截取浏览器窗口
+                        screenshot = pyautogui.screenshot(region=(x, y, width, height))
+                        if screenshot:
+                            self.last_heartbeat = current_time
+                            self.heartbeat_miss_count = 0
+                            await self.send_notification("系统状态", "心跳检测正常")
+                        else:
+                            self.heartbeat_miss_count += 1
+                            await self.send_notification("系统状态", f"心跳检测异常：截图失败 ({self.heartbeat_miss_count}/{self.max_heartbeat_miss})")
+                    else:
+                        self.heartbeat_miss_count += 1
+                        await self.send_notification("系统状态", f"心跳检测异常：窗口大小异常 ({self.heartbeat_miss_count}/{self.max_heartbeat_miss})")
+                else:
+                    self.heartbeat_miss_count += 1
+                    await self.send_notification("系统状态", f"心跳检测异常：未找到浏览器窗口 ({self.heartbeat_miss_count}/{self.max_heartbeat_miss})")
+                
+                if self.heartbeat_miss_count >= self.max_heartbeat_miss:
+                    await self.send_notification("系统状态", "系统可能已经死锁，尝试重启程序...")
+                    await self.restart_program()
+                    
+        except Exception as e:
+            await self.send_notification("系统状态", f"心跳检测发生错误: {str(e)}")
+            self.heartbeat_miss_count += 1
+            
+    async def restart_program(self):
+        """重启程序"""
+        try:
+            await self.send_notification("系统状态", "开始执行程序重启...")
+            
+            # 清理资源
+            self.cleanup()
+            
+            # 使用 Python 执行新的程序实例
+            python_executable = sys.executable
+            os.execl(python_executable, python_executable, *sys.argv)
+            
+        except Exception as e:
+            await self.send_notification("系统状态", f"程序重启失败: {str(e)}")
+
+    def _is_late_punch_in(self, punch_time):
+        """检查是否迟到"""
+        work_start = datetime.strptime(self.work_start_time, "%H:%M").time()
+        late_threshold = timedelta(minutes=self.late_threshold)
+        punch_datetime = datetime.strptime(punch_time.strftime("%H:%M"), "%H:%M").time()
+        
+        # 计算时间差
+        start_minutes = work_start.hour * 60 + work_start.minute
+        punch_minutes = punch_datetime.hour * 60 + punch_datetime.minute
+        
+        return punch_minutes > (start_minutes + self.late_threshold)
+        
+    def _is_early_leave(self, punch_time):
+        """检查是否早退"""
+        work_end = datetime.strptime(self.work_end_time, "%H:%M").time()
+        early_threshold = timedelta(minutes=self.early_leave_threshold)
+        punch_datetime = datetime.strptime(punch_time.strftime("%H:%M"), "%H:%M").time()
+        
+        # 计算时间差
+        end_minutes = work_end.hour * 60 + work_end.minute
+        punch_minutes = punch_datetime.hour * 60 + punch_datetime.minute
+        
+        return punch_minutes < (end_minutes - self.early_leave_threshold)
+        
+    def is_work_time(self, current_time=None):
+        """判断是否是工作时间"""
+        if current_time is None:
+            current_time = datetime.now()
+            
+        # 首先判断是否是工作日
+        if not is_workday(current_time.date()):
+            return False
+            
+        # 然后判断是否在工作时间范围内
+        current_minutes = current_time.hour * 60 + current_time.minute
+        work_start_time = datetime.strptime(self.work_start_time, "%H:%M")
+        work_end_time = datetime.strptime(self.work_end_time, "%H:%M")
+        work_start_minutes = work_start_time.hour * 60 + work_start_time.minute
+        work_end_minutes = work_end_time.hour * 60 + work_end_time.minute
+        
+        return work_start_minutes <= current_minutes <= work_end_minutes
+        
+    async def check_punch_status(self):
+        """检查打卡状态"""
+        try:
+            current_time = datetime.now()
+            current_date = current_time.date()
+            
+            # 如果不是工作日，不进行检查
+            if not is_workday(current_date):
+                return
+            
+            # 重置昨天的打卡记录
+            if self.today_punch_records['punch_in_time'] and \
+               self.today_punch_records['punch_in_time'].date() < current_date:
+                self.today_punch_records = {
+                    'punch_in_time': None,
+                    'punch_out_time': None
+                }
+            
+            # 检查上班打卡
+            if not self.today_punch_records['punch_in_time'] and \
+               current_time.time() > datetime.strptime(self.work_start_time, "%H:%M").time():
+                await self.send_notification(
+                    "打卡提醒",
+                    "⚠️ 今日未检测到上班打卡记录，请及时补卡！"
+                )
+            
+            # 检查下班打卡
+            if self.today_punch_records['punch_in_time'] and \
+               not self.today_punch_records['punch_out_time'] and \
+               current_time.time() > datetime.strptime("18:00", "%H:%M").time():
+                await self.send_notification(
+                    "打卡提醒",
+                    "⚠️ 今日未检测到下班打卡记录，请及时补卡！"
+                )
+                
+        except Exception as e:
+            logging.error(f"检查打卡状态时发生错误: {str(e)}")
+            
+    async def handle_error(self, error, context="未知"):
+        """统一错误处理"""
+        try:
+            current_time = datetime.now()
+            time_diff = (current_time - self.last_error_reset).total_seconds()
+            
+            # 重置错误计数
+            if time_diff > self.error_reset_interval:
+                self.error_count = 0
+                self.last_error_reset = current_time
+            
+            self.error_count += 1
+            error_msg = f"发生错误 ({self.error_count}/{self.max_errors}) - 上下文: {context}\n错误信息: {str(error)}\n{traceback.format_exc()}"
+            
+            # 记录错误日志
+            logging.error(error_msg)
+            
+            # 发送错误通知
+            await self.send_notification("错误警告", error_msg)
+            
+            # 如果错误次数过多，尝试重启程序
+            if self.error_count >= self.max_errors:
+                logging.critical("错误次数过多，准备重启程序...")
+                await self.restart_program()
+                
+        except Exception as e:
+            logging.critical(f"错误处理器本身发生错误: {str(e)}")
+            
+    async def get_punch_records_from_page(self):
+        """从页面识别今日打卡记录"""
+        try:
+            # 获取浏览器窗口截图
+            screen = self.take_screenshot()
+            if screen is None:
+                logging.error("获取截图失败，无法识别打卡记录")
+                return None
+            
+            # 保存临时文件用于OCR识别
+            cv2.imwrite('logs/temp_ocr.png', screen)
+            
+            # 使用OCR识别文本
+            custom_config = r'--oem 3 --psm 6 -c preserve_interword_spaces=1'
+            text = pytesseract.image_to_string(
+                Image.open('logs/temp_ocr.png'),
+                lang='chi_sim',
+                config=custom_config
+            )
+            os.remove('logs/temp_ocr.png')  # 删除临时文件
+            
+            # 输出完整的OCR识别结果
+            print("\n=== OCR识别完整结果 ===")
+            print(text)
+            print("=====================\n")
+            logging.info(f"\n=== OCR识别完整结果 ===\n{text}\n=====================")
+            
+            # 查找今日打卡记录
+            lines = text.split('\n')
+            today_str = datetime.now().strftime('%Y-%m-%d')
+            today_str_short = datetime.now().strftime('%m-%d')  # 短日期格式
+            punch_in_time = None
+            punch_out_time = None
+            is_today_record = False
+            
+            # 定义日期匹配模式
+            date_patterns = [
+                r'\d{4}-\d{2}-\d{2}',  # 完整日期格式 YYYY-MM-DD
+                r'\d{2}-\d{2}'         # 短日期格式 MM-DD
+            ]
+            
+            # 定义多个时间匹配模式
+            time_patterns = [
+                (r'(\d{2}:\d{2})\s*上班', '上班'),
+                (r'(\d{2}[:：]\d{2})\s*上班', '上班'),  # 处理中文冒号
+                (r'上班\s*(\d{2}[:：]\d{2})', '上班'),  # 处理时间在后面的情况
+                (r'(\d{2}:\d{2})\s*下班', '下班'),
+                (r'(\d{2}[:：]\d{2})\s*下班', '下班'),  # 处理中文冒号
+                (r'下班\s*(\d{2}[:：]\d{2})', '下班'),  # 处理时间在后面的情况
+            ]
+            
+            # 遍历所有行寻找打卡记录
+            for i, line in enumerate(lines):
+                logging.debug(f"处理第{i+1}行: {line}")
+                
+                # 首先检查是否包含日期
+                for date_pattern in date_patterns:
+                    date_match = re.search(date_pattern, line)
+                    if date_match:
+                        date_str = date_match.group(0)
+                        # 如果是短日期格式，添加年份
+                        if len(date_str) == 5:  # MM-DD格式
+                            is_today_record = date_str == today_str_short
+                        else:  # YYYY-MM-DD格式
+                            is_today_record = date_str == today_str
+                        logging.debug(f"找到日期: {date_str}, 是否今天: {is_today_record}")
+                        break  # 找到日期后跳出内层循环
+                
+                # 检查打卡时间
+                # 如果已经确认是今天的记录，或者在同一行找到日期和时间
+                if is_today_record or any(today_str in line for date_pattern in date_patterns):
+                    # 检查所有匹配模式
+                    for pattern, punch_type in time_patterns:
+                        time_match = re.search(pattern, line)
+                        if time_match:
+                            time_str = time_match.group(1).replace('：', ':')  # 统一冒号格式
+                            if punch_type == '上班' and not punch_in_time:
+                                punch_in_time = time_str + ':00'
+                                logging.info(f"识别到今日上班打卡时间: {punch_in_time}")
+                            elif punch_type == '下班' and not punch_out_time:
+                                punch_out_time = time_str + ':00'
+                                logging.info(f"识别到今日下班打卡时间: {punch_out_time}")
+            
+            if punch_in_time or punch_out_time:
+                # 更新打卡记录
+                if punch_in_time:
+                    try:
+                        self.today_punch_records['punch_in_time'] = datetime.strptime(punch_in_time, '%H:%M:%S')
+                        self.punch_record_manager.update_record(today_str, "上班", punch_in_time)
+                        logging.info(f"成功更新今日上班打卡记录: {punch_in_time}")
+                    except Exception as e:
+                        logging.error(f"更新上班打卡记录时出错: {str(e)}")
+                    
+                if punch_out_time:
+                    try:
+                        self.today_punch_records['punch_out_time'] = datetime.strptime(punch_out_time, '%H:%M:%S')
+                        self.punch_record_manager.update_record(today_str, "下班", punch_out_time)
+                        logging.info(f"成功更新今日下班打卡记录: {punch_out_time}")
+                    except Exception as e:
+                        logging.error(f"更新下班打卡记录时出错: {str(e)}")
+                    
+                await self.send_notification("打卡记录", 
+                    f"已更新今日打卡记录:\n"
+                    f"上班时间: {punch_in_time if punch_in_time else '未识别'}\n"
+                    f"下班时间: {punch_out_time if punch_out_time else '未识别'}"
+                )
+                return True
+            else:
+                logging.warning("未能从页面识别到今日打卡记录")
+                return False
+                
+        except Exception as e:
+            logging.error(f"识别打卡记录时发生错误: {str(e)}\n{traceback.format_exc()}")
+            return False
+
+async def run_schedule():
+    attendance_system = None
+    
+    while True:
+        try:
+            # 运行待处理的定时任务
+            for job in schedule.get_jobs():
+                if job.should_run:
+                    try:
+                        # 执行任务并等待其完成
+                        result = job.run()
+                        if asyncio.iscoroutine(result):
+                            await result
+                    except Exception as e:
+                        print(f"执行定时任务时发生错误: {str(e)}")
+            
+            # 执行心跳检测
+            if attendance_system:
+                await attendance_system.check_heartbeat()
+                # 每小时检查一次打卡状态
+                if datetime.now().minute == 0:
+                    await attendance_system.check_punch_status()
+                
+            await asyncio.sleep(1)
+        except Exception as e:
+            print(f"调度任务发生错误: {str(e)}")
+            await asyncio.sleep(5)  # 发生错误时等待一段时间后继续
+
+async def main():
+    try:
+        attendance_system = AttendanceSystem()
+        logging.info("自动打卡系统已启动...")
+        
+        print("自动打卡系统已启动...")
+        print("\n您可以通过Telegram机器人控制打卡：")
+        print("/punch_in - 执行上班打卡")
+        print("/punch_out - 执行下班打卡")
+        print("/status - 查看系统状态")
+        print("/errors - 查看最近错误日志")
+        print("/kill - 查看并管理定时任务")
+        print("/kill <任务ID> - 直接删除指定任务")
+        
+        # 初始化 Telegram 机器人
+        app = Application.builder().token(attendance_system.bot.token).build()
+        attendance_system.bot.app = app
+        attendance_system.bot.attendance_system = attendance_system
+        
+        # 注册命令处理器
+        app.add_handler(CommandHandler('start', attendance_system.bot.start_command))
+        app.add_handler(CommandHandler('punch_in', attendance_system.bot.punch_in_command))
+        app.add_handler(CommandHandler('punch_out', attendance_system.bot.punch_out_command))
+        app.add_handler(CommandHandler('status', attendance_system.bot.status_command))
+        app.add_handler(CommandHandler('errors', attendance_system.bot.get_recent_errors))
+        app.add_handler(CommandHandler('kill', attendance_system.bot.kill_command))
+        
+        # 注册按钮回调处理器
+        app.add_handler(CallbackQueryHandler(attendance_system.bot.button_callback))
+        
+        # 添加更新时间记录处理器
+        async def update_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+            attendance_system.bot.last_update_time = datetime.now()
+            
+        app.add_handler(MessageHandler(filters.ALL, update_handler))
+
+        # 创建调度任务
+        schedule_task = asyncio.create_task(run_schedule())
+        
+        try:
+            # 启动机器人
+            await app.initialize()
+            await app.start()
+            
+            # 启动轮询
+            await attendance_system.bot.start_polling()
+            
+            # 启动连接监控
+            monitor_task = asyncio.create_task(attendance_system.bot.monitor_connection())
+            
+            # 保持程序运行
+            await asyncio.gather(
+                asyncio.Event().wait(),
+                monitor_task,
+                return_exceptions=True
+            )
+        finally:
+            # 清理资源
+            schedule_task.cancel()
+            await attendance_system.bot.stop_polling()
+            await app.stop()
+            await app.shutdown()
+    except Exception as e:
+        logging.critical(f"程序启动失败: {str(e)}")
+        if attendance_system:
+            await attendance_system.handle_error(e, "程序启动")
+    finally:
+        # 清理资源
+        if attendance_system:
+            attendance_system.cleanup()
+            logging.info("程序已停止，资源已清理")
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        print("\n程序已停止")
