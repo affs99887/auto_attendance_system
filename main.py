@@ -507,12 +507,30 @@ class TelegramBot:
         """重启消息轮询"""
         logging.info("正在重启 Telegram Bot 轮询...")
         await self.stop_polling()
-        await asyncio.sleep(5)  # 等待5秒后重启
         
-        # 重新创建应用实例
+        # 完全关闭和清理旧的应用实例
         try:
             if self.app:
+                # 停止所有处理器
+                for handler in self.app.handlers.values():
+                    for group in handler:
+                        group.clear()
+                
+                # 停止更新器
+                if self.app.updater:
+                    await self.app.updater.stop()
+                
+                # 停止和关闭应用
+                await self.app.stop()
                 await self.app.shutdown()
+                await self.cleanup_connections()
+                
+                # 清空引用
+                self.app = None
+                
+            await asyncio.sleep(5)  # 等待5秒后重启
+            
+            # 重新创建应用实例
             self.app = Application.builder().token(self.token).pool_timeout(self.pool_timeout).connect_timeout(self.connect_timeout).read_timeout(self.read_timeout).write_timeout(self.write_timeout).connection_pool_size(self.connection_pool_size).pool_maxsize(self.pool_maxsize).get_updates_connection_pool_size(self.connection_pool_size).build()
             
             # 重新注册处理器
