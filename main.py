@@ -43,7 +43,7 @@ class TelegramBot:
         self.last_connection_error = None
         # 添加轮询监控
         self.last_update_time = datetime.now()
-        self.update_timeout = 600  # 5分钟无更新则重启轮询
+        self.update_timeout = 600  # 10分钟无更新则重启轮询
         self.polling_task = None
         self.is_polling = False
         # 添加连接池配置
@@ -53,7 +53,7 @@ class TelegramBot:
         self.read_timeout = 30
         self.write_timeout = 30
         self.connect_timeout = 30
-        self.pool_maxsize = 100
+
 
     async def start_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """处理/start命令"""
@@ -482,10 +482,19 @@ class TelegramBot:
     async def cleanup_connections(self):
         """清理连接池"""
         try:
-            if hasattr(self.app.bot.request, '_client'):
-                await self.app.bot.request._client.aclose()
-            if hasattr(self.app.updater, '_last_update_id'):
-                self.app.updater._last_update_id = None
+            if self.app and hasattr(self.app, 'bot') and hasattr(self.app.bot, 'request'):
+                if hasattr(self.app.bot.request, '_client'):
+                    try:
+                        await self.app.bot.request._client.aclose()
+                    except Exception as e:
+                        logging.warning(f"关闭客户端连接时发生错误: {str(e)}")
+            
+            if self.app and hasattr(self.app, 'updater'):
+                if hasattr(self.app.updater, '_last_update_id'):
+                    try:
+                        self.app.updater._last_update_id = None
+                    except Exception as e:
+                        logging.warning(f"重置last_update_id时发生错误: {str(e)}")
         except Exception as e:
             logging.error(f"清理连接时发生错误: {str(e)}")
 
@@ -495,12 +504,19 @@ class TelegramBot:
             return
             
         try:
-            await self.app.updater.stop()
+            # 检查updater是否存在且正在运行
+            if self.app and self.app.updater:
+                try:
+                    await self.app.updater.stop()
+                except Exception as e:
+                    logging.warning(f"停止updater时发生异常，可能已经不在运行状态: {str(e)}")
+            
             self.is_polling = False
             # 清理连接
             await self.cleanup_connections()
             logging.info("Telegram Bot 轮询已停止")
         except Exception as e:
+            self.is_polling = False  # 确保状态正确
             logging.error(f"停止轮询时发生错误: {str(e)}")
 
     async def restart_polling(self):
@@ -511,18 +527,20 @@ class TelegramBot:
         # 完全关闭和清理旧的应用实例
         try:
             if self.app:
-                # 停止所有处理器
-                for handler in self.app.handlers.values():
-                    for group in handler:
-                        group.clear()
-                
-                # 停止更新器
-                if self.app.updater:
-                    await self.app.updater.stop()
+                # 停止更新器（已在stop_polling中处理）
                 
                 # 停止和关闭应用
-                await self.app.stop()
-                await self.app.shutdown()
+                try:
+                    await self.app.stop()
+                except Exception as e:
+                    logging.warning(f"停止应用时发生错误，将继续执行: {str(e)}")
+                    
+                try:
+                    await self.app.shutdown()
+                except Exception as e:
+                    logging.warning(f"关闭应用时发生错误，将继续执行: {str(e)}")
+                
+                # 清理连接
                 await self.cleanup_connections()
                 
                 # 清空引用
@@ -531,7 +549,7 @@ class TelegramBot:
             await asyncio.sleep(5)  # 等待5秒后重启
             
             # 重新创建应用实例
-            self.app = Application.builder().token(self.token).pool_timeout(self.pool_timeout).connect_timeout(self.connect_timeout).read_timeout(self.read_timeout).write_timeout(self.write_timeout).connection_pool_size(self.connection_pool_size).pool_maxsize(self.pool_maxsize).get_updates_connection_pool_size(self.connection_pool_size).build()
+            self.app = Application.builder().token(self.token).pool_timeout(self.pool_timeout).connect_timeout(self.connect_timeout).read_timeout(self.read_timeout).write_timeout(self.write_timeout).connection_pool_size(self.connection_pool_size).get_updates_connection_pool_size(self.connection_pool_size).build()
             
             # 重新注册处理器
             self.app.add_handler(CommandHandler('start', self.start_command))
@@ -549,7 +567,7 @@ class TelegramBot:
             
         except Exception as e:
             logging.error(f"重新创建应用实例时发生错误: {str(e)}")
-            raise
+            # 不抛出异常，允许程序继续运行
             
         self.last_update_time = datetime.now()
         logging.info("Telegram Bot 轮询重启完成")
@@ -563,20 +581,48 @@ class TelegramBot:
                 
                 if time_since_last_update > self.update_timeout:
                     logging.warning(f"已超过 {self.update_timeout} 秒未收到更新，准备重启轮询...")
-                    await self.restart_polling()
+                    try:
+                        await self.restart_polling()
+                    except Exception as e:
+                        logging.error(f"重启轮询失败: {str(e)}")
                     
                 # 每60秒进行一次测试请求
-                try:
-                    await self.app.bot.get_me()
-                    self.connection_error_count = 0
-                except Exception as e:
-                    self.connection_error_count += 1
-                    logging.error(f"连接测试失败 ({self.connection_error_count}/{self.max_connection_errors}): {str(e)}")
-                    
-                    if self.connection_error_count >= self.max_connection_errors:
-                        logging.critical("连接错误次数过多，准备重启轮询...")
-                        await self.restart_polling()
+                if self.app and hasattr(self.app, 'bot'):
+                    try:
+                        await self.app.bot.get_me()
                         self.connection_error_count = 0
+                    except Exception as e:
+                        self.connection_error_count += 1
+                        logging.error(f"连接测试失败 ({self.connection_error_count}/{self.max_connection_errors}): {str(e)}")
+                        
+                        if self.connection_error_count >= self.max_connection_errors:
+                            logging.critical("连接错误次数过多，准备重启轮询...")
+                            try:
+                                await self.restart_polling()
+                                self.connection_error_count = 0
+                            except Exception as restart_e:
+                                logging.error(f"尝试重启轮询失败: {str(restart_e)}")
+                else:
+                    logging.warning("应用实例尚未初始化，尝试初始化...")
+                    try:
+                        # 尝试创建新的应用实例
+                        self.app = Application.builder().token(self.token).pool_timeout(self.pool_timeout).connect_timeout(self.connect_timeout).read_timeout(self.read_timeout).write_timeout(self.write_timeout).connection_pool_size(self.connection_pool_size).get_updates_connection_pool_size(self.connection_pool_size).build()
+                        
+                        # 重新注册处理器
+                        self.app.add_handler(CommandHandler('start', self.start_command))
+                        self.app.add_handler(CommandHandler('punch_in', self.punch_in_command))
+                        self.app.add_handler(CommandHandler('punch_out', self.punch_out_command))
+                        self.app.add_handler(CommandHandler('status', self.status_command))
+                        self.app.add_handler(CommandHandler('errors', self.get_recent_errors))
+                        self.app.add_handler(CommandHandler('kill', self.kill_command))
+                        self.app.add_handler(CallbackQueryHandler(self.button_callback))
+                        
+                        # 初始化并启动
+                        await self.app.initialize()
+                        await self.app.start()
+                        await self.start_polling()
+                    except Exception as init_e:
+                        logging.error(f"初始化应用实例失败: {str(init_e)}")
                 
                 await asyncio.sleep(60)
             except Exception as e:
@@ -587,7 +633,7 @@ class TelegramBot:
         """运行Telegram机器人"""
         self.attendance_system = attendance_system
         # 配置应用程序，添加连接池和超时设置
-        self.app = Application.builder().token(self.token).pool_timeout(self.pool_timeout).connect_timeout(self.connect_timeout).read_timeout(self.read_timeout).write_timeout(self.write_timeout).connection_pool_size(self.connection_pool_size).pool_maxsize(self.pool_maxsize).get_updates_connection_pool_size(self.connection_pool_size).build()
+        self.app = Application.builder().token(self.token).pool_timeout(self.pool_timeout).connect_timeout(self.connect_timeout).read_timeout(self.read_timeout).write_timeout(self.write_timeout).connection_pool_size(self.connection_pool_size).get_updates_connection_pool_size(self.connection_pool_size).build()
         
         # 注册命令处理器
         self.app.add_handler(CommandHandler('start', self.start_command))
