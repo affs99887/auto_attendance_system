@@ -53,6 +53,9 @@ class TelegramBot:
         self.read_timeout = 30
         self.write_timeout = 30
         self.connect_timeout = 30
+        # 添加设置定时打卡的状态变量
+        self.setting_time_state = {}  # 用于存储用户的设置状态
+        self.setting_time_timer = {}  # 用于存储设置超时计时器
 
 
     async def start_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -195,18 +198,35 @@ class TelegramBot:
             return
             
         try:
+            # 获取页码参数，默认为第1页
+            page = 1
+            if context.args and len(context.args) > 0:
+                try:
+                    page = int(context.args[0])
+                except ValueError:
+                    page = 1
+            
+            # 确保日志文件路径正确
+            log_file = 'attendance_system.log'
+            if not os.path.exists(log_file):
+                log_file = os.path.join('logs', 'attendance_system.log')
+                if not os.path.exists(log_file):
+                    await update.message.reply_text("找不到日志文件，请检查文件是否存在")
+                    return
+            
             # 尝试不同的编码方式读取日志
             encodings = ['utf-8', 'gbk', 'gb2312', 'gb18030', 'latin1']
             logs = []
             
             for encoding in encodings:
                 try:
-                    with open(self.log_file, 'r', encoding=encoding) as f:
+                    with open(log_file, 'r', encoding=encoding) as f:
                         logs = f.readlines()
                     break  # 如果成功读取，跳出循环
                 except UnicodeDecodeError:
                     continue  # 如果当前编码失败，尝试下一个
                 except Exception as e:
+                    logging.error(f"读取日志文件时出错: {str(e)}")
                     continue
             
             if not logs:
@@ -223,24 +243,100 @@ class TelegramBot:
             # 只保留最近的50条错误日志（按时间正序）
             recent_logs = error_logs[-50:]
             
-            # 格式化日志消息
-            log_message = "最近的错误日志（按时间正序）：\n\n"
-            log_message += "".join(recent_logs)
+            # 对日志进行分类和格式化
+            formatted_logs = []
+            current_error_group = None
+            current_error_lines = []
             
-            # 如果消息太长，分段发送
-            if len(log_message) > 4000:
-                for i in range(0, len(log_message), 4000):
-                    chunk = log_message[i:i + 4000]
-                    await update.message.reply_text(chunk)
-            else:
-                await update.message.reply_text(log_message)
+            for log_line in recent_logs:
+                # 检查是否是新的错误开始
+                if ('ERROR' in log_line or 'CRITICAL' in log_line) and (' - ERROR - ' in log_line or ' - CRITICAL - ' in log_line):
+                    # 如果有之前的错误组，先添加到结果中
+                    if current_error_group and current_error_lines:
+                        formatted_logs.append({
+                            'timestamp': current_error_group,
+                            'content': current_error_lines
+                        })
+                    
+                    # 提取时间戳作为新的错误组
+                    timestamp_part = log_line.split(' - ERROR')[0].strip()
+                    if ' - CRITICAL' in log_line:
+                        timestamp_part = log_line.split(' - CRITICAL')[0].strip()
+                    
+                    current_error_group = timestamp_part
+                    current_error_lines = [log_line.split(' - ERROR - ')[-1].strip() if ' - ERROR - ' in log_line 
+                                          else log_line.split(' - CRITICAL - ')[-1].strip()]
+                else:
+                    # 继续添加到当前错误组
+                    if current_error_lines:
+                        current_error_lines.append(log_line.strip())
+            
+            # 添加最后一组
+            if current_error_group and current_error_lines:
+                formatted_logs.append({
+                    'timestamp': current_error_group,
+                    'content': current_error_lines
+                })
+            
+            # 反转列表，使最近的错误显示在最前面
+            formatted_logs.reverse()
+            
+            # 分页处理
+            items_per_page = 5  # 每页显示5个错误组
+            total_pages = (len(formatted_logs) + items_per_page - 1) // items_per_page
+            
+            # 确保页码在有效范围内
+            if page < 1:
+                page = 1
+            if page > total_pages:
+                page = total_pages
+            
+            # 计算当前页的数据范围
+            start_idx = (page - 1) * items_per_page
+            end_idx = min(start_idx + items_per_page, len(formatted_logs))
+            current_page_logs = formatted_logs[start_idx:end_idx]
+            
+            # 构建格式化的消息
+            log_message = f"📋 *最近的错误日志* (第{page}/{total_pages}页)\n\n"
+            
+            for i, log_group in enumerate(current_page_logs):
+                # 添加分隔线（除了第一组）
+                if i > 0:
+                    log_message += "\n" + "—" * 30 + "\n\n"
                 
-        except FileNotFoundError:
-            await update.message.reply_text("日志文件不存在")
+                # 添加时间戳和错误内容
+                log_message += f"⏱️ *{log_group['timestamp']}*\n"
+                log_message += f"❌ {log_group['content'][0]}\n"
+                
+                # 添加额外的错误详情（如果有）
+                if len(log_group['content']) > 1:
+                    for detail in log_group['content'][1:]:
+                        if detail.strip():  # 只添加非空行
+                            log_message += f"   {detail}\n"
+            
+            # 创建翻页按钮
+            keyboard = []
+            buttons = []
+            
+            # 添加上一页按钮
+            if page > 1:
+                buttons.append(InlineKeyboardButton("⬅️ 上一页", callback_data=f"errors_page_{page-1}"))
+            
+            # 添加下一页按钮
+            if page < total_pages:
+                buttons.append(InlineKeyboardButton("下一页 ➡️", callback_data=f"errors_page_{page+1}"))
+            
+            if buttons:
+                keyboard.append(buttons)
+            
+            reply_markup = InlineKeyboardMarkup(keyboard) if keyboard else None
+            
+            # 发送消息
+            await update.message.reply_text(log_message, parse_mode='Markdown', reply_markup=reply_markup)
         except Exception as e:
-            error_msg = f"获取日志时发生错误: {str(e)}\n"
-            error_msg += "请检查日志文件权限和编码格式"
-            await update.message.reply_text(error_msg)
+            error_msg = f"获取错误日志时发生异常: {str(e)}"
+            logging.error(error_msg)
+            await update.message.reply_text(f"获取错误日志失败: {str(e)}")
 
     async def send_message(self, title, content):
         """发送Telegram消息"""
@@ -444,7 +540,48 @@ class TelegramBot:
                         await query.message.edit_text("所有任务已删除")
                 else:
                     await query.message.reply_text("❌ 删除任务失败")
+            elif query.data.startswith('settime_type_'):
+                punch_type = query.data.split('_')[-1]
+                self.setting_time_state[self.chat_id]['type'] = punch_type
+                
+                # 创建设置模式选择按钮
+                keyboard = [
+                    [
+                        InlineKeyboardButton("延时执行", callback_data=f'settime_mode_delay_{punch_type}'),
+                        InlineKeyboardButton("指定时间", callback_data=f'settime_mode_specific_{punch_type}')
+                    ]
+                ]
+                reply_markup = InlineKeyboardMarkup(keyboard)
+                
+                await query.message.edit_text(
+                    f"请选择设置模式：",
+                    reply_markup=reply_markup
+                )
+                
+            elif query.data.startswith('settime_mode_'):
+                parts = query.data.split('_')
+                mode = parts[2]
+                punch_type = parts[3]
+                
+                self.setting_time_state[self.chat_id].update({
+                    'mode': mode,
+                    'step': 'input_delay' if mode == 'delay' else 'input_hour'
+                })
+                
+                if mode == 'delay':
+                    await query.message.edit_text("请输入要延迟的分钟数：")
+                else:
+                    await query.message.edit_text("请输入小时数（0-23）：")
 
+            # 处理错误日志翻页
+            elif query.data.startswith('errors_page_'):
+                page = int(query.data.split('_')[-1])
+                # 使用命令处理器重新获取指定页的错误日志
+                context.args = [str(page)]
+                await self.get_recent_errors(Update(update_id=update.callback_query.id, message=query.message), context)
+                # 删除原消息
+                await query.message.delete()
+                
         except Exception as e:
             error_msg = f"处理按钮回调时发生错误: {str(e)}"
             logging.error(error_msg)
@@ -527,8 +664,6 @@ class TelegramBot:
         # 完全关闭和清理旧的应用实例
         try:
             if self.app:
-                # 停止更新器（已在stop_polling中处理）
-                
                 # 停止和关闭应用
                 try:
                     await self.app.stop()
@@ -558,7 +693,17 @@ class TelegramBot:
             self.app.add_handler(CommandHandler('status', self.status_command))
             self.app.add_handler(CommandHandler('errors', self.get_recent_errors))
             self.app.add_handler(CommandHandler('kill', self.kill_command))
+            self.app.add_handler(CommandHandler('set_time', self.settime_command))
             self.app.add_handler(CallbackQueryHandler(self.button_callback))
+            # 注册消息处理器，必须在其他处理器之后添加
+            self.app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self.handle_message))
+            
+            # 添加更新时间记录处理器
+            async def update_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+                self.last_update_time = datetime.now()
+                self.connection_error_count = 0  # 重置错误计数
+            
+            self.app.add_handler(MessageHandler(filters.ALL, update_handler))
             
             # 初始化并启动
             await self.app.initialize()
@@ -577,52 +722,62 @@ class TelegramBot:
         while True:
             try:
                 current_time = datetime.now()
-                time_since_last_update = (current_time - self.last_update_time).total_seconds()
                 
-                if time_since_last_update > self.update_timeout:
-                    logging.warning(f"已超过 {self.update_timeout} 秒未收到更新，准备重启轮询...")
-                    try:
-                        await self.restart_polling()
-                    except Exception as e:
-                        logging.error(f"重启轮询失败: {str(e)}")
+                # 检查最后更新时间
+                if self.last_update_time:
+                    time_since_last_update = (current_time - self.last_update_time).total_seconds()
                     
-                # 每60秒进行一次测试请求
-                if self.app and hasattr(self.app, 'bot'):
-                    try:
-                        await self.app.bot.get_me()
-                        self.connection_error_count = 0
-                    except Exception as e:
-                        self.connection_error_count += 1
-                        logging.error(f"连接测试失败 ({self.connection_error_count}/{self.max_connection_errors}): {str(e)}")
+                    if time_since_last_update > self.update_timeout:
+                        logging.warning(f"已经 {time_since_last_update:.0f} 秒没有收到更新，尝试重启轮询...")
                         
-                        if self.connection_error_count >= self.max_connection_errors:
-                            logging.critical("连接错误次数过多，准备重启轮询...")
+                        # 尝试重启轮询
+                        try:
+                            await self.restart_polling()
+                        except Exception as e:
+                            logging.error(f"重启轮询失败: {str(e)}")
+                            
+                            # 如果重启失败，尝试完全重新创建应用实例
                             try:
-                                await self.restart_polling()
-                                self.connection_error_count = 0
-                            except Exception as restart_e:
-                                logging.error(f"尝试重启轮询失败: {str(restart_e)}")
-                else:
-                    logging.warning("应用实例尚未初始化，尝试初始化...")
-                    try:
-                        # 尝试创建新的应用实例
-                        self.app = Application.builder().token(self.token).pool_timeout(self.pool_timeout).connect_timeout(self.connect_timeout).read_timeout(self.read_timeout).write_timeout(self.write_timeout).connection_pool_size(self.connection_pool_size).get_updates_connection_pool_size(self.connection_pool_size).build()
-                        
-                        # 重新注册处理器
-                        self.app.add_handler(CommandHandler('start', self.start_command))
-                        self.app.add_handler(CommandHandler('punch_in', self.punch_in_command))
-                        self.app.add_handler(CommandHandler('punch_out', self.punch_out_command))
-                        self.app.add_handler(CommandHandler('status', self.status_command))
-                        self.app.add_handler(CommandHandler('errors', self.get_recent_errors))
-                        self.app.add_handler(CommandHandler('kill', self.kill_command))
-                        self.app.add_handler(CallbackQueryHandler(self.button_callback))
-                        
-                        # 初始化并启动
-                        await self.app.initialize()
-                        await self.app.start()
-                        await self.start_polling()
-                    except Exception as init_e:
-                        logging.error(f"初始化应用实例失败: {str(init_e)}")
+                                if self.app:
+                                    try:
+                                        await self.app.stop()
+                                        await self.app.shutdown()
+                                    except Exception as stop_e:
+                                        logging.warning(f"停止旧应用实例时发生错误: {str(stop_e)}")
+                                    
+                                    await self.cleanup_connections()
+                                    self.app = None
+                                
+                                await asyncio.sleep(5)  # 等待5秒
+                                
+                                # 尝试创建新的应用实例
+                                self.app = Application.builder().token(self.token).pool_timeout(self.pool_timeout).connect_timeout(self.connect_timeout).read_timeout(self.read_timeout).write_timeout(self.write_timeout).connection_pool_size(self.connection_pool_size).get_updates_connection_pool_size(self.connection_pool_size).build()
+                                
+                                # 重新注册处理器
+                                self.app.add_handler(CommandHandler('start', self.start_command))
+                                self.app.add_handler(CommandHandler('punch_in', self.punch_in_command))
+                                self.app.add_handler(CommandHandler('punch_out', self.punch_out_command))
+                                self.app.add_handler(CommandHandler('status', self.status_command))
+                                self.app.add_handler(CommandHandler('errors', self.get_recent_errors))
+                                self.app.add_handler(CommandHandler('kill', self.kill_command))
+                                self.app.add_handler(CommandHandler('set_time', self.settime_command))
+                                self.app.add_handler(CallbackQueryHandler(self.button_callback))
+                                # 注册消息处理器，必须在其他处理器之后添加
+                                self.app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self.handle_message))
+                                
+                                # 添加更新时间记录处理器
+                                async def update_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+                                    self.last_update_time = datetime.now()
+                                    self.connection_error_count = 0  # 重置错误计数
+                                
+                                self.app.add_handler(MessageHandler(filters.ALL, update_handler))
+                                
+                                # 初始化并启动
+                                await self.app.initialize()
+                                await self.app.start()
+                                await self.start_polling()
+                            except Exception as init_e:
+                                logging.error(f"初始化应用实例失败: {str(init_e)}")
                 
                 await asyncio.sleep(60)
             except Exception as e:
@@ -630,21 +785,26 @@ class TelegramBot:
                 await asyncio.sleep(60)
 
     def run(self, attendance_system):
-        """运行Telegram机器人"""
+        """运行机器人"""
         self.attendance_system = attendance_system
+        
         # 配置应用程序，添加连接池和超时设置
         self.app = Application.builder().token(self.token).pool_timeout(self.pool_timeout).connect_timeout(self.connect_timeout).read_timeout(self.read_timeout).write_timeout(self.write_timeout).connection_pool_size(self.connection_pool_size).get_updates_connection_pool_size(self.connection_pool_size).build()
         
         # 注册命令处理器
-        self.app.add_handler(CommandHandler('start', self.start_command))
-        self.app.add_handler(CommandHandler('punch_in', self.punch_in_command))
-        self.app.add_handler(CommandHandler('punch_out', self.punch_out_command))
-        self.app.add_handler(CommandHandler('status', self.status_command))
-        self.app.add_handler(CommandHandler('errors', self.get_recent_errors))
-        self.app.add_handler(CommandHandler('kill', self.kill_command))
+        self.app.add_handler(CommandHandler("start", self.start_command))
+        self.app.add_handler(CommandHandler("punch_in", self.punch_in_command))
+        self.app.add_handler(CommandHandler("punch_out", self.punch_out_command))
+        self.app.add_handler(CommandHandler("status", self.status_command))
+        self.app.add_handler(CommandHandler("errors", self.get_recent_errors))
+        self.app.add_handler(CommandHandler("kill", self.kill_command))
+        self.app.add_handler(CommandHandler("set_time", self.settime_command))  # 修改命令名称
         
         # 注册按钮回调处理器
         self.app.add_handler(CallbackQueryHandler(self.button_callback))
+        
+        # 注册消息处理器
+        self.app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self.handle_message))  # 添加消息处理器
         
         # 添加更新时间记录
         async def update_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -664,6 +824,149 @@ class TelegramBot:
             connect_timeout=self.connect_timeout,
             pool_timeout=self.pool_timeout
         )
+
+    async def settime_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """处理/settime命令"""
+        if str(update.message.chat_id) != self.chat_id:
+            await update.message.reply_text("您没有权限使用此机器人")
+            return
+
+        # 创建打卡类型选择按钮
+        keyboard = [
+            [
+                InlineKeyboardButton("设置上班时间", callback_data='settime_type_in'),
+                InlineKeyboardButton("设置下班时间", callback_data='settime_type_out')
+            ]
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        # 初始化状态
+        self.setting_time_state[self.chat_id] = {
+            'step': 'select_type',
+            'type': None,
+            'mode': None,
+            'hour': None,
+            'minute': None
+        }
+        
+        # 设置1分钟超时
+        if self.chat_id in self.setting_time_timer:
+            self.setting_time_timer[self.chat_id].cancel()
+        self.setting_time_timer[self.chat_id] = asyncio.create_task(self._cancel_settime_timeout(self.chat_id))
+
+        await update.message.reply_text(
+            "请选择要设置的打卡类型：",
+            reply_markup=reply_markup
+        )
+
+    async def _cancel_settime_timeout(self, chat_id):
+        """一分钟后取消设置时间的状态"""
+        await asyncio.sleep(60)
+        if chat_id in self.setting_time_state:
+            del self.setting_time_state[chat_id]
+            await self.send_message("设置超时", "由于超过1分钟没有操作，设置已取消")
+
+    async def handle_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """处理文本消息"""
+        if str(update.message.chat_id) != self.chat_id:
+            await update.message.reply_text("您没有权限使用此机器人")
+            return
+
+        if self.chat_id not in self.setting_time_state:
+            return
+
+        # 重置超时计时器
+        if self.chat_id in self.setting_time_timer:
+            self.setting_time_timer[self.chat_id].cancel()
+        self.setting_time_timer[self.chat_id] = asyncio.create_task(self._cancel_settime_timeout(self.chat_id))
+
+        state = self.setting_time_state[self.chat_id]
+        text = update.message.text
+
+        if state['step'] == 'input_delay':
+            try:
+                delay_minutes = int(text)
+                if delay_minutes <= 0:
+                    await update.message.reply_text("请输入大于0的数字")
+                    return
+                
+                # 计算目标时间
+                target_time = datetime.now() + timedelta(minutes=delay_minutes)
+                await self._schedule_punch(state['type'], target_time.hour, target_time.minute)
+                del self.setting_time_state[self.chat_id]
+                self.setting_time_timer[self.chat_id].cancel()
+                
+            except ValueError:
+                await update.message.reply_text("请输入有效的数字")
+                
+        elif state['step'] == 'input_hour':
+            try:
+                hour = int(text)
+                if 0 <= hour <= 23:
+                    state['hour'] = hour
+                    state['step'] = 'input_minute'
+                    await update.message.reply_text("请输入分钟数（0-59）：")
+                else:
+                    await update.message.reply_text("请输入0-23之间的数字")
+            except ValueError:
+                await update.message.reply_text("请输入有效的数字")
+                
+        elif state['step'] == 'input_minute':
+            try:
+                minute = int(text)
+                if 0 <= minute <= 59:
+                    await self._schedule_punch(state['type'], state['hour'], minute)
+                    del self.setting_time_state[self.chat_id]
+                    self.setting_time_timer[self.chat_id].cancel()
+                else:
+                    await update.message.reply_text("请输入0-59之间的数字")
+            except ValueError:
+                await update.message.reply_text("请输入有效的数字")
+
+    async def _schedule_punch(self, punch_type, hour, minute):
+        """设置定时打卡任务"""
+        time_str = f"{hour:02d}:{minute:02d}"
+        target_time = datetime.strptime(time_str, "%H:%M").replace(
+            year=datetime.now().year,
+            month=datetime.now().month,
+            day=datetime.now().day
+        )
+        
+        # 如果设置的时间已经过去，就设置为明天的这个时间
+        if target_time < datetime.now():
+            target_time = target_time + timedelta(days=1)
+        
+        # 删除已有的相同类型的定时任务
+        saved_tasks = self.attendance_system.task_manager.get_tasks()
+        for task in saved_tasks:
+            if task['type'] == f'punch_{punch_type}':
+                self.attendance_system.task_manager.remove_task_by_id(task['id'])
+        
+        # 清除schedule中的任务并重新加载
+        schedule.clear()
+        
+        # 添加新任务
+        task_id = self.attendance_system.task_manager.add_task(
+            task_type=f'punch_{punch_type}',
+            scheduled_time=time_str
+        )
+        
+        if punch_type == 'in':
+            async def punch_in_job():
+                await self.attendance_system.punch_in()
+                # 执行完后删除任务
+                self.attendance_system.task_manager.remove_task_by_id(task_id)
+                schedule.clear()
+            schedule.every().day.at(time_str).do(punch_in_job)
+            await self.send_message("设置成功", f"已设置在 {target_time.strftime('%Y-%m-%d %H:%M')} 自动上班打卡")
+        else:
+            async def punch_out_job():
+                await self.attendance_system.punch_out()
+                # 执行完后删除任务
+                self.attendance_system.task_manager.remove_task_by_id(task_id)
+                schedule.clear()
+            schedule.every().day.at(time_str).do(punch_out_job)
+            await self.send_message("设置成功", f"已设置在 {target_time.strftime('%Y-%m-%d %H:%M')} 自动下班打卡")
 
 class AttendanceSystem:
     def __init__(self):
@@ -1286,8 +1589,24 @@ class AttendanceSystem:
             
             # 检查是否有警告弹窗
             await self.send_notification("打卡流程", "检查是否存在警告弹窗...")
-            alert_loc = self.find_element_by_image('templates/alert.png', threshold=0.7)  # 降低匹配阈值
-            if alert_loc:
+            
+            # 使用OCR识别文本
+            custom_config = r'--oem 3 --psm 6 -c preserve_interword_spaces=1'
+            screen_text = pytesseract.image_to_string(
+                Image.fromarray(cv2.cvtColor(screen, cv2.COLOR_BGR2RGB)),
+                lang='chi_sim',
+                config=custom_config
+            )
+            
+            # 检查是否包含警告文本
+            warning_texts = [
+                "连接不是专用连接",
+                "此网站的安全证书",
+                "不安全的连接"
+            ]
+            has_alert = any(warning_text in screen_text for warning_text in warning_texts)
+            
+            if has_alert:
                 await self.send_notification("打卡流程", "检测到警告弹窗，处理中...")
                 # 查找并点击更多按钮
                 await self.send_notification("打卡流程", "尝试查找更多按钮...")
@@ -1664,8 +1983,8 @@ class AttendanceSystem:
             
             # 如果不是工作日，不进行检查
             if not is_workday(current_date):
-                return
-            
+                    return
+                
             # 重置昨天的打卡记录
             if self.today_punch_records['punch_in_time'] and \
                self.today_punch_records['punch_in_time'].date() < current_date:
@@ -1891,9 +2210,11 @@ async def main():
         app.add_handler(CommandHandler('status', attendance_system.bot.status_command))
         app.add_handler(CommandHandler('errors', attendance_system.bot.get_recent_errors))
         app.add_handler(CommandHandler('kill', attendance_system.bot.kill_command))
-        
+        app.add_handler(CommandHandler('set_time', attendance_system.bot.settime_command))
         # 注册按钮回调处理器
         app.add_handler(CallbackQueryHandler(attendance_system.bot.button_callback))
+        # 注册消息处理器，必须在其他处理器之后添加
+        app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, attendance_system.bot.handle_message))
         
         # 添加更新时间记录处理器
         async def update_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
