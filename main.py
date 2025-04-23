@@ -22,6 +22,7 @@ from punch_records import PunchRecordManager
 import telegram
 import win32gui
 import win32con
+import win32api
 import numpy as np
 import re
 
@@ -181,6 +182,16 @@ class TelegramBot:
                         if next_run < current_time:
                             next_run = next_run + timedelta(days=1)
                         status_text += f"➤ [任务 #{task['id']}] 下班打卡：{next_run.strftime('%Y-%m-%d %H:%M')}\n"
+                    elif task['type'] == 'punch_in':
+                        next_run = datetime.strptime(task['scheduled_time'], "%H:%M").replace(
+                            year=current_time.year,
+                            month=current_time.month,
+                            day=current_time.day
+                        )
+                        # 如果时间已过，显示明天的时间
+                        if next_run < current_time:
+                            next_run = next_run + timedelta(days=1)
+                        status_text += f"➤ [任务 #{task['id']}] 上班打卡：{next_run.strftime('%Y-%m-%d %H:%M')}\n"
             else:
                 status_text += "\n⏱ 暂无定时任务\n"
             
@@ -430,6 +441,22 @@ class TelegramBot:
                             callback_data=f"kill_{task['id']}"
                         )
                     ])
+                elif task['type'] == 'punch_in':
+                    next_run = datetime.strptime(task['scheduled_time'], "%H:%M").replace(
+                        year=datetime.now().year,
+                        month=datetime.now().month,
+                        day=datetime.now().day
+                    )
+                    # 如果时间已过，显示明天的时间
+                    if next_run < datetime.now():
+                        next_run = next_run + timedelta(days=1)
+                    message_text += f"➤ [任务 #{task['id']}] 上班打卡：{next_run.strftime('%Y-%m-%d %H:%M')}\n"
+                    keyboard.append([
+                        InlineKeyboardButton(
+                            f"删除任务 #{task['id']}",
+                            callback_data=f"kill_{task['id']}"
+                        )
+                    ])
 
             reply_markup = InlineKeyboardMarkup(keyboard)
             await update.message.reply_text(message_text, reply_markup=reply_markup)
@@ -457,7 +484,11 @@ class TelegramBot:
                     async def retry_punch_out_job():
                         await self.attendance_system.punch_out()
                     schedule.every().day.at(saved_task['scheduled_time']).do(retry_punch_out_job)
-
+                elif saved_task['type'] == 'punch_in':
+                    async def retry_punch_in_job():
+                        await self.attendance_system.punch_in()
+                    schedule.every().day.at(saved_task['scheduled_time']).do(retry_punch_in_job)
+            
             await message.reply_text(
                 f"已删除任务:\n"
                 f"ID: {task['id']}\n"
@@ -498,6 +529,10 @@ class TelegramBot:
                             async def retry_punch_out_job():
                                 await self.attendance_system.punch_out()
                             schedule.every().day.at(saved_task['scheduled_time']).do(retry_punch_out_job)
+                        elif saved_task['type'] == 'punch_in':
+                            async def retry_punch_in_job():
+                                await self.attendance_system.punch_in()
+                            schedule.every().day.at(saved_task['scheduled_time']).do(retry_punch_in_job)
 
                     # 发送删除成功的消息
                     await query.message.reply_text(
@@ -526,6 +561,22 @@ class TelegramBot:
                             if next_run < datetime.now():
                                 next_run = next_run + timedelta(days=1)
                             message_text += f"➤ [任务 #{remaining_task['id']}] 下班打卡：{next_run.strftime('%Y-%m-%d %H:%M')}\n"
+                            keyboard.append([
+                                InlineKeyboardButton(
+                                    f"删除任务 #{remaining_task['id']}",
+                                    callback_data=f"kill_{remaining_task['id']}"
+                                )
+                            ])
+                        elif remaining_task['type'] == 'punch_in':
+                            next_run = datetime.strptime(remaining_task['scheduled_time'], "%H:%M").replace(
+                                year=datetime.now().year,
+                                month=datetime.now().month,
+                                day=datetime.now().day
+                            )
+                            # 如果时间已过，显示明天的时间
+                            if next_run < datetime.now():
+                                next_run = next_run + timedelta(days=1)
+                            message_text += f"➤ [任务 #{remaining_task['id']}] 上班打卡：{next_run.strftime('%Y-%m-%d %H:%M')}\n"
                             keyboard.append([
                                 InlineKeyboardButton(
                                     f"删除任务 #{remaining_task['id']}",
@@ -936,10 +987,20 @@ class TelegramBot:
         if target_time < datetime.now():
             target_time = target_time + timedelta(days=1)
         
+        # 标准化punch_type
+        if punch_type == "上班" or punch_type == "in":
+            task_type = "punch_in"
+            display_type = "上班"
+        elif punch_type == "下班" or punch_type == "out":
+            task_type = "punch_out"
+            display_type = "下班"
+        else:
+            raise ValueError(f"无效的打卡类型: {punch_type}")
+        
         # 删除已有的相同类型的定时任务
         saved_tasks = self.attendance_system.task_manager.get_tasks()
         for task in saved_tasks:
-            if task['type'] == f'punch_{punch_type}':
+            if task['type'] == task_type:
                 self.attendance_system.task_manager.remove_task_by_id(task['id'])
         
         # 清除schedule中的任务并重新加载
@@ -947,35 +1008,448 @@ class TelegramBot:
         
         # 添加新任务
         task_id = self.attendance_system.task_manager.add_task(
-            task_type=f'punch_{punch_type}',
+            task_type=task_type,
             scheduled_time=time_str
         )
         
-        if punch_type == 'in':
+        if task_type == "punch_in":
             async def punch_in_job():
                 await self.attendance_system.punch_in()
                 # 执行完后删除任务
                 self.attendance_system.task_manager.remove_task_by_id(task_id)
                 schedule.clear()
-            schedule.every().day.at(time_str).do(punch_in_job)
-            await self.send_message("设置成功", f"已设置在 {target_time.strftime('%Y-%m-%d %H:%M')} 自动上班打卡")
+            schedule.every().day.at(time_str).do(lambda: asyncio.create_task(punch_in_job()))
+            await self.send_message("设置成功", f"已设置在 {target_time.strftime('%Y-%m-%d %H:%M')} 自动{display_type}打卡")
         else:
             async def punch_out_job():
                 await self.attendance_system.punch_out()
                 # 执行完后删除任务
                 self.attendance_system.task_manager.remove_task_by_id(task_id)
                 schedule.clear()
-            schedule.every().day.at(time_str).do(punch_out_job)
-            await self.send_message("设置成功", f"已设置在 {target_time.strftime('%Y-%m-%d %H:%M')} 自动下班打卡")
+            schedule.every().day.at(time_str).do(lambda: asyncio.create_task(punch_out_job()))
+            await self.send_message("设置成功", f"已设置在 {target_time.strftime('%Y-%m-%d %H:%M')} 自动{display_type}打卡")
+
+    def close_browser(self):
+        """通过识别关闭按钮关闭浏览器窗口"""
+        try:
+            # 获取当前屏幕截图
+            screen = self.attendance_system.take_screenshot()
+            if screen is None:
+                logging.error("关闭浏览器时无法获取屏幕截图")
+                return False
+            
+            # 使用模板匹配查找关闭按钮
+            logging.info("使用模板匹配查找关闭按钮")
+            close_button_loc = self.attendance_system.find_element_by_image('templates/close_button.png', threshold=0.7)
+            if close_button_loc:
+                logging.info(f"找到关闭按钮，位置: {close_button_loc}")
+                self.attendance_system.click_position(*close_button_loc)
+                time.sleep(1)  # 等待窗口关闭
+                
+                # 验证浏览器是否已关闭
+                new_screen = self.attendance_system.take_screenshot()
+                if new_screen is not None:
+                    # 比较两个截图，检查是否有变化
+                    diff = cv2.absdiff(screen, new_screen)
+                    non_zero_count = np.count_nonzero(diff)
+                    if non_zero_count > 10000:  # 如果有足够的差异，认为浏览器已关闭
+                        logging.info("浏览器窗口已关闭")
+                        return True
+                else:
+                    logging.info("浏览器窗口已关闭")
+                    return True
+            else:
+                logging.info("未找到关闭按钮，尝试备选方法")
+                
+                # 备选方法1：尝试点击右上角固定位置
+                height, width = screen.shape[:2]
+                logging.info("尝试点击浏览器右上角固定位置")
+                self.attendance_system.click_position(width - 20, 20)
+                time.sleep(1)  # 等待窗口关闭
+                
+                # 验证浏览器是否已关闭
+                new_screen = self.attendance_system.take_screenshot()
+                if new_screen is not None:
+                    diff = cv2.absdiff(screen, new_screen)
+                    non_zero_count = np.count_nonzero(diff)
+                    if non_zero_count > 10000:
+                        logging.info("浏览器窗口已关闭")
+                        return True
+                else:
+                    logging.info("浏览器窗口已关闭")
+                    return True
+                
+                # 备选方法2：使用win32gui关闭
+                logging.info("尝试使用win32gui关闭浏览器")
+                hwnd = self.attendance_system.get_browser_window()
+                if hwnd:
+                    win32gui.PostMessage(hwnd, win32con.WM_CLOSE, 0, 0)
+                    time.sleep(1)  # 等待窗口关闭
+                    return True
+            
+            # 如果所有方法都失败，返回失败
+            logging.error("所有关闭浏览器的方法都失败")
+            return False
+        except Exception as e:
+            logging.error(f"关闭浏览器窗口时发生错误: {str(e)}")
+            # 尝试使用win32gui作为最后的备选方案
+            try:
+                hwnd = self.attendance_system.get_browser_window()
+                if hwnd:
+                    win32gui.PostMessage(hwnd, win32con.WM_CLOSE, 0, 0)
+                    time.sleep(1)  # 等待窗口关闭
+                    return True
+                return False
+            except Exception as e2:
+                logging.error(f"备选关闭方法也失败: {str(e2)}")
+                return False
+
+    async def _do_punch(self, punch_type="上班", username=None, password=None):
+        """通用打卡方法"""
+        screen = None
+        try:
+            # 重置消息
+            self.current_message = f"开始{punch_type}打卡流程 - 用户: {username}"
+            self.message_id = None
+            
+            # 使用 Edge InPrivate 模式打开新窗口
+            await self.send_notification("打卡流程", "开始打开浏览器...")
+            os.system('start msedge --inprivate --new-window "{}"'.format(self.login_url))
+            time.sleep(3)  # 增加等待时间，确保页面完全加载
+            
+            # 获取当前窗口截图用于错误处理
+            screen = self.take_screenshot()
+            
+            # 检查是否有警告弹窗
+            await self.send_notification("打卡流程", "检查是否存在警告弹窗...")
+            
+            # 使用OCR识别文本
+            custom_config = r'--oem 3 --psm 6 -c preserve_interword_spaces=1'
+            screen_text = pytesseract.image_to_string(
+                Image.fromarray(cv2.cvtColor(screen, cv2.COLOR_BGR2RGB)),
+                lang='chi_sim',
+                config=custom_config
+            )
+            
+            # 检查是否包含警告文本
+            warning_texts = [
+                "连接不是专用连接",
+                "此网站的安全证书",
+                "不安全的连接"
+            ]
+            has_alert = any(warning_text in screen_text for warning_text in warning_texts)
+            
+            if has_alert:
+                await self.send_notification("打卡流程", "检测到警告弹窗，处理中...")
+                # 查找并点击更多按钮
+                await self.send_notification("打卡流程", "尝试查找更多按钮...")
+                more_button_loc = self.find_element_by_image('templates/more_button.png', threshold=0.5)
+                if not more_button_loc:
+                    error_msg = "检测到警告弹窗但未找到更多按钮，终止打卡流程"
+                    await self.send_notification("打卡流程", error_msg)
+                    # 发送失败截图
+                    if screen is not None:
+                        screenshot_path = 'punch_error.png'
+                        cv2.imwrite(screenshot_path, screen)
+                        try:
+                            with open(screenshot_path, 'rb') as photo:
+                                await self.bot.app.bot.send_photo(
+                                    chat_id=self.bot.chat_id,
+                                    photo=photo,
+                                    caption=f"{punch_type}打卡失败 - {error_msg}"
+                                )
+                            os.remove(screenshot_path)
+                        except Exception as e:
+                            await self.send_notification("打卡流程", f"截图发送失败: {str(e)}")
+                    return False
+                
+                await self.send_notification("打卡流程", "找到更多按钮，点击中...")
+                self.click_position(*more_button_loc)
+                time.sleep(1)
+                
+                # 更新截图
+                screen = self.take_screenshot()
+                
+                # 查找并点击继续按钮
+                await self.send_notification("打卡流程", "尝试查找继续按钮...")
+                continue_button_loc = self.find_element_by_image('templates/continue2.png', threshold=0.5)
+                if not continue_button_loc:
+                    error_msg = "点击更多按钮后未找到继续按钮，终止打卡流程"
+                    await self.send_notification("打卡流程", error_msg)
+                    # 发送失败截图
+                    if screen is not None:
+                        screenshot_path = 'punch_error.png'
+                        cv2.imwrite(screenshot_path, screen)
+                        try:
+                            with open(screenshot_path, 'rb') as photo:
+                                await self.bot.app.bot.send_photo(
+                                    chat_id=self.bot.chat_id,
+                                    photo=photo,
+                                    caption=f"{punch_type}打卡失败 - {error_msg}"
+                                )
+                            os.remove(screenshot_path)
+                        except Exception as e:
+                            await self.send_notification("打卡流程", f"截图发送失败: {str(e)}")
+                    return False
+                
+                await self.send_notification("打卡流程", "点击继续按钮...")
+                self.click_position(*continue_button_loc)
+                time.sleep(1)
+            else:
+                await self.send_notification("打卡流程", "未检测到警告弹窗，继续执行...")
+            
+            # 更新截图
+            screen = self.take_screenshot()
+            
+            if await self.login(username, password):
+                await self.send_notification("打卡流程", "登录成功，等待系统加载...")
+                time.sleep(3)
+                
+                # 更新截图
+                screen = self.take_screenshot()
+                
+                # 根据打卡类型选择不同的按钮模板
+                button_template = 'templates/punch_button.png' if punch_type == "上班" else 'templates/punch_out_button.png'
+                await self.send_notification("打卡流程", "开始查找打卡按钮...")
+                punch_button_loc = self.find_element_by_image(button_template)
+                if punch_button_loc:
+                    await self.send_notification("打卡流程", "找到打卡按钮，开始打卡...")
+                    self.click_position(*punch_button_loc)
+                    time.sleep(2)  # 等待打卡结果显示
+                    
+                    # 更新截图
+                    screen = self.take_screenshot()
+                    if screen is None:
+                        await self.send_notification("打卡流程", "截图失败")
+                        return False
+                    
+                    current_time = datetime.now()
+                    punch_success = False
+                    
+                    # 检查异常打卡情况
+                    if punch_type == "上班":
+                        if self._is_late_punch_in(current_time):
+                            await self.send_notification(
+                                "打卡异常",
+                                f"⚠️ 检测到迟到打卡！打卡时间：{current_time.strftime('%H:%M')}"
+                            )
+                        self.today_punch_records['punch_in_time'] = current_time
+                        # 保存打卡记录
+                        self.punch_record_manager.update_record(
+                            current_time.strftime('%Y-%m-%d'),
+                            "上班",
+                            current_time.strftime('%H:%M:%S')
+                        )
+                        punch_success = True
+                    else:  # 下班打卡
+                        # 检查是否存在unable_escape情况
+                        await self.send_notification("打卡流程", "检查是否满足下班条件...")
+                        unable_escape_loc = self.find_element_by_image('templates/unable_escape.png')
+                        if unable_escape_loc:
+                            # 获取剩余工作时间
+                            remaining_time = await self.get_remaining_time()
+                            if remaining_time:
+                                error_msg = f"未满足下班条件，还需工作: {remaining_time}"
+                                
+                                # 从剩余时间中提取分钟数
+                                import re
+                                time_match = re.match(r'(\d+)小时(\d+)分钟', remaining_time)
+                                if time_match:
+                                    hours = int(time_match.group(1))
+                                    minutes = int(time_match.group(2))
+                                    total_minutes = hours * 60 + minutes
+                                    
+                                    # 设置定时重试，直接使用计算出的时间
+                                    retry_time = await self.schedule_retry_punch_out(total_minutes)
+                                    error_msg += f"\n已设置在 {retry_time} 自动重试下班打卡"
+                            else:
+                                error_msg = "未满足下班条件，无法获取剩余时间"
+                            await self.send_notification("打卡流程", error_msg)
+                            
+                            # 保存并发送当前的浏览器窗口截图
+                            screenshot_path = 'punch_out_unable.png'
+                            cv2.imwrite(screenshot_path, screen)
+                            try:
+                                with open(screenshot_path, 'rb') as photo:
+                                    await self.bot.app.bot.send_photo(
+                                        chat_id=self.bot.chat_id,
+                                        photo=photo,
+                                        caption=f"下班打卡失败 - {error_msg}"
+                                    )
+                                os.remove(screenshot_path)  # 删除临时截图
+                            except Exception as e:
+                                await self.send_notification("打卡流程", f"截图发送失败: {str(e)}")
+                            return False
+                        else:
+                            # 只有在没有unable_escape时才记录下班时间
+                            if self._is_early_leave(current_time):
+                                await self.send_notification(
+                                    "打卡异常",
+                                    f"⚠️ 检测到早退打卡！打卡时间：{current_time.strftime('%H:%M')}"
+                                )
+                            self.today_punch_records['punch_out_time'] = current_time
+                            # 保存打卡记录
+                            self.punch_record_manager.update_record(
+                                current_time.strftime('%Y-%m-%d'),
+                                "下班",
+                                current_time.strftime('%H:%M:%S')
+                            )
+                            punch_success = True
+                    
+                    if punch_success:
+                        # 识别并更新打卡记录
+                        await self.get_punch_records_from_page()
+                        
+                        # 打卡完成后发送状态信息
+                        await self.send_daily_status()
+                        
+                        # 保存并发送当前的浏览器窗口截图
+                        screenshot_path = f'logs/punch_{"in" if punch_type == "上班" else "out"}_result.png'
+                        cv2.imwrite(screenshot_path, screen)
+                        
+                        success_msg = f"{punch_type}打卡成功 - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+                        await self.send_notification("打卡流程", success_msg)
+                        
+                        # 发送截图，增加重试机制
+                        max_retries = 3
+                        retry_delay = 5
+                        for retry in range(max_retries):
+                            try:
+                                if os.path.exists(screenshot_path):
+                                    with open(screenshot_path, 'rb') as photo:
+                                        await self.bot.app.bot.send_photo(
+                                            chat_id=self.bot.chat_id,
+                                            photo=photo,
+                                            caption=f"{punch_type}打卡结果截图"
+                                        )
+                                    os.remove(screenshot_path)  # 删除临时截图
+                                    break
+                                else:
+                                    await self.send_notification("打卡流程", f"截图文件不存在: {screenshot_path}")
+                            except telegram.error.NetworkError as e:
+                                if retry < max_retries - 1:
+                                    await self.send_notification("打卡流程", f"发送截图时发生网络错误，{retry + 1}/{max_retries} 次重试: {str(e)}")
+                                    await asyncio.sleep(retry_delay * (retry + 1))
+                                else:
+                                    await self.send_notification("打卡流程", f"发送截图失败，网络错误: {str(e)}")
+                            except Exception as e:
+                                await self.send_notification("打卡流程", f"发送截图失败: {str(e)}")
+                                break
+                
+                        # 关闭浏览器窗口
+                        await self.send_notification("打卡流程", "正在关闭浏览器窗口...")
+                        if self.bot.close_browser():
+                            await self.send_notification("打卡流程", "浏览器窗口已关闭")
+                        else:
+                            await self.send_notification("打卡流程", "关闭浏览器窗口失败")
+                        
+                        return True
+                    else:
+                        error_msg = "未找到打卡按钮"
+                        await self.send_notification("打卡流程", error_msg)
+                        # 发送失败截图
+                        if screen is not None:
+                            screenshot_path = 'punch_error.png'
+                            cv2.imwrite(screenshot_path, screen)
+                            try:
+                                with open(screenshot_path, 'rb') as photo:
+                                    await self.bot.app.bot.send_photo(
+                                        chat_id=self.bot.chat_id,
+                                        photo=photo,
+                                        caption=f"{punch_type}打卡失败 - {error_msg}"
+                                    )
+                                os.remove(screenshot_path)
+                            except Exception as e:
+                                await self.send_notification("打卡流程", f"截图发送失败: {str(e)}")
+                        
+                        # 关闭浏览器窗口
+                        await self.send_notification("打卡流程", "正在关闭浏览器窗口...")
+                        if self.bot.close_browser():
+                            await self.send_notification("打卡流程", "浏览器窗口已关闭")
+                        else:
+                            await self.send_notification("打卡流程", "关闭浏览器窗口失败")
+                        
+                        return False
+            else:
+                error_msg = "登录失败，无法进行打卡"
+                await self.send_notification("打卡流程", error_msg)
+                # 发送失败截图
+                if screen is not None:
+                    screenshot_path = 'punch_error.png'
+                    cv2.imwrite(screenshot_path, screen)
+                    try:
+                        with open(screenshot_path, 'rb') as photo:
+                            await self.bot.app.bot.send_photo(
+                                chat_id=self.bot.chat_id,
+                                photo=photo,
+                                caption=f"{punch_type}打卡失败 - {error_msg}"
+                            )
+                        os.remove(screenshot_path)
+                    except Exception as e:
+                        await self.send_notification("打卡流程", f"截图发送失败: {str(e)}")
+                
+                # 关闭浏览器窗口
+                await self.send_notification("打卡流程", "正在关闭浏览器窗口...")
+                if self.bot.close_browser():
+                    await self.send_notification("打卡流程", "浏览器窗口已关闭")
+                else:
+                    await self.send_notification("打卡流程", "关闭浏览器窗口失败")
+                
+                return False
+        except Exception as e:
+            error_msg = f"{punch_type}打卡流程发生错误: {str(e)}"
+            await self.send_notification("打卡流程", error_msg)
+            # 发送失败截图
+            if screen is not None:
+                screenshot_path = 'punch_error.png'
+                cv2.imwrite(screenshot_path, screen)
+                try:
+                    with open(screenshot_path, 'rb') as photo:
+                        await self.bot.app.bot.send_photo(
+                            chat_id=self.bot.chat_id,
+                            photo=photo,
+                            caption=f"{punch_type}打卡失败 - {error_msg}"
+                        )
+                    os.remove(screenshot_path)
+                except Exception as e:
+                    await self.send_notification("打卡流程", f"截图发送失败: {str(e)}")
+            await self.handle_error(e, f"{punch_type}打卡流程")
+            
+            # 关闭浏览器窗口
+            await self.send_notification("打卡流程", "正在关闭浏览器窗口...")
+            if self.bot.close_browser():
+                await self.send_notification("打卡流程", "浏览器窗口已关闭")
+            else:
+                await self.send_notification("打卡流程", "关闭浏览器窗口失败")
+            
+            return False
 
 class AttendanceSystem:
     def __init__(self):
         # 设置pytesseract路径
         pytesseract.pytesseract.tesseract_cmd = os.getenv('TESSERACT_PATH', r'C:\Program Files\Tesseract-OCR\tesseract.exe')
         
-        # 配置信息
-        self.username = os.getenv('LOGIN_USERNAME')
-        self.password = os.getenv('LOGIN_PASSWORD')
+        # 配置多用户信息
+        self.users = [
+            {
+                'username': os.getenv('LOGIN_USERNAME'),
+                'password': os.getenv('LOGIN_PASSWORD'),
+                'punch_records': {
+                    'punch_in_time': None,
+                    'punch_out_time': None
+                }
+            },
+            {
+                'username': os.getenv('LOGIN_USERNAME2'),
+                'password': os.getenv('LOGIN_PASSWORD2'),
+                'punch_records': {
+                    'punch_in_time': None,
+                    'punch_out_time': None
+                }
+            }
+        ]
+        
+        # 登录URL
         self.login_url = os.getenv('LOGIN_URL')
         
         # 创建Telegram机器人实例
@@ -1036,6 +1510,9 @@ class AttendanceSystem:
         
         # 初始化定时任务
         self.init_schedule_tasks()
+        
+        # 添加虚拟鼠标控制
+        self.use_virtual_mouse = True
 
     def setup_logging(self):
         """配置日志记录"""
@@ -1273,13 +1750,44 @@ class AttendanceSystem:
         pyautogui.hotkey('ctrl', 'v')  # 粘贴
         time.sleep(0.5)  # 等待粘贴完成
     
+    def virtual_mouse_click(self, x, y):
+        """使用虚拟鼠标进行点击"""
+        try:
+            # 获取目标窗口句柄
+            hwnd = self.get_browser_window()
+            if not hwnd:
+                logging.error("未找到浏览器窗口")
+                return False
+                
+            # 将屏幕坐标转换为窗口客户区坐标
+            client_point = win32gui.ScreenToClient(hwnd, (x, y))
+            
+            # 发送鼠标左键点击消息
+            win32api.PostMessage(hwnd, win32con.WM_LBUTTONDOWN, win32con.MK_LBUTTON, win32api.MAKELONG(*client_point))
+            time.sleep(0.1)  # 短暂延迟确保消息被处理
+            win32api.PostMessage(hwnd, win32con.WM_LBUTTONUP, 0, win32api.MAKELONG(*client_point))
+            time.sleep(0.1)
+            
+            return True
+        except Exception as e:
+            logging.error(f"虚拟鼠标点击失败: {str(e)}")
+            return False
+            
+    def click_position(self, x, y):
+        """统一的点击接口"""
+        if self.use_virtual_mouse:
+            return self.virtual_mouse_click(x, y)
+        else:
+            pyautogui.click(x, y)
+            return True
+    
     async def click_safe_place(self):
         """点击安全位置"""
         await self.send_notification("安全位置", "查找第一个安全位置...")
         safe_loc = self.find_element_by_image(self.safe_place_path)
         if safe_loc:
             await self.send_notification("安全位置", "找到第一个安全位置，进行点击...")
-            pyautogui.click(safe_loc)
+            self.click_position(*safe_loc)
             time.sleep(0.5)
             return True
             
@@ -1287,14 +1795,14 @@ class AttendanceSystem:
         safe_loc2 = self.find_element_by_image(self.safe_place_path2)
         if safe_loc2:
             await self.send_notification("安全位置", "找到第二个安全位置，进行点击...")
-            pyautogui.click(safe_loc2)
+            self.click_position(*safe_loc2)
             time.sleep(0.5)
             return True
             
         await self.send_notification("安全位置", "两个安全位置都未找到")
         return False
     
-    async def login(self):
+    async def login(self, username, password):
         """登录系统"""
         try:
             await self.send_notification("登录流程", "开始登录流程...")
@@ -1307,9 +1815,9 @@ class AttendanceSystem:
             )
             if username_loc:
                 await self.send_notification("登录流程", "找到用户名输入框，开始输入...")
-                pyautogui.click(username_loc)
-                self.input_text(self.username)  # 使用剪贴板输入
-                await self.send_notification("登录流程", f"用户名 {self.username} 输入完成")
+                self.click_position(*username_loc)
+                self.input_text(username)  # 使用传入的用户名
+                await self.send_notification("登录流程", f"用户名 {username} 输入完成")
             else:
                 await self.send_notification("登录流程", "未找到用户名输入框")
                 return False
@@ -1329,8 +1837,8 @@ class AttendanceSystem:
             )
             if password_loc:
                 await self.send_notification("登录流程", "找到密码输入框，开始输入...")
-                pyautogui.click(password_loc)
-                self.input_text(self.password)  # 使用剪贴板输入
+                self.click_position(*password_loc)
+                self.input_text(password)  # 使用传入的密码
                 await self.send_notification("登录流程", "密码输入完成")
             else:
                 await self.send_notification("登录流程", "未找到密码输入框")
@@ -1348,7 +1856,7 @@ class AttendanceSystem:
             login_button_loc = self.find_element_by_image('templates/login_button.png')
             if login_button_loc:
                 await self.send_notification("登录流程", "找到登录按钮，点击登录...")
-                pyautogui.click(login_button_loc)
+                self.click_position(*login_button_loc)
                 await self.send_notification("登录流程", "登录按钮点击完成")
             else:
                 await self.send_notification("登录流程", "未找到登录按钮")
@@ -1501,6 +2009,15 @@ class AttendanceSystem:
                     except Exception as e:
                         logging.error(f"执行定时下班打卡任务时发生错误: {str(e)}")
                 schedule.every().day.at(task['scheduled_time']).do(lambda: asyncio.create_task(punch_out_job()))
+            elif task['type'] == 'punch_in':
+                async def punch_in_job():
+                    try:
+                        await self.punch_in()
+                        # 打卡完成后发送状态信息
+                        await self.send_daily_status()
+                    except Exception as e:
+                        logging.error(f"执行定时上班打卡任务时发生错误: {str(e)}")
+                schedule.every().day.at(task['scheduled_time']).do(lambda: asyncio.create_task(punch_in_job()))
 
     async def send_daily_status(self):
         """发送每日状态信息"""
@@ -1531,12 +2048,17 @@ class AttendanceSystem:
                 f"📅 当前时间：{current_time.strftime('%Y-%m-%d %H:%M:%S')}\n"
                 f"📌 今日类型：{'🏖️ 节假日' if is_holiday_today else '💼 工作日' if is_workday_today else '🎉 休息日'}\n"
                 f"⏰ 工作状态：{'🟢 工作时间' if is_work_time else '🔴 非工作时间'}\n\n"
-                
-                "📍 今日打卡记录\n"
-                f"上班打卡：{'✅ ' + self.today_punch_records['punch_in_time'].strftime('%H:%M:%S') if self.today_punch_records['punch_in_time'] else '❌ 未打卡'}\n"
-                f"下班打卡：{'✅ ' + self.today_punch_records['punch_out_time'].strftime('%H:%M:%S') if self.today_punch_records['punch_out_time'] else '❌ 未打卡'}\n\n"
-                
-                "⚙️ 系统信息\n"
+            )
+            
+            # 添加每个用户的打卡记录
+            status_text += "📍 今日打卡记录\n"
+            for user in self.users:
+                status_text += f"\n用户: {user['username']}\n"
+                status_text += f"上班打卡：{'✅ ' + user['punch_records']['punch_in_time'].strftime('%H:%M:%S') if user['punch_records']['punch_in_time'] else '❌ 未打卡'}\n"
+                status_text += f"下班打卡：{'✅ ' + user['punch_records']['punch_out_time'].strftime('%H:%M:%S') if user['punch_records']['punch_out_time'] else '❌ 未打卡'}\n"
+            
+            status_text += (
+                "\n⚙️ 系统信息\n"
                 f"运行时长：{int(hours)}小时{int(minutes)}分钟\n"
                 f"内存使用：{memory.percent}%\n"
                 f"CPU使用：{cpu_percent}%\n"
@@ -1564,6 +2086,16 @@ class AttendanceSystem:
                         if next_run < current_time:
                             next_run = next_run + timedelta(days=1)
                         status_text += f"➤ [任务 #{task['id']}] 下班打卡：{next_run.strftime('%Y-%m-%d %H:%M')}\n"
+                    elif task['type'] == 'punch_in':
+                        next_run = datetime.strptime(task['scheduled_time'], "%H:%M").replace(
+                            year=current_time.year,
+                            month=current_time.month,
+                            day=current_time.day
+                        )
+                        # 如果时间已过，显示明天的时间
+                        if next_run < current_time:
+                            next_run = next_run + timedelta(days=1)
+                        status_text += f"➤ [任务 #{task['id']}] 上班打卡：{next_run.strftime('%Y-%m-%d %H:%M')}\n"
             else:
                 status_text += "\n⏱ 暂无定时任务\n"
             
@@ -1572,11 +2104,12 @@ class AttendanceSystem:
         except Exception as e:
             logging.error(f"发送每日状态信息时发生错误: {str(e)}")
             
-    async def _do_punch(self, punch_type="上班"):
+    async def _do_punch(self, punch_type="上班", username=None, password=None):
         """通用打卡方法"""
+        screen = None
         try:
             # 重置消息
-            self.current_message = f"开始{punch_type}打卡流程"
+            self.current_message = f"开始{punch_type}打卡流程 - 用户: {username}"
             self.message_id = None
             
             # 使用 Edge InPrivate 模式打开新窗口
@@ -1631,7 +2164,7 @@ class AttendanceSystem:
                     return False
                 
                 await self.send_notification("打卡流程", "找到更多按钮，点击中...")
-                pyautogui.click(more_button_loc)
+                self.click_position(*more_button_loc)
                 time.sleep(1)
                 
                 # 更新截图
@@ -1660,7 +2193,7 @@ class AttendanceSystem:
                     return False
                 
                 await self.send_notification("打卡流程", "点击继续按钮...")
-                pyautogui.click(continue_button_loc)
+                self.click_position(*continue_button_loc)
                 time.sleep(1)
             else:
                 await self.send_notification("打卡流程", "未检测到警告弹窗，继续执行...")
@@ -1668,7 +2201,7 @@ class AttendanceSystem:
             # 更新截图
             screen = self.take_screenshot()
             
-            if await self.login():
+            if await self.login(username, password):
                 await self.send_notification("打卡流程", "登录成功，等待系统加载...")
                 time.sleep(3)
                 
@@ -1681,7 +2214,7 @@ class AttendanceSystem:
                 punch_button_loc = self.find_element_by_image(button_template)
                 if punch_button_loc:
                     await self.send_notification("打卡流程", "找到打卡按钮，开始打卡...")
-                    pyautogui.click(punch_button_loc)
+                    self.click_position(*punch_button_loc)
                     time.sleep(2)  # 等待打卡结果显示
                     
                     # 更新截图
@@ -1802,24 +2335,41 @@ class AttendanceSystem:
                             except Exception as e:
                                 await self.send_notification("打卡流程", f"发送截图失败: {str(e)}")
                                 break
-                else:
-                    error_msg = "未找到打卡按钮"
-                    await self.send_notification("打卡流程", error_msg)
-                    # 发送失败截图
-                    if screen is not None:
-                        screenshot_path = 'punch_error.png'
-                        cv2.imwrite(screenshot_path, screen)
-                        try:
-                            with open(screenshot_path, 'rb') as photo:
-                                await self.bot.app.bot.send_photo(
-                                    chat_id=self.bot.chat_id,
-                                    photo=photo,
-                                    caption=f"{punch_type}打卡失败 - {error_msg}"
-                                )
-                            os.remove(screenshot_path)
-                        except Exception as e:
-                            await self.send_notification("打卡流程", f"截图发送失败: {str(e)}")
-                    return False
+                
+                        # 关闭浏览器窗口
+                        await self.send_notification("打卡流程", "正在关闭浏览器窗口...")
+                        if self.bot.close_browser():
+                            await self.send_notification("打卡流程", "浏览器窗口已关闭")
+                        else:
+                            await self.send_notification("打卡流程", "关闭浏览器窗口失败")
+                        
+                        return True
+                    else:
+                        error_msg = "未找到打卡按钮"
+                        await self.send_notification("打卡流程", error_msg)
+                        # 发送失败截图
+                        if screen is not None:
+                            screenshot_path = 'punch_error.png'
+                            cv2.imwrite(screenshot_path, screen)
+                            try:
+                                with open(screenshot_path, 'rb') as photo:
+                                    await self.bot.app.bot.send_photo(
+                                        chat_id=self.bot.chat_id,
+                                        photo=photo,
+                                        caption=f"{punch_type}打卡失败 - {error_msg}"
+                                    )
+                                os.remove(screenshot_path)
+                            except Exception as e:
+                                await self.send_notification("打卡流程", f"截图发送失败: {str(e)}")
+                        
+                        # 关闭浏览器窗口
+                        await self.send_notification("打卡流程", "正在关闭浏览器窗口...")
+                        if self.bot.close_browser():
+                            await self.send_notification("打卡流程", "浏览器窗口已关闭")
+                        else:
+                            await self.send_notification("打卡流程", "关闭浏览器窗口失败")
+                        
+                        return False
             else:
                 error_msg = "登录失败，无法进行打卡"
                 await self.send_notification("打卡流程", error_msg)
@@ -1837,6 +2387,14 @@ class AttendanceSystem:
                         os.remove(screenshot_path)
                     except Exception as e:
                         await self.send_notification("打卡流程", f"截图发送失败: {str(e)}")
+                
+                # 关闭浏览器窗口
+                await self.send_notification("打卡流程", "正在关闭浏览器窗口...")
+                if self.bot.close_browser():
+                    await self.send_notification("打卡流程", "浏览器窗口已关闭")
+                else:
+                    await self.send_notification("打卡流程", "关闭浏览器窗口失败")
+                
                 return False
         except Exception as e:
             error_msg = f"{punch_type}打卡流程发生错误: {str(e)}"
@@ -1856,14 +2414,115 @@ class AttendanceSystem:
                 except Exception as e:
                     await self.send_notification("打卡流程", f"截图发送失败: {str(e)}")
             await self.handle_error(e, f"{punch_type}打卡流程")
+            
+            # 关闭浏览器窗口
+            await self.send_notification("打卡流程", "正在关闭浏览器窗口...")
+            if self.bot.close_browser():
+                await self.send_notification("打卡流程", "浏览器窗口已关闭")
+            else:
+                await self.send_notification("打卡流程", "关闭浏览器窗口失败")
+            
+            return False
 
     async def punch_in(self):
-        """上班打卡"""
-        await self._do_punch("上班")
+        """执行上班打卡"""
+        try:
+            if not self.users or len(self.users) == 0:
+                await self.send_notification("打卡错误", "未配置用户信息，无法执行打卡")
+                return False
+            
+            success_count = 0
+            for i, user in enumerate(self.users):
+                username = user.get('username')
+                password = user.get('password')
+                
+                # 为每个用户发送单独的开始消息
+                await self.send_notification("多用户打卡", f"开始为用户 {username} 执行上班打卡 ({i+1}/{len(self.users)})")
+                
+                # 执行打卡
+                result = await self._do_punch("上班", username, password)
+                
+                if result:
+                    success_count += 1
+                    # 为每个用户发送单独的成功消息
+                    await self.send_notification("打卡成功", f"用户 {username} 上班打卡成功")
+                else:
+                    # 为每个用户发送单独的失败消息
+                    await self.send_notification("打卡失败", f"用户 {username} 上班打卡失败")
+                
+                # 确保浏览器已关闭
+                await self.send_notification("打卡流程", f"确认用户 {username} 的浏览器已关闭")
+                # 使用 bot 对象的 close_browser 方法
+                browser_closed = self.bot.close_browser()
+                if not browser_closed:
+                    # 如果关闭失败，再尝试一次
+                    await self.send_notification("打卡流程", "首次关闭浏览器失败，再次尝试...")
+                    time.sleep(2)
+                    browser_closed = self.bot.close_browser()
+                    if not browser_closed:
+                        await self.send_notification("打卡流程", "浏览器关闭失败，可能需要手动关闭")
+                
+                # 如果还有下一个用户，等待一段时间再继续
+                if i < len(self.users) - 1:
+                    await self.send_notification("打卡流程", f"等待5秒后开始下一个用户的打卡...")
+                    await asyncio.sleep(5)
+            
+            # 所有用户打卡完成后发送总结消息
+            await self.send_notification("打卡完成", f"上班打卡完成，成功: {success_count}/{len(self.users)}")
+            return success_count > 0
+        except Exception as e:
+            await self.handle_error(e, "上班打卡")
+            return False
 
     async def punch_out(self):
-        """下班打卡"""
-        await self._do_punch("下班")
+        """执行下班打卡"""
+        try:
+            if not self.users or len(self.users) == 0:
+                await self.send_notification("打卡错误", "未配置用户信息，无法执行打卡")
+                return False
+            
+            success_count = 0
+            for i, user in enumerate(self.users):
+                username = user.get('username')
+                password = user.get('password')
+                
+                # 为每个用户发送单独的开始消息
+                await self.send_notification("多用户打卡", f"开始为用户 {username} 执行下班打卡 ({i+1}/{len(self.users)})")
+                
+                # 执行打卡
+                result = await self._do_punch("下班", username, password)
+                
+                if result:
+                    success_count += 1
+                    # 为每个用户发送单独的成功消息
+                    await self.send_notification("打卡成功", f"用户 {username} 下班打卡成功")
+                else:
+                    # 为每个用户发送单独的失败消息
+                    await self.send_notification("打卡失败", f"用户 {username} 下班打卡失败")
+                
+                # 确保浏览器已关闭
+                await self.send_notification("打卡流程", f"确认用户 {username} 的浏览器已关闭")
+                # 使用 bot 对象的 close_browser 方法
+                browser_closed = self.bot.close_browser()
+                if not browser_closed:
+                    # 如果关闭失败，再尝试一次
+                    await self.send_notification("打卡流程", "首次关闭浏览器失败，再次尝试...")
+                    time.sleep(2)
+                    browser_closed = self.bot.close_browser()
+                    if not browser_closed:
+                        await self.send_notification("打卡流程", "浏览器关闭失败，可能需要手动关闭")
+                
+                # 如果还有下一个用户，等待一段时间再继续
+                if i < len(self.users) - 1:
+                    await self.send_notification("打卡流程", f"等待5秒后开始下一个用户的打卡...")
+                    await asyncio.sleep(5)
+            
+            # 所有用户打卡完成后发送总结消息
+            await self.send_notification("打卡完成", f"下班打卡完成，成功: {success_count}/{len(self.users)}")
+            return success_count > 0
+        except Exception as e:
+            await self.handle_error(e, "下班打卡")
+            return False
 
     def cleanup(self):
         """清理资源"""
