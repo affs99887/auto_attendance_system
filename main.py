@@ -18,6 +18,7 @@ from punch_records import PunchRecordManager
 import telegram
 import re
 import pytesseract
+from PIL import Image
 
 # 导入重构后的模块
 from email_service import email_service
