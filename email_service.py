@@ -10,6 +10,10 @@ from email.mime.application import MIMEApplication
 from datetime import datetime
 from typing import List, Optional
 import logging
+from dotenv import load_dotenv
+
+# 加载环境变量
+load_dotenv()
 
 
 class EmailService:

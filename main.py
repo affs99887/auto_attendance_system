@@ -17,6 +17,7 @@ from tasks import TaskManager
 from punch_records import PunchRecordManager
 import telegram
 import re
+import pytesseract
 
 # 导入重构后的模块
 from email_service import email_service
@@ -2794,6 +2795,7 @@ async def run_schedule():
             await asyncio.sleep(5)  # 发生错误时等待一段时间后继续
 
 async def main():
+    attendance_system = None
     try:
         attendance_system = AttendanceSystem()
         logging.info("自动打卡系统已启动...")
