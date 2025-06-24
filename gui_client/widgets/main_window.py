@@ -9,12 +9,21 @@ import threading
 from datetime import datetime
 import os
 
-from .status_panel import StatusPanel
-from .punch_panel import PunchPanel
-from .task_panel import TaskPanel
-from .log_panel import LogPanel
-from .config_panel import ConfigPanel
-from ..utils.gui_utils import setup_styles, create_labeled_frame
+try:
+    from .status_panel import StatusPanel
+    from .punch_panel import PunchPanel
+    from .task_panel import TaskPanel
+    from .log_panel import LogPanel
+    from .config_panel import ConfigPanel
+    from ..utils.gui_utils import setup_styles, create_labeled_frame
+except ImportError:
+    # 如果相对导入失败，尝试绝对导入
+    from gui_client.widgets.status_panel import StatusPanel
+    from gui_client.widgets.punch_panel import PunchPanel
+    from gui_client.widgets.task_panel import TaskPanel
+    from gui_client.widgets.log_panel import LogPanel
+    from gui_client.widgets.config_panel import ConfigPanel
+    from gui_client.utils.gui_utils import setup_styles, create_labeled_frame
 
 class MainWindow:
     """主窗口类"""

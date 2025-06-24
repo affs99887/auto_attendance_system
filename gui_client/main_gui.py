@@ -20,8 +20,13 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from main import AttendanceSystem, TelegramBot
 from tasks import TaskManager
 from punch_records import PunchRecordManager
-from widgets.main_window import MainWindow
-from utils.gui_utils import set_window_icon, center_window
+try:
+    from .widgets.main_window import MainWindow
+    from .utils.gui_utils import set_window_icon, center_window
+except ImportError:
+    # 如果相对导入失败，尝试绝对导入
+    from gui_client.widgets.main_window import MainWindow
+    from gui_client.utils.gui_utils import set_window_icon, center_window
 
 class AttendanceGUIApp:
     """自动打卡系统GUI应用主类"""

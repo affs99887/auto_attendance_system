@@ -10,9 +10,14 @@ import threading
 import time
 from datetime import datetime
 
-from ..utils.gui_utils import (
-    create_labeled_frame, StatusColors, ScrollableFrame
-)
+try:
+    from ..utils.gui_utils import (
+        create_labeled_frame, StatusColors, ScrollableFrame
+    )
+except ImportError:
+    from gui_client.utils.gui_utils import (
+        create_labeled_frame, StatusColors, ScrollableFrame
+    )
 
 class LogPanel:
     """日志查看面板类"""
@@ -78,4 +83,424 @@ class LogPanel:
         ).pack(side=tk.LEFT, padx=(0, 5))
         
         # 实时监控开关
-        self.monitor_var = tk.BooleanVar()\n        self.monitor_check = ttk.Checkbutton(\n            top_controls,\n            text=\"实时监控\",\n            variable=self.monitor_var,\n            command=self.toggle_monitoring\n        )\n        self.monitor_check.pack(side=tk.LEFT, padx=(10, 0))\n        \n        # 下方筛选控制\n        filter_frame = ttk.Frame(frame)\n        filter_frame.pack(fill=tk.X)\n        \n        # 日志级别筛选\n        ttk.Label(filter_frame, text=\"级别:\").pack(side=tk.LEFT)\n        \n        self.level_var = tk.StringVar(value=\"ALL\")\n        level_combo = ttk.Combobox(\n            filter_frame,\n            textvariable=self.level_var,\n            values=[\"ALL\", \"DEBUG\", \"INFO\", \"WARNING\", \"ERROR\", \"CRITICAL\"],\n            state=\"readonly\",\n            width=10\n        )\n        level_combo.pack(side=tk.LEFT, padx=(5, 10))\n        level_combo.bind('<<ComboboxSelected>>', self.filter_logs)\n        \n        # 搜索框\n        ttk.Label(filter_frame, text=\"搜索:\").pack(side=tk.LEFT)\n        \n        self.search_var = tk.StringVar()\n        search_entry = ttk.Entry(\n            filter_frame,\n            textvariable=self.search_var,\n            width=20\n        )\n        search_entry.pack(side=tk.LEFT, padx=(5, 5))\n        search_entry.bind('<KeyRelease>', self.search_logs)\n        \n        # 搜索按钮\n        ttk.Button(\n            filter_frame,\n            text=\"搜索\",\n            command=self.search_logs\n        ).pack(side=tk.LEFT)\n    \n    def create_log_display_section(self, parent):\n        \"\"\"创建日志显示区域\"\"\"\n        frame = create_labeled_frame(parent, \"📜 日志内容\")\n        frame.pack(fill=tk.BOTH, expand=True, pady=(0, 10))\n        \n        # 创建文本显示区域\n        text_frame = ttk.Frame(frame)\n        text_frame.pack(fill=tk.BOTH, expand=True)\n        \n        # 日志文本控件\n        self.log_text = tk.Text(\n            text_frame,\n            wrap=tk.WORD,\n            font=(\"Consolas\", 9),\n            bg=\"#1e1e1e\",\n            fg=\"#ffffff\",\n            insertbackground=\"white\"\n        )\n        \n        # 垂直滚动条\n        v_scrollbar = ttk.Scrollbar(text_frame, orient=tk.VERTICAL, command=self.log_text.yview)\n        self.log_text.configure(yscrollcommand=v_scrollbar.set)\n        \n        # 水平滚动条\n        h_scrollbar = ttk.Scrollbar(text_frame, orient=tk.HORIZONTAL, command=self.log_text.xview)\n        self.log_text.configure(xscrollcommand=h_scrollbar.set)\n        \n        # 布局\n        self.log_text.grid(row=0, column=0, sticky=\"nsew\")\n        v_scrollbar.grid(row=0, column=1, sticky=\"ns\")\n        h_scrollbar.grid(row=1, column=0, sticky=\"ew\")\n        \n        text_frame.grid_columnconfigure(0, weight=1)\n        text_frame.grid_rowconfigure(0, weight=1)\n        \n        # 配置日志颜色标签\n        self.setup_log_tags()\n        \n        # 右键菜单\n        self.create_context_menu()\n    \n    def create_status_section(self, parent):\n        \"\"\"创建状态区域\"\"\"\n        frame = ttk.Frame(parent)\n        frame.pack(fill=tk.X)\n        \n        # 日志文件路径\n        self.log_file_label = ttk.Label(frame, text=\"日志文件: --\")\n        self.log_file_label.pack(side=tk.LEFT)\n        \n        # 日志行数\n        self.log_lines_label = ttk.Label(frame, text=\"行数: 0\")\n        self.log_lines_label.pack(side=tk.RIGHT)\n        \n        # 监控状态\n        self.monitor_status_label = ttk.Label(frame, text=\"监控: 未启动\")\n        self.monitor_status_label.pack(side=tk.RIGHT, padx=(0, 10))\n    \n    def setup_log_tags(self):\n        \"\"\"设置日志颜色标签\"\"\"\n        # DEBUG - 灰色\n        self.log_text.tag_configure(\"DEBUG\", foreground=\"#888888\")\n        \n        # INFO - 白色（默认）\n        self.log_text.tag_configure(\"INFO\", foreground=\"#ffffff\")\n        \n        # WARNING - 黄色\n        self.log_text.tag_configure(\"WARNING\", foreground=\"#ffcc00\")\n        \n        # ERROR - 红色\n        self.log_text.tag_configure(\"ERROR\", foreground=\"#ff6666\")\n        \n        # CRITICAL - 亮红色\n        self.log_text.tag_configure(\"CRITICAL\", foreground=\"#ff0000\", font=(\"Consolas\", 9, \"bold\"))\n        \n        # 时间戳 - 蓝色\n        self.log_text.tag_configure(\"TIMESTAMP\", foreground=\"#66ccff\")\n        \n        # 模块名 - 绿色\n        self.log_text.tag_configure(\"MODULE\", foreground=\"#66ff66\")\n    \n    def create_context_menu(self):\n        \"\"\"创建右键菜单\"\"\"\n        self.context_menu = tk.Menu(self.log_text, tearoff=0)\n        self.context_menu.add_command(label=\"复制\", command=self.copy_selection)\n        self.context_menu.add_command(label=\"全选\", command=self.select_all)\n        self.context_menu.add_separator()\n        self.context_menu.add_command(label=\"清空\", command=self.clear_display)\n        self.context_menu.add_command(label=\"查找\", command=self.show_find_dialog)\n        \n        self.log_text.bind(\"<Button-3>\", self.show_context_menu)\n    \n    def show_context_menu(self, event):\n        \"\"\"显示右键菜单\"\"\"\n        try:\n            self.context_menu.tk_popup(event.x_root, event.y_root)\n        finally:\n            self.context_menu.grab_release()\n    \n    def copy_selection(self):\n        \"\"\"复制选中文本\"\"\"\n        try:\n            selected_text = self.log_text.get(tk.SEL_FIRST, tk.SEL_LAST)\n            self.log_text.clipboard_clear()\n            self.log_text.clipboard_append(selected_text)\n        except tk.TclError:\n            pass  # 没有选中文本\n    \n    def select_all(self):\n        \"\"\"全选文本\"\"\"\n        self.log_text.tag_add(tk.SEL, \"1.0\", tk.END)\n        self.log_text.mark_set(tk.INSERT, \"1.0\")\n        self.log_text.see(tk.INSERT)\n    \n    def show_find_dialog(self):\n        \"\"\"显示查找对话框\"\"\"\n        # 简单的查找实现\n        search_text = self.search_var.get()\n        if search_text:\n            self.search_in_text(search_text)\n        else:\n            messagebox.showinfo(\"查找\", \"请在搜索框中输入要查找的内容\")\n    \n    def refresh_data(self):\n        \"\"\"刷新日志数据\"\"\"\n        self.refresh_logs()\n        self.update_status_info()\n    \n    def refresh_logs(self):\n        \"\"\"刷新日志显示\"\"\"\n        try:\n            # 查找日志文件\n            log_file = self.find_log_file()\n            \n            if log_file and os.path.exists(log_file):\n                self.load_log_file(log_file)\n                self.log_file_label.config(text=f\"日志文件: {os.path.basename(log_file)}\")\n            else:\n                self.log_text.delete(1.0, tk.END)\n                self.log_text.insert(tk.END, \"未找到日志文件\\n\")\n                self.log_file_label.config(text=\"日志文件: 未找到\")\n                \n        except Exception as e:\n            messagebox.showerror(\"错误\", f\"刷新日志失败: {str(e)}\")\n    \n    def find_log_file(self):\n        \"\"\"查找日志文件\"\"\"\n        # 可能的日志文件位置\n        possible_files = [\n            \"attendance_system.log\",\n            \"logs/attendance_system.log\",\n            \"logs/gui_client.log\",\n            \"gui_client.log\"\n        ]\n        \n        for file_path in possible_files:\n            if os.path.exists(file_path):\n                return file_path\n        \n        return None\n    \n    def load_log_file(self, file_path):\n        \"\"\"加载日志文件\"\"\"\n        try:\n            # 尝试不同的编码\n            encodings = ['utf-8', 'gbk', 'gb2312', 'latin1']\n            \n            for encoding in encodings:\n                try:\n                    with open(file_path, 'r', encoding=encoding) as f:\n                        content = f.read()\n                    break\n                except UnicodeDecodeError:\n                    continue\n            else:\n                # 所有编码都失败\n                self.log_text.delete(1.0, tk.END)\n                self.log_text.insert(tk.END, \"无法读取日志文件，编码不支持\\n\")\n                return\n            \n            # 显示日志内容\n            self.display_log_content(content)\n            \n            # 更新文件大小\n            self.last_log_size = os.path.getsize(file_path)\n            \n        except Exception as e:\n            self.log_text.delete(1.0, tk.END)\n            self.log_text.insert(tk.END, f\"读取日志文件失败: {str(e)}\\n\")\n    \n    def display_log_content(self, content):\n        \"\"\"显示日志内容并应用颜色\"\"\"\n        self.log_text.delete(1.0, tk.END)\n        \n        lines = content.split('\\n')\n        line_count = 0\n        \n        for line in lines:\n            if line.strip():  # 跳过空行\n                self.insert_colored_line(line)\n                line_count += 1\n        \n        # 滚动到底部\n        self.log_text.see(tk.END)\n        \n        # 更新行数\n        self.log_lines_label.config(text=f\"行数: {line_count}\")\n    \n    def insert_colored_line(self, line):\n        \"\"\"插入带颜色的日志行\"\"\"\n        # 解析日志行格式: 时间戳 - 模块 - 级别 - 消息\n        parts = line.split(' - ', 3)\n        \n        if len(parts) >= 4:\n            timestamp, module, level, message = parts\n            \n            # 插入时间戳\n            start_pos = self.log_text.index(tk.INSERT)\n            self.log_text.insert(tk.END, timestamp)\n            end_pos = self.log_text.index(tk.INSERT)\n            self.log_text.tag_add(\"TIMESTAMP\", start_pos, end_pos)\n            \n            self.log_text.insert(tk.END, \" - \")\n            \n            # 插入模块名\n            start_pos = self.log_text.index(tk.INSERT)\n            self.log_text.insert(tk.END, module)\n            end_pos = self.log_text.index(tk.INSERT)\n            self.log_text.tag_add(\"MODULE\", start_pos, end_pos)\n            \n            self.log_text.insert(tk.END, \" - \")\n            \n            # 插入级别和消息\n            start_pos = self.log_text.index(tk.INSERT)\n            self.log_text.insert(tk.END, f\"{level} - {message}\")\n            end_pos = self.log_text.index(tk.INSERT)\n            \n            # 根据级别应用颜色\n            if level in [\"DEBUG\", \"INFO\", \"WARNING\", \"ERROR\", \"CRITICAL\"]:\n                self.log_text.tag_add(level, start_pos, end_pos)\n            \n        else:\n            # 无法解析的行，使用默认颜色\n            self.log_text.insert(tk.END, line)\n        \n        self.log_text.insert(tk.END, \"\\n\")\n    \n    def toggle_monitoring(self):\n        \"\"\"切换实时监控\"\"\"\n        if self.monitor_var.get():\n            self.start_monitoring()\n        else:\n            self.stop_monitoring()\n    \n    def start_monitoring(self):\n        \"\"\"开始实时监控\"\"\"\n        if not self.log_monitoring:\n            self.log_monitoring = True\n            self.monitor_thread = threading.Thread(target=self.monitor_log_file, daemon=True)\n            self.monitor_thread.start()\n            \n            self.monitor_status_label.config(\n                text=\"监控: 运行中\", \n                foreground=StatusColors.SUCCESS\n            )\n    \n    def stop_monitoring(self):\n        \"\"\"停止实时监控\"\"\"\n        self.log_monitoring = False\n        \n        self.monitor_status_label.config(\n            text=\"监控: 已停止\", \n            foreground=StatusColors.ERROR\n        )\n    \n    def monitor_log_file(self):\n        \"\"\"监控日志文件变化\"\"\"\n        while self.log_monitoring:\n            try:\n                log_file = self.find_log_file()\n                \n                if log_file and os.path.exists(log_file):\n                    current_size = os.path.getsize(log_file)\n                    \n                    if current_size > self.last_log_size:\n                        # 文件有新内容\n                        self.parent.after(0, self.refresh_logs)\n                        self.last_log_size = current_size\n                \n                time.sleep(2)  # 每2秒检查一次\n                \n            except Exception:\n                pass  # 忽略监控过程中的错误\n    \n    def filter_logs(self, event=None):\n        \"\"\"根据级别筛选日志\"\"\"\n        # 重新加载并筛选日志\n        self.refresh_logs()\n    \n    def search_logs(self, event=None):\n        \"\"\"搜索日志\"\"\"\n        search_text = self.search_var.get().strip()\n        \n        if search_text:\n            self.search_in_text(search_text)\n    \n    def search_in_text(self, search_text):\n        \"\"\"在文本中搜索\"\"\"\n        # 清除之前的搜索标记\n        self.log_text.tag_remove(\"search\", \"1.0\", tk.END)\n        \n        if search_text:\n            # 配置搜索标记样式\n            self.log_text.tag_configure(\"search\", background=\"yellow\", foreground=\"black\")\n            \n            # 搜索所有匹配项\n            start_pos = \"1.0\"\n            match_count = 0\n            \n            while True:\n                start_pos = self.log_text.search(search_text, start_pos, tk.END)\n                if not start_pos:\n                    break\n                \n                end_pos = f\"{start_pos}+{len(search_text)}c\"\n                self.log_text.tag_add(\"search\", start_pos, end_pos)\n                start_pos = end_pos\n                match_count += 1\n            \n            if match_count > 0:\n                # 跳转到第一个匹配项\n                first_match = self.log_text.search(search_text, \"1.0\", tk.END)\n                if first_match:\n                    self.log_text.see(first_match)\n                    \n                messagebox.showinfo(\"搜索结果\", f\"找到 {match_count} 个匹配项\")\n            else:\n                messagebox.showinfo(\"搜索结果\", \"未找到匹配项\")\n    \n    def clear_display(self):\n        \"\"\"清空显示\"\"\"\n        self.log_text.delete(1.0, tk.END)\n        self.log_lines_label.config(text=\"行数: 0\")\n    \n    def export_logs(self):\n        \"\"\"导出日志\"\"\"\n        try:\n            # 选择保存文件\n            filename = filedialog.asksaveasfilename(\n                title=\"导出日志\",\n                defaultextension=\".txt\",\n                filetypes=[(\"文本文件\", \"*.txt\"), (\"所有文件\", \"*.*\")]\n            )\n            \n            if filename:\n                content = self.log_text.get(1.0, tk.END)\n                \n                with open(filename, 'w', encoding='utf-8') as f:\n                    f.write(content)\n                \n                messagebox.showinfo(\"成功\", f\"日志已导出到: {filename}\")\n                \n        except Exception as e:\n            messagebox.showerror(\"错误\", f\"导出日志失败: {str(e)}\")\n    \n    def update_status_info(self):\n        \"\"\"更新状态信息\"\"\"\n        try:\n            log_file = self.find_log_file()\n            if log_file:\n                self.log_file_label.config(text=f\"日志文件: {os.path.basename(log_file)}\")\n            else:\n                self.log_file_label.config(text=\"日志文件: 未找到\")\n        except Exception:\n            self.log_file_label.config(text=\"日志文件: 获取失败\")"
+        self.monitor_var = tk.BooleanVar()
+        self.monitor_check = ttk.Checkbutton(
+            top_controls,
+            text="实时监控",
+            variable=self.monitor_var,
+            command=self.toggle_monitoring
+        )
+        self.monitor_check.pack(side=tk.LEFT, padx=(10, 0))
+        
+        # 下方筛选控制
+        filter_frame = ttk.Frame(frame)
+        filter_frame.pack(fill=tk.X)
+        
+        # 日志级别筛选
+        ttk.Label(filter_frame, text="级别:").pack(side=tk.LEFT)
+        
+        self.level_var = tk.StringVar(value="ALL")
+        level_combo = ttk.Combobox(
+            filter_frame,
+            textvariable=self.level_var,
+            values=["ALL", "DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"],
+            state="readonly",
+            width=10
+        )
+        level_combo.pack(side=tk.LEFT, padx=(5, 10))
+        level_combo.bind('<<ComboboxSelected>>', self.filter_logs)
+        
+        # 搜索框
+        ttk.Label(filter_frame, text="搜索:").pack(side=tk.LEFT)
+        
+        self.search_var = tk.StringVar()
+        search_entry = ttk.Entry(
+            filter_frame,
+            textvariable=self.search_var,
+            width=20
+        )
+        search_entry.pack(side=tk.LEFT, padx=(5, 5))
+        search_entry.bind('<KeyRelease>', self.search_logs)
+        
+        # 搜索按钮
+        ttk.Button(
+            filter_frame,
+            text="搜索",
+            command=self.search_logs
+        ).pack(side=tk.LEFT)
+    
+    def create_log_display_section(self, parent):
+        """创建日志显示区域"""
+        frame = create_labeled_frame(parent, "📜 日志内容")
+        frame.pack(fill=tk.BOTH, expand=True, pady=(0, 10))
+        
+        # 创建文本显示区域
+        text_frame = ttk.Frame(frame)
+        text_frame.pack(fill=tk.BOTH, expand=True)
+        
+        # 日志文本控件
+        self.log_text = tk.Text(
+            text_frame,
+            wrap=tk.WORD,
+            font=("Consolas", 9),
+            bg="#1e1e1e",
+            fg="#ffffff",
+            insertbackground="white"
+        )
+        
+        # 垂直滚动条
+        v_scrollbar = ttk.Scrollbar(text_frame, orient=tk.VERTICAL, command=self.log_text.yview)
+        self.log_text.configure(yscrollcommand=v_scrollbar.set)
+        
+        # 水平滚动条
+        h_scrollbar = ttk.Scrollbar(text_frame, orient=tk.HORIZONTAL, command=self.log_text.xview)
+        self.log_text.configure(xscrollcommand=h_scrollbar.set)
+        
+        # 布局
+        self.log_text.grid(row=0, column=0, sticky="nsew")
+        v_scrollbar.grid(row=0, column=1, sticky="ns")
+        h_scrollbar.grid(row=1, column=0, sticky="ew")
+        
+        text_frame.grid_columnconfigure(0, weight=1)
+        text_frame.grid_rowconfigure(0, weight=1)
+        
+        # 配置日志颜色标签
+        self.setup_log_tags()
+        
+        # 右键菜单
+        self.create_context_menu()
+    
+    def create_status_section(self, parent):
+        """创建状态区域"""
+        frame = ttk.Frame(parent)
+        frame.pack(fill=tk.X)
+        
+        # 日志文件路径
+        self.log_file_label = ttk.Label(frame, text="日志文件: --")
+        self.log_file_label.pack(side=tk.LEFT)
+        
+        # 日志行数
+        self.log_lines_label = ttk.Label(frame, text="行数: 0")
+        self.log_lines_label.pack(side=tk.RIGHT)
+        
+        # 监控状态
+        self.monitor_status_label = ttk.Label(frame, text="监控: 未启动")
+        self.monitor_status_label.pack(side=tk.RIGHT, padx=(0, 10))
+    
+    def setup_log_tags(self):
+        """设置日志颜色标签"""
+        # DEBUG - 灰色
+        self.log_text.tag_configure("DEBUG", foreground="#888888")
+        
+        # INFO - 白色（默认）
+        self.log_text.tag_configure("INFO", foreground="#ffffff")
+        
+        # WARNING - 黄色
+        self.log_text.tag_configure("WARNING", foreground="#ffcc00")
+        
+        # ERROR - 红色
+        self.log_text.tag_configure("ERROR", foreground="#ff6666")
+        
+        # CRITICAL - 亮红色
+        self.log_text.tag_configure("CRITICAL", foreground="#ff0000", font=("Consolas", 9, "bold"))
+        
+        # 时间戳 - 蓝色
+        self.log_text.tag_configure("TIMESTAMP", foreground="#66ccff")
+        
+        # 模块名 - 绿色
+        self.log_text.tag_configure("MODULE", foreground="#66ff66")
+    
+    def create_context_menu(self):
+        """创建右键菜单"""
+        self.context_menu = tk.Menu(self.log_text, tearoff=0)
+        self.context_menu.add_command(label="复制", command=self.copy_selection)
+        self.context_menu.add_command(label="全选", command=self.select_all)
+        self.context_menu.add_separator()
+        self.context_menu.add_command(label="清空", command=self.clear_display)
+        self.context_menu.add_command(label="查找", command=self.show_find_dialog)
+        
+        self.log_text.bind("<Button-3>", self.show_context_menu)
+    
+    def show_context_menu(self, event):
+        """显示右键菜单"""
+        try:
+            self.context_menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            self.context_menu.grab_release()
+    
+    def copy_selection(self):
+        """复制选中文本"""
+        try:
+            selected_text = self.log_text.get(tk.SEL_FIRST, tk.SEL_LAST)
+            self.log_text.clipboard_clear()
+            self.log_text.clipboard_append(selected_text)
+        except tk.TclError:
+            pass  # 没有选中文本
+    
+    def select_all(self):
+        """全选文本"""
+        self.log_text.tag_add(tk.SEL, "1.0", tk.END)
+        self.log_text.mark_set(tk.INSERT, "1.0")
+        self.log_text.see(tk.INSERT)
+    
+    def show_find_dialog(self):
+        """显示查找对话框"""
+        # 简单的查找实现
+        search_text = self.search_var.get()
+        if search_text:
+            self.search_in_text(search_text)
+        else:
+            messagebox.showinfo("查找", "请在搜索框中输入要查找的内容")
+    
+    def refresh_data(self):
+        """刷新日志数据"""
+        self.refresh_logs()
+        self.update_status_info()
+    
+    def refresh_logs(self):
+        """刷新日志显示"""
+        try:
+            # 查找日志文件
+            log_file = self.find_log_file()
+            
+            if log_file and os.path.exists(log_file):
+                self.load_log_file(log_file)
+                self.log_file_label.config(text=f"日志文件: {os.path.basename(log_file)}")
+            else:
+                self.log_text.delete(1.0, tk.END)
+                self.log_text.insert(tk.END, "未找到日志文件\n")
+                self.log_file_label.config(text="日志文件: 未找到")
+                
+        except Exception as e:
+            messagebox.showerror("错误", f"刷新日志失败: {str(e)}")
+    
+    def find_log_file(self):
+        """查找日志文件"""
+        # 可能的日志文件位置
+        possible_files = [
+            "attendance_system.log",
+            "logs/attendance_system.log",
+            "logs/gui_client.log",
+            "gui_client.log"
+        ]
+        
+        for file_path in possible_files:
+            if os.path.exists(file_path):
+                return file_path
+        
+        return None
+    
+    def load_log_file(self, file_path):
+        """加载日志文件"""
+        try:
+            # 尝试不同的编码
+            encodings = ['utf-8', 'gbk', 'gb2312', 'latin1']
+            
+            for encoding in encodings:
+                try:
+                    with open(file_path, 'r', encoding=encoding) as f:
+                        content = f.read()
+                    break
+                except UnicodeDecodeError:
+                    continue
+            else:
+                # 所有编码都失败
+                self.log_text.delete(1.0, tk.END)
+                self.log_text.insert(tk.END, "无法读取日志文件，编码不支持\n")
+                return
+            
+            # 显示日志内容
+            self.display_log_content(content)
+            
+            # 更新文件大小
+            self.last_log_size = os.path.getsize(file_path)
+            
+        except Exception as e:
+            self.log_text.delete(1.0, tk.END)
+            self.log_text.insert(tk.END, f"读取日志文件失败: {str(e)}\n")
+    
+    def display_log_content(self, content):
+        """显示日志内容并应用颜色"""
+        self.log_text.delete(1.0, tk.END)
+        
+        lines = content.split('\n')
+        line_count = 0
+        
+        for line in lines:
+            if line.strip():  # 跳过空行
+                self.insert_colored_line(line)
+                line_count += 1
+        
+        # 滚动到底部
+        self.log_text.see(tk.END)
+        
+        # 更新行数
+        self.log_lines_label.config(text=f"行数: {line_count}")
+    
+    def insert_colored_line(self, line):
+        """插入带颜色的日志行"""
+        # 解析日志行格式: 时间戳 - 模块 - 级别 - 消息
+        parts = line.split(' - ', 3)
+        
+        if len(parts) >= 4:
+            timestamp, module, level, message = parts
+            
+            # 插入时间戳
+            start_pos = self.log_text.index(tk.INSERT)
+            self.log_text.insert(tk.END, timestamp)
+            end_pos = self.log_text.index(tk.INSERT)
+            self.log_text.tag_add("TIMESTAMP", start_pos, end_pos)
+            
+            self.log_text.insert(tk.END, " - ")
+            
+            # 插入模块名
+            start_pos = self.log_text.index(tk.INSERT)
+            self.log_text.insert(tk.END, module)
+            end_pos = self.log_text.index(tk.INSERT)
+            self.log_text.tag_add("MODULE", start_pos, end_pos)
+            
+            self.log_text.insert(tk.END, " - ")
+            
+            # 插入级别和消息
+            start_pos = self.log_text.index(tk.INSERT)
+            self.log_text.insert(tk.END, f"{level} - {message}")
+            end_pos = self.log_text.index(tk.INSERT)
+            
+            # 根据级别应用颜色
+            if level in ["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"]:
+                self.log_text.tag_add(level, start_pos, end_pos)
+            
+        else:
+            # 无法解析的行，使用默认颜色
+            self.log_text.insert(tk.END, line)
+        
+        self.log_text.insert(tk.END, "\n")
+    
+    def toggle_monitoring(self):
+        """切换实时监控"""
+        if self.monitor_var.get():
+            self.start_monitoring()
+        else:
+            self.stop_monitoring()
+    
+    def start_monitoring(self):
+        """开始实时监控"""
+        if not self.log_monitoring:
+            self.log_monitoring = True
+            self.monitor_thread = threading.Thread(target=self.monitor_log_file, daemon=True)
+            self.monitor_thread.start()
+            
+            self.monitor_status_label.config(
+                text="监控: 运行中", 
+                foreground=StatusColors.SUCCESS
+            )
+    
+    def stop_monitoring(self):
+        """停止实时监控"""
+        self.log_monitoring = False
+        
+        self.monitor_status_label.config(
+            text="监控: 已停止", 
+            foreground=StatusColors.ERROR
+        )
+    
+    def monitor_log_file(self):
+        """监控日志文件变化"""
+        while self.log_monitoring:
+            try:
+                log_file = self.find_log_file()
+                
+                if log_file and os.path.exists(log_file):
+                    current_size = os.path.getsize(log_file)
+                    
+                    if current_size > self.last_log_size:
+                        # 文件有新内容
+                        self.parent.after(0, self.refresh_logs)
+                        self.last_log_size = current_size
+                
+                time.sleep(2)  # 每2秒检查一次
+                
+            except Exception:
+                pass  # 忽略监控过程中的错误
+    
+    def filter_logs(self, event=None):
+        """根据级别筛选日志"""
+        # 重新加载并筛选日志
+        self.refresh_logs()
+    
+    def search_logs(self, event=None):
+        """搜索日志"""
+        search_text = self.search_var.get().strip()
+        
+        if search_text:
+            self.search_in_text(search_text)
+    
+    def search_in_text(self, search_text):
+        """在文本中搜索"""
+        # 清除之前的搜索标记
+        self.log_text.tag_remove("search", "1.0", tk.END)
+        
+        if search_text:
+            # 配置搜索标记样式
+            self.log_text.tag_configure("search", background="yellow", foreground="black")
+            
+            # 搜索所有匹配项
+            start_pos = "1.0"
+            match_count = 0
+            
+            while True:
+                start_pos = self.log_text.search(search_text, start_pos, tk.END)
+                if not start_pos:
+                    break
+                
+                end_pos = f"{start_pos}+{len(search_text)}c"
+                self.log_text.tag_add("search", start_pos, end_pos)
+                start_pos = end_pos
+                match_count += 1
+            
+            if match_count > 0:
+                # 跳转到第一个匹配项
+                first_match = self.log_text.search(search_text, "1.0", tk.END)
+                if first_match:
+                    self.log_text.see(first_match)
+                    
+                messagebox.showinfo("搜索结果", f"找到 {match_count} 个匹配项")
+            else:
+                messagebox.showinfo("搜索结果", "未找到匹配项")
+    
+    def clear_display(self):
+        """清空显示"""
+        self.log_text.delete(1.0, tk.END)
+        self.log_lines_label.config(text="行数: 0")
+    
+    def export_logs(self):
+        """导出日志"""
+        try:
+            # 选择保存文件
+            filename = filedialog.asksaveasfilename(
+                title="导出日志",
+                defaultextension=".txt",
+                filetypes=[("文本文件", "*.txt"), ("所有文件", "*.*")]
+            )
+            
+            if filename:
+                content = self.log_text.get(1.0, tk.END)
+                
+                with open(filename, 'w', encoding='utf-8') as f:
+                    f.write(content)
+                
+                messagebox.showinfo("成功", f"日志已导出到: {filename}")
+                
+        except Exception as e:
+            messagebox.showerror("错误", f"导出日志失败: {str(e)}")
+    
+    def update_status_info(self):
+        """更新状态信息"""
+        try:
+            log_file = self.find_log_file()
+            if log_file:
+                self.log_file_label.config(text=f"日志文件: {os.path.basename(log_file)}")
+            else:
+                self.log_file_label.config(text="日志文件: 未找到")
+        except Exception:
+            self.log_file_label.config(text="日志文件: 获取失败")

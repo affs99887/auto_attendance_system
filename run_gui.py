@@ -19,8 +19,9 @@ def main():
             sys.exit(1)
         
         # 启动GUI应用
-        from gui_client.main_gui import main as gui_main
-        gui_main()
+        from gui_client.main_gui import AttendanceGUIApp
+        app = AttendanceGUIApp()
+        app.run()
         
     except KeyboardInterrupt:
         print("\n用户中断程序")

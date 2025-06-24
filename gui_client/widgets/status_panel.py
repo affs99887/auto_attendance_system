@@ -10,10 +10,16 @@ import psutil
 from chinese_calendar import is_workday, is_holiday
 import os
 
-from ..utils.gui_utils import (
-    create_labeled_frame, format_time_display, 
-    format_datetime_display, StatusColors
-)
+try:
+    from ..utils.gui_utils import (
+        create_labeled_frame, format_time_display, 
+        format_datetime_display, StatusColors
+    )
+except ImportError:
+    from gui_client.utils.gui_utils import (
+        create_labeled_frame, format_time_display, 
+        format_datetime_display, StatusColors
+    )
 
 class StatusPanel:
     """系统状态面板类"""

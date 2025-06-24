@@ -9,10 +9,16 @@ from datetime import datetime, timedelta
 import threading
 import os
 
-from ..utils.gui_utils import (
-    create_labeled_frame, format_datetime_display, 
-    StatusColors, ask_yes_no
-)
+try:
+    from ..utils.gui_utils import (
+        create_labeled_frame, format_datetime_display, 
+        StatusColors, ask_yes_no
+    )
+except ImportError:
+    from gui_client.utils.gui_utils import (
+        create_labeled_frame, format_datetime_display, 
+        StatusColors, ask_yes_no
+    )
 
 class PunchPanel:
     """打卡操作面板类"""
