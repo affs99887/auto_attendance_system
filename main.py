@@ -2699,12 +2699,12 @@ class AttendanceSystem:
             await self.send_notification("邮件发送", f"准备发送{punch_type}打卡截图邮件...")
             
             # 使用异步方式发送邮件，不阻塞打卡流程
+            # 简化callback，只记录日志，避免事件循环问题
             def email_callback(success: bool, email_subject: str):
                 if success:
-                    # 异步发送通知
-                    asyncio.create_task(self.send_notification("邮件发送", f"{punch_type}打卡截图邮件发送成功"))
+                    logging.info(f"邮件发送成功: {email_subject}")
                 else:
-                    asyncio.create_task(self.send_notification("邮件发送", f"{punch_type}打卡截图邮件发送失败"))
+                    logging.error(f"邮件发送失败: {email_subject}")
             
             # 异步发送邮件
             self.email_service.send_email_async(
