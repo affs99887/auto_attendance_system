@@ -20,6 +20,18 @@ import re
 import pytesseract
 from PIL import Image
 
+# 图像处理和计算机视觉
+import cv2
+import numpy as np
+
+# GUI自动化
+import pyautogui
+
+# Windows API
+import win32gui
+import win32con
+import win32api
+
 # 导入重构后的模块
 from email_service import email_service
 from browser_automation import browser_controller
