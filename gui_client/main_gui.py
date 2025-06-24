@@ -45,6 +45,7 @@ class AttendanceGUIApp:
         self.telegram_bot = None
         self.event_loop = None
         self.system_thread = None
+        self.system_running = False
         
         # 创建主窗口
         self.main_window = MainWindow(self.root, self)
@@ -108,6 +109,7 @@ class AttendanceGUIApp:
                 self.telegram_bot.attendance_system = self.attendance_system
             
             # 更新GUI状态
+            self.system_running = True
             self.root.after(0, lambda: self.main_window.update_status("系统运行中"))
             self.root.after(0, lambda: self.main_window.set_system_running(True))
             
@@ -120,6 +122,7 @@ class AttendanceGUIApp:
         except Exception as e:
             error_msg = f"系统运行错误: {str(e)}"
             self.logger.error(error_msg)
+            self.system_running = False
             self.root.after(0, lambda: messagebox.showerror("系统错误", error_msg))
             self.root.after(0, lambda: self.main_window.set_system_running(False))
     
@@ -131,6 +134,7 @@ class AttendanceGUIApp:
             if self.event_loop and self.event_loop.is_running():
                 self.event_loop.call_soon_threadsafe(self.event_loop.stop)
             
+            self.system_running = False
             self.main_window.set_system_running(False)
             self.main_window.update_status("系统已停止")
             
