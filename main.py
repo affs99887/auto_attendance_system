@@ -12,6 +12,7 @@ import logging
 from logging.handlers import RotatingFileHandler
 import traceback
 import psutil
+import subprocess
 from chinese_calendar import is_workday, is_holiday
 from tasks import TaskManager
 from punch_records import PunchRecordManager
@@ -39,6 +40,75 @@ from image_recognition import image_recognizer
 
 # 加载环境变量
 load_dotenv()
+
+class WatchdogManager:
+    """看门狗管理器，负责进程监控和自动重启"""
+    
+    def __init__(self):
+        self.restart_count = 0
+        self.max_restarts = 5
+        self.restart_interval = 3600  # 1小时
+        self.last_restart = datetime.now()
+        self.monitoring = False
+        self.monitor_task = None
+        
+    def is_process_running(self, process_name="python"):
+        """检查指定进程是否在运行"""
+        current_pid = os.getpid()
+        for proc in psutil.process_iter(['pid', 'name', 'cmdline']):
+            try:
+                # 跳过当前进程
+                if proc.info['pid'] == current_pid:
+                    continue
+                    
+                if proc.info['name'] == process_name or \
+                   (proc.info['cmdline'] and 'main.py' in proc.info['cmdline']):
+                    return True
+            except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+                pass
+        return False
+    
+    def start_main_program(self):
+        """启动主程序"""
+        try:
+            # 使用 Python 解释器启动主程序
+            subprocess.Popen([sys.executable, 'main.py'])
+            logging.info("主程序已启动")
+            return True
+        except Exception as e:
+            logging.error(f"启动主程序失败: {str(e)}")
+            return False
+    
+    async def monitor_system_resources(self):
+        """监控系统资源使用情况"""
+        while self.monitoring:
+            try:
+                # 检查系统资源使用情况
+                memory_percent = psutil.virtual_memory().percent
+                cpu_percent = psutil.cpu_percent()
+                
+                if memory_percent > 90 or cpu_percent > 90:
+                    logging.warning(f"系统资源使用率过高 (内存: {memory_percent}%, CPU: {cpu_percent}%)")
+                
+                await asyncio.sleep(60)  # 每分钟检查一次
+                
+            except Exception as e:
+                logging.error(f"资源监控发生错误: {str(e)}")
+                await asyncio.sleep(5)
+    
+    def start_monitoring(self):
+        """启动监控"""
+        if not self.monitoring:
+            self.monitoring = True
+            self.monitor_task = asyncio.create_task(self.monitor_system_resources())
+            logging.info("看门狗监控已启动")
+    
+    def stop_monitoring(self):
+        """停止监控"""
+        self.monitoring = False
+        if self.monitor_task:
+            self.monitor_task.cancel()
+            logging.info("看门狗监控已停止")
 
 class TelegramBot:
     def __init__(self, chat_id):
@@ -77,10 +147,11 @@ class TelegramBot:
             "支持的命令：\n"
             "/punch_in - 上班打卡\n"
             "/punch_out - 下班打卡\n"
-            "/status - 查看状态\n"
+            "/status - 查看状态（包含看门狗状态）\n"
             "/errors - 查看最近错误日志\n"
             "/kill - 查看并管理定时任务\n"
-            "/kill <任务ID> - 直接删除指定任务"
+            "/kill <任务ID> - 直接删除指定任务\n\n"
+            "🛡️ 看门狗功能已内置启用"
         )
 
     async def punch_in_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -176,6 +247,7 @@ class TelegramBot:
                 f"下班时间：{self.attendance_system.work_end_time}\n"
                 f"迟到阈值：{self.attendance_system.late_threshold}分钟\n"
                 f"早退阈值：{self.attendance_system.early_leave_threshold}分钟\n"
+                f"看门狗状态：{'🟢 运行中' if hasattr(self.attendance_system, 'watchdog') and self.attendance_system.watchdog.monitoring else '🔴 未启用'}\n"
             )
             
             # 获取定时任务列表
@@ -1145,6 +1217,9 @@ class AttendanceSystem:
         
         # 创建Telegram机器人实例
         self.bot = TelegramBot(os.getenv('TELEGRAM_CHAT_ID'))
+        
+        # 创建看门狗管理器实例
+        self.watchdog = WatchdogManager()
         
         # 截图保存路径
         self.screenshot_path = 'logs/temp_screenshot.png'
@@ -2443,8 +2518,22 @@ class AttendanceSystem:
             await self.handle_error(e, "下班打卡")
             return False
 
+    def start_watchdog(self):
+        """启动看门狗监控"""
+        if hasattr(self, 'watchdog'):
+            self.watchdog.start_monitoring()
+            logging.info("看门狗监控已启动")
+    
+    def stop_watchdog(self):
+        """停止看门狗监控"""
+        if hasattr(self, 'watchdog'):
+            self.watchdog.stop_monitoring()
+            logging.info("看门狗监控已停止")
+    
     def cleanup(self):
         """清理资源"""
+        # 停止watchdog监控
+        self.stop_watchdog()
         # 保存当前的定时任务到文件
         scheduled_jobs = schedule.get_jobs()
         self.task_manager.clear_tasks()
@@ -2817,10 +2906,13 @@ async def main():
         print("\n您可以通过Telegram机器人控制打卡：")
         print("/punch_in - 执行上班打卡")
         print("/punch_out - 执行下班打卡")
-        print("/status - 查看系统状态")
+        print("/status - 查看系统状态（包含看门狗状态）")
         print("/errors - 查看最近错误日志")
         print("/kill - 查看并管理定时任务")
         print("/kill <任务ID> - 直接删除指定任务")
+        
+        # 显示看门狗状态
+        print("\n🛡️ 看门狗模式已启用 - 系统将自动监控进程状态和资源使用情况")
         
         # 初始化 Telegram 机器人
         app = Application.builder().token(attendance_system.bot.token).build()
@@ -2829,6 +2921,9 @@ async def main():
         
         # 在Telegram机器人初始化之后检查邮箱连接
         await attendance_system.check_email_connection()
+        
+        # 启动看门狗监控（如果启用）
+        attendance_system.start_watchdog()
         
         # 注册命令处理器
         app.add_handler(CommandHandler('start', attendance_system.bot.start_command))

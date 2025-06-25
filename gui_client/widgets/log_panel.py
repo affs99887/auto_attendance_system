@@ -36,6 +36,10 @@ class LogPanel:
         
         # 初始化数据
         self.refresh_data()
+        
+        # 启动实时监控（在所有组件创建完成后）
+        if self.monitor_var.get():
+            self.toggle_monitoring()
     
     def create_widgets(self):
         """创建日志面板的所有组件"""
@@ -82,8 +86,8 @@ class LogPanel:
             command=self.export_logs
         ).pack(side=tk.LEFT, padx=(0, 5))
         
-        # 实时监控开关
-        self.monitor_var = tk.BooleanVar()
+        # 实时监控开关 (默认开启)
+        self.monitor_var = tk.BooleanVar(value=True)
         self.monitor_check = ttk.Checkbutton(
             top_controls,
             text="实时监控",
@@ -91,6 +95,8 @@ class LogPanel:
             command=self.toggle_monitoring
         )
         self.monitor_check.pack(side=tk.LEFT, padx=(10, 0))
+        
+        # 将启动实时监控延迟到所有组件创建完成后
         
         # 下方筛选控制
         filter_frame = ttk.Frame(frame)

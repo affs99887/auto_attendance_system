@@ -12,3 +12,4 @@ waitress>=2.1.2
 python-telegram-bot==20.7
 chinese-calendar==1.10.0
 pywin32>=306
+pystray>=0.19.4

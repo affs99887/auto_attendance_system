@@ -373,7 +373,8 @@ class ConfigPanel:
             self.debug_var.set(os.getenv("DEBUG", "False").lower() == "true")
             self.save_screenshot_var.set(os.getenv("SAVE_SCREENSHOT", "False").lower() == "true")
             
-            messagebox.showinfo("成功", "配置已重新加载")
+            # 注释掉自动弹窗，避免启动时干扰
+            # messagebox.showinfo("成功", "配置已重新加载")
             
         except Exception as e:
             messagebox.showerror("错误", f"加载配置失败: {str(e)}")
