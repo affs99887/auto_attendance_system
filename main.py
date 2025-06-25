@@ -1115,6 +1115,11 @@ class TelegramBot:
     def close_browser(self):
         """通过识别关闭按钮关闭浏览器窗口"""
         try:
+            # 检查attendance_system是否已初始化
+            if not self.attendance_system:
+                logging.error("AttendanceSystem未初始化，无法关闭浏览器")
+                return False
+                
             # 获取当前屏幕截图
             screen = self.attendance_system.take_screenshot()
             if screen is None:
@@ -1164,11 +1169,12 @@ class TelegramBot:
                 
                 # 备选方法2：使用win32gui关闭
                 logging.info("尝试使用win32gui关闭浏览器")
-                hwnd = self.attendance_system.get_browser_window()
-                if hwnd:
-                    win32gui.PostMessage(hwnd, win32con.WM_CLOSE, 0, 0)
-                    time.sleep(1)  # 等待窗口关闭
-                    return True
+                if self.attendance_system:
+                    hwnd = self.attendance_system.get_browser_window()
+                    if hwnd:
+                        win32gui.PostMessage(hwnd, win32con.WM_CLOSE, 0, 0)
+                        time.sleep(1)  # 等待窗口关闭
+                        return True
             
             # 如果所有方法都失败，返回失败
             logging.error("所有关闭浏览器的方法都失败")
@@ -1177,11 +1183,12 @@ class TelegramBot:
             logging.error(f"关闭浏览器窗口时发生错误: {str(e)}")
             # 尝试使用win32gui作为最后的备选方案
             try:
-                hwnd = self.attendance_system.get_browser_window()
-                if hwnd:
-                    win32gui.PostMessage(hwnd, win32con.WM_CLOSE, 0, 0)
-                    time.sleep(1)  # 等待窗口关闭
-                    return True
+                if self.attendance_system:
+                    hwnd = self.attendance_system.get_browser_window()
+                    if hwnd:
+                        win32gui.PostMessage(hwnd, win32con.WM_CLOSE, 0, 0)
+                        time.sleep(1)  # 等待窗口关闭
+                        return True
                 return False
             except Exception as e2:
                 logging.error(f"备选关闭方法也失败: {str(e2)}")
@@ -1948,6 +1955,12 @@ class AttendanceSystem:
         """通用打卡方法"""
         screen = None
         remaining_time_info = None  # 用于存储剩余工作时间信息
+        
+        # 确保bot已初始化
+        if not self.bot or not hasattr(self.bot, 'app') or not self.bot.app:
+            error_msg = f"Telegram bot未正确初始化，无法执行{punch_type}打卡"
+            logging.error(error_msg)
+            return (False, None)
         
         try:
             # 重置消息

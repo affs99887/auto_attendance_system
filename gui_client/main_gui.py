@@ -129,6 +129,10 @@ class AttendanceGUIApp:
             if chat_id:
                 self.telegram_bot = TelegramBot(chat_id)
                 self.telegram_bot.attendance_system = self.attendance_system
+                # 初始化Telegram应用程序
+                from telegram.ext import Application
+                self.telegram_bot.app = Application.builder().token(self.telegram_bot.token).build()
+                self.attendance_system.bot = self.telegram_bot
             
             # 更新GUI状态
             self.system_running = True
