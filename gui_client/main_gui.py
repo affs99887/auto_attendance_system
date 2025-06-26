@@ -23,6 +23,13 @@ except ImportError:
 # 添加项目根目录到Python路径
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+# 加载环境变量
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
+
 # 导入系统模块
 from main import AttendanceSystem, TelegramBot
 from tasks import TaskManager
@@ -30,10 +37,12 @@ from punch_records import PunchRecordManager
 try:
     from .widgets.main_window import MainWindow
     from .utils.gui_utils import set_window_icon, center_window
+    from .integrated_watchdog import IntegratedWatchdog
 except ImportError:
     # 如果相对导入失败，尝试绝对导入
     from gui_client.widgets.main_window import MainWindow
     from gui_client.utils.gui_utils import set_window_icon, center_window
+    from gui_client.integrated_watchdog import IntegratedWatchdog
 
 class AttendanceGUIApp:
     """自动打卡系统GUI应用主类"""
@@ -52,7 +61,10 @@ class AttendanceGUIApp:
         self.telegram_bot = None
         self.event_loop = None
         self.system_thread = None
-        self.system_running = False
+        
+        # 系统运行状态：stopped, starting, running, stopping
+        self.system_status = "stopped"
+        self.system_running = False  # 保持向后兼容
         
         # 系统托盘相关
         self.tray_icon = None
@@ -60,6 +72,11 @@ class AttendanceGUIApp:
         # 双击检测相关
         self.last_click_time = 0
         self.double_click_threshold = 0.5  # 双击时间阈值（秒）
+        
+        # 集成看门狗
+        self.integrated_watchdog = None
+        # 看门狗状态：disabled, starting, running, stopping, error
+        self.watchdog_status = "disabled"
         
         # 创建主窗口
         self.main_window = MainWindow(self.root, self)
@@ -72,6 +89,9 @@ class AttendanceGUIApp:
         
         # 配置日志
         self.setup_logging()
+        
+        # 初始化集成看门狗
+        self.init_integrated_watchdog()
         
     def setup_logging(self):
         """配置日志系统"""
@@ -98,10 +118,161 @@ class AttendanceGUIApp:
         else:
             self.logger.warning("pystray未安装，无法使用系统托盘功能")
     
+    def init_integrated_watchdog(self):
+        """初始化集成看门狗"""
+        try:
+            self.integrated_watchdog = IntegratedWatchdog(self)
+            self.logger.info("集成看门狗已初始化")
+            
+            # 延迟启动看门狗，等待GUI完全初始化
+            self.root.after(2000, self.start_integrated_watchdog)
+            
+        except Exception as e:
+            self.logger.error(f"初始化集成看门狗失败: {e}")
+    
+    def start_integrated_watchdog(self):
+        """启动集成看门狗"""
+        try:
+            if self.watchdog_status in ["starting", "running"]:
+                self.logger.warning(f"看门狗已在运行或启动中，当前状态: {self.watchdog_status}")
+                return
+                
+            # 设置启动中状态
+            self.set_watchdog_status("starting")
+            
+            if self.integrated_watchdog:
+                success = self.integrated_watchdog.start()
+                if success:
+                    self.logger.info("集成看门狗已启动")
+                    self.set_watchdog_status("running")
+                else:
+                    self.logger.warning("集成看门狗启动失败")
+                    self.set_watchdog_status("error")
+            else:
+                self.logger.error("集成看门狗对象不存在")
+                self.set_watchdog_status("error")
+        except Exception as e:
+            self.logger.error(f"启动集成看门狗失败: {e}")
+            self.set_watchdog_status("error")
+    
+    def set_system_status(self, status):
+        """设置系统运行状态"""
+        old_status = self.system_status
+        self.system_status = status
+        
+        # 更新system_running以保持向后兼容
+        self.system_running = (status == "running")
+        
+        self.logger.info(f"系统状态变更: {old_status} -> {status}")
+        
+        # 更新GUI显示
+        if hasattr(self.main_window, 'set_system_running'):
+            self.main_window.set_system_running(self.system_running)
+            
+        # 更新状态文本显示
+        status_text = {
+            "stopped": "系统已停止",
+            "starting": "系统启动中...",
+            "running": "系统运行中",
+            "stopping": "系统关闭中..."
+        }.get(status, f"未知状态: {status}")
+        
+        if hasattr(self.main_window, 'update_status'):
+            self.main_window.update_status(status_text)
+    
+    def set_watchdog_status(self, status):
+        """设置看门狗状态"""
+        old_status = self.watchdog_status
+        self.watchdog_status = status
+        
+        self.logger.info(f"看门狗状态变更: {old_status} -> {status}")
+        
+        # 更新GUI显示
+        if hasattr(self.main_window, 'update_watchdog_status'):
+            # 创建状态对象用于显示
+            watchdog_display_status = {
+                'enabled': status not in ['disabled', 'error'],
+                'running': status == 'running',
+                'status_text': status,
+                'restart_count': getattr(self.integrated_watchdog, 'restart_count', 0) if self.integrated_watchdog else 0,
+                'max_restarts': getattr(self.integrated_watchdog, 'max_restarts', 10) if self.integrated_watchdog else 10,
+                'health_status': getattr(self.integrated_watchdog, 'health_status', {}) if self.integrated_watchdog else {}
+            }
+            self.main_window.update_watchdog_status(watchdog_display_status)
+    
+    def get_system_status(self):
+        """获取当前系统状态"""
+        return {
+            'status': self.system_status,
+            'running': self.system_running,
+            'attendance_system': self.attendance_system is not None,
+            'telegram_bot': self.telegram_bot is not None,
+            'event_loop_running': self.event_loop and self.event_loop.is_running() if self.event_loop else False
+        }
+    
+    def stop_integrated_watchdog(self):
+        """停止集成看门狗"""
+        try:
+            if self.watchdog_status in ["stopping", "disabled"]:
+                self.logger.warning(f"看门狗已停止或停止中，当前状态: {self.watchdog_status}")
+                return
+                
+            # 设置停止中状态
+            self.set_watchdog_status("stopping")
+            
+            if self.integrated_watchdog:
+                self.integrated_watchdog.stop()
+                self.logger.info("集成看门狗已停止")
+                self.set_watchdog_status("disabled")
+            else:
+                self.set_watchdog_status("disabled")
+        except Exception as e:
+            self.logger.error(f"停止集成看门狗失败: {e}")
+            self.set_watchdog_status("error")
+    
+    def restart_system(self):
+        """重启系统（供看门狗调用）"""
+        try:
+            self.logger.info("正在重启系统...")
+            
+            # 停止当前系统
+            self.stop_system()
+            
+            # 等待停止完成
+            time.sleep(2)
+            
+            # 重新启动系统
+            self.start_system()
+            
+            self.logger.info("系统重启完成")
+            
+        except Exception as e:
+            self.logger.error(f"重启系统失败: {e}")
+    
+    def get_watchdog_status(self):
+        """获取看门狗状态"""
+        if self.integrated_watchdog:
+            return self.integrated_watchdog.get_status()
+        else:
+            return {
+                'enabled': False,
+                'running': False,
+                'restart_count': 0,
+                'max_restarts': 0,
+                'health_status': {},
+                'config': {}
+            }
+    
     def start_system(self):
         """启动打卡系统"""
         try:
-            self.main_window.update_status("正在启动系统...")
+            # 检查当前状态
+            if self.system_status in ["starting", "running"]:
+                self.logger.warning(f"系统已在运行或启动中，当前状态: {self.system_status}")
+                return
+            
+            # 设置启动中状态
+            self.set_system_status("starting")
             
             # 在新线程中启动系统
             self.system_thread = threading.Thread(target=self._run_system, daemon=True)
@@ -112,6 +283,7 @@ class AttendanceGUIApp:
         except Exception as e:
             error_msg = f"启动系统失败: {str(e)}"
             self.logger.error(error_msg)
+            self.set_system_status("stopped")
             messagebox.showerror("错误", error_msg)
     
     def _run_system(self):
@@ -121,23 +293,8 @@ class AttendanceGUIApp:
             self.event_loop = asyncio.new_event_loop()
             asyncio.set_event_loop(self.event_loop)
             
-            # 初始化系统组件
-            self.attendance_system = AttendanceSystem()
-            
-            # 获取Telegram配置
-            chat_id = os.getenv('TELEGRAM_CHAT_ID')
-            if chat_id:
-                self.telegram_bot = TelegramBot(chat_id)
-                self.telegram_bot.attendance_system = self.attendance_system
-                # 初始化Telegram应用程序
-                from telegram.ext import Application
-                self.telegram_bot.app = Application.builder().token(self.telegram_bot.token).build()
-                self.attendance_system.bot = self.telegram_bot
-            
-            # 更新GUI状态
-            self.system_running = True
-            self.root.after(0, lambda: self.main_window.update_status("系统运行中"))
-            self.root.after(0, lambda: self.main_window.set_system_running(True))
+            # 运行异步初始化
+            self.event_loop.run_until_complete(self._async_init_system())
             
             # 启动定期更新
             self.schedule_updates()
@@ -148,28 +305,196 @@ class AttendanceGUIApp:
         except Exception as e:
             error_msg = f"系统运行错误: {str(e)}"
             self.logger.error(error_msg)
-            self.system_running = False
+            self.root.after(0, lambda: self.set_system_status("stopped"))
             self.root.after(0, lambda: messagebox.showerror("系统错误", error_msg))
-            self.root.after(0, lambda: self.main_window.set_system_running(False))
+    
+    async def _async_init_system(self):
+        """异步初始化系统组件"""
+        try:
+            # 初始化系统组件
+            self.attendance_system = AttendanceSystem()
+            
+            # 获取Telegram配置并启动bot
+            chat_id = os.getenv('TELEGRAM_CHAT_ID')
+            bot_token = os.getenv('TELEGRAM_BOT_TOKEN')
+            
+            if chat_id and bot_token:
+                self.logger.info("初始化Telegram Bot...")
+                self.telegram_bot = TelegramBot(chat_id)
+                self.telegram_bot.attendance_system = self.attendance_system
+                
+                # 初始化Telegram应用程序
+                from telegram.ext import Application
+                app = Application.builder().token(bot_token).build()
+                self.telegram_bot.app = app
+                self.attendance_system.bot = self.telegram_bot
+                
+                # 注册命令处理器
+                await self._register_bot_handlers()
+                
+                # 启动Telegram bot
+                await app.initialize()
+                await app.start()
+                await self.telegram_bot.start_polling()
+                
+                # 启动连接监控
+                asyncio.create_task(self.telegram_bot.monitor_connection())
+                
+                self.logger.info("Telegram Bot启动成功")
+                self.root.after(0, lambda: self.main_window.update_status("系统运行中 (包含Telegram Bot)"))
+            else:
+                self.logger.warning("未配置Telegram Bot参数，仅启动核心功能")
+                self.root.after(0, lambda: self.main_window.update_status("系统运行中 (无Telegram Bot)"))
+            
+            # 加载现有的定时任务到调度器
+            self.load_existing_tasks_to_scheduler()
+            
+            # 启动调度器监控
+            self.start_scheduler_monitor()
+            
+            # 更新GUI状态为运行中
+            self.root.after(0, lambda: self.set_system_status("running"))
+            
+        except Exception as e:
+            self.logger.error(f"异步初始化系统失败: {str(e)}")
+            raise
+    
+    async def _register_bot_handlers(self):
+        """注册Telegram bot命令处理器"""
+        try:
+            from telegram.ext import CommandHandler, CallbackQueryHandler, MessageHandler, filters
+            
+            # 添加命令处理器（使用实际存在的方法名）
+            self.telegram_bot.app.add_handler(CommandHandler("start", self.telegram_bot.start_command))
+            self.telegram_bot.app.add_handler(CommandHandler("punch_in", self.telegram_bot.punch_in_command))
+            self.telegram_bot.app.add_handler(CommandHandler("punch_out", self.telegram_bot.punch_out_command))
+            self.telegram_bot.app.add_handler(CommandHandler("status", self.telegram_bot.status_command))
+            self.telegram_bot.app.add_handler(CommandHandler("errors", self.telegram_bot.get_recent_errors))
+            self.telegram_bot.app.add_handler(CommandHandler("kill", self.telegram_bot.kill_command))
+            self.telegram_bot.app.add_handler(CommandHandler("set_time", self.telegram_bot.settime_command))
+            
+            # 添加回调处理器
+            self.telegram_bot.app.add_handler(CallbackQueryHandler(self.telegram_bot.button_callback))
+            
+            # 添加消息处理器（用于处理设置时间等交互）
+            self.telegram_bot.app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self.telegram_bot.handle_message))
+            
+            self.logger.info("Telegram Bot命令处理器注册完成")
+            
+        except Exception as e:
+            self.logger.error(f"注册Bot命令处理器失败: {str(e)}")
+            raise
     
     def stop_system(self):
         """停止打卡系统"""
         try:
-            self.main_window.update_status("正在停止系统...")
+            # 检查当前状态
+            if self.system_status in ["stopping", "stopped"]:
+                self.logger.warning(f"系统已停止或停止中，当前状态: {self.system_status}")
+                return
             
+            # 设置停止中状态
+            self.set_system_status("stopping")
+            
+            # 异步停止Telegram bot
+            if self.event_loop and self.event_loop.is_running() and self.telegram_bot:
+                self.event_loop.call_soon_threadsafe(
+                    asyncio.create_task, self._async_stop_bot()
+                )
+            
+            # 停止事件循环
             if self.event_loop and self.event_loop.is_running():
                 self.event_loop.call_soon_threadsafe(self.event_loop.stop)
             
-            self.system_running = False
-            self.main_window.set_system_running(False)
-            self.main_window.update_status("系统已停止")
+            # 等待一小段时间后设置为已停止
+            self.root.after(1000, lambda: self.set_system_status("stopped"))
             
             self.logger.info("打卡系统已停止")
             
         except Exception as e:
             error_msg = f"停止系统失败: {str(e)}"
             self.logger.error(error_msg)
+            self.set_system_status("stopped")
             messagebox.showerror("错误", error_msg)
+    
+    async def _async_stop_bot(self):
+        """异步停止Telegram bot"""
+        try:
+            if self.telegram_bot and self.telegram_bot.app:
+                self.logger.info("正在停止Telegram Bot...")
+                await self.telegram_bot.stop_polling()
+                await self.telegram_bot.app.stop()
+                await self.telegram_bot.app.shutdown()
+                self.logger.info("Telegram Bot已停止")
+        except Exception as e:
+            self.logger.error(f"停止Telegram Bot失败: {str(e)}")
+    
+    def load_existing_tasks_to_scheduler(self):
+        """将现有任务加载到调度器"""
+        try:
+            if self.attendance_system and self.attendance_system.task_manager:
+                import schedule
+                import asyncio
+                
+                tasks = self.attendance_system.task_manager.get_tasks()
+                self.logger.info(f"开始加载 {len(tasks)} 个现有任务到调度器")
+                
+                for task in tasks:
+                    task_type = task['type']
+                    scheduled_time = task['scheduled_time']
+                    task_id = task.get('id', 'unknown')
+                    
+                    try:
+                        if task_type == 'punch_in':
+                            def punch_in_job():
+                                if self.event_loop and self.event_loop.is_running():
+                                    asyncio.run_coroutine_threadsafe(
+                                        self.attendance_system.punch_in(),
+                                        self.event_loop
+                                    )
+                            schedule.every().day.at(scheduled_time).do(punch_in_job).tag(f'punch_in_{scheduled_time}_{task_id}')
+                            
+                        elif task_type == 'punch_out':
+                            def punch_out_job():
+                                if self.event_loop and self.event_loop.is_running():
+                                    asyncio.run_coroutine_threadsafe(
+                                        self.attendance_system.punch_out(),
+                                        self.event_loop
+                                    )
+                            schedule.every().day.at(scheduled_time).do(punch_out_job).tag(f'punch_out_{scheduled_time}_{task_id}')
+                        
+                        self.logger.info(f"任务加载成功: ID {task_id}, 类型 {task_type}, 时间 {scheduled_time}")
+                        
+                    except Exception as task_error:
+                        self.logger.error(f"加载任务 {task_id} 失败: {task_error}")
+                
+                self.logger.info(f"任务加载完成，调度器中共有 {len(schedule.jobs)} 个任务")
+                
+        except Exception as e:
+            self.logger.error(f"加载现有任务到调度器失败: {str(e)}")
+    
+    def start_scheduler_monitor(self):
+        """启动调度器监控任务"""
+        try:
+            import schedule
+            
+            async def scheduler_monitor():
+                """调度器监控循环"""
+                while self.event_loop and self.event_loop.is_running():
+                    try:
+                        schedule.run_pending()  # 运行到期的任务
+                        await asyncio.sleep(1)  # 每秒检查一次
+                    except Exception as e:
+                        self.logger.error(f"调度器运行错误: {e}")
+                        await asyncio.sleep(5)  # 出错后等待5秒
+            
+            # 在事件循环中启动调度器监控
+            if self.event_loop:
+                asyncio.create_task(scheduler_monitor())
+                self.logger.info("调度器监控已启动")
+            
+        except Exception as e:
+            self.logger.error(f"启动调度器监控失败: {str(e)}")
     
     def schedule_updates(self):
         """安排定期更新GUI内容"""
@@ -414,6 +739,9 @@ class AttendanceGUIApp:
     def on_closing(self):
         """处理窗口关闭事件"""
         try:
+            # 停止集成看门狗
+            self.stop_integrated_watchdog()
+            
             # 停止系统
             self.stop_system()
             

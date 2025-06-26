@@ -52,27 +52,53 @@ class TaskPanel:
         control_frame = ttk.Frame(frame)
         control_frame.pack(fill=tk.X, pady=(0, 5))
         
+        # 第一行按钮
+        button_row1 = ttk.Frame(control_frame)
+        button_row1.pack(fill=tk.X, pady=(0, 2))
+        
         ttk.Button(
-            control_frame,
+            button_row1,
             text="刷新任务",
             command=self.refresh_data
         ).pack(side=tk.LEFT)
         
         ttk.Button(
-            control_frame,
+            button_row1,
             text="删除选中",
-            command=self.delete_selected_task
+            command=self.delete_selected_tasks
         ).pack(side=tk.LEFT, padx=(5, 0))
         
         ttk.Button(
-            control_frame,
+            button_row1,
             text="清空所有",
             command=self.clear_all_tasks
         ).pack(side=tk.LEFT, padx=(5, 0))
         
+        # 第二行按钮
+        button_row2 = ttk.Frame(control_frame)
+        button_row2.pack(fill=tk.X)
+        
+        ttk.Button(
+            button_row2,
+            text="全选",
+            command=self.select_all_tasks
+        ).pack(side=tk.LEFT)
+        
+        ttk.Button(
+            button_row2,
+            text="取消全选",
+            command=self.deselect_all_tasks
+        ).pack(side=tk.LEFT, padx=(5, 0))
+        
+        ttk.Button(
+            button_row2,
+            text="反选",
+            command=self.invert_selection
+        ).pack(side=tk.LEFT, padx=(5, 0))
+        
         # 任务列表树形视图
         columns = ("id", "type", "time", "next_run", "created")
-        self.task_tree = ttk.Treeview(frame, columns=columns, show='headings')
+        self.task_tree = ttk.Treeview(frame, columns=columns, show='headings', selectmode='extended')
         
         # 设置列标题
         self.task_tree.heading("id", text="ID")
@@ -98,6 +124,16 @@ class TaskPanel:
         
         # 绑定选择事件
         self.task_tree.bind('<<TreeviewSelect>>', self.on_task_select)
+        
+        # 绑定键盘快捷键
+        self.task_tree.bind('<Delete>', lambda e: self.delete_selected_tasks())
+        self.task_tree.bind('<Control-a>', lambda e: self.select_all_tasks())
+        self.task_tree.bind('<Control-d>', lambda e: self.deselect_all_tasks())
+        self.task_tree.bind('<Control-i>', lambda e: self.invert_selection())
+        self.task_tree.bind('<F5>', lambda e: self.refresh_data())
+        
+        # 设置焦点，使键盘快捷键生效
+        self.task_tree.focus_set()
     
     def create_task_operations_section(self, parent):
         """创建任务操作区域"""
@@ -153,6 +189,18 @@ class TaskPanel:
             text="任务统计: 总共 0 个任务"
         )
         self.stats_label.pack(anchor=tk.W)
+        
+        # 快捷键提示
+        shortcuts_frame = ttk.Frame(frame)
+        shortcuts_frame.pack(fill=tk.X, pady=(5, 0))
+        
+        shortcuts_text = "快捷键: Del-删除 | Ctrl+A-全选 | Ctrl+D-取消全选 | Ctrl+I-反选 | F5-刷新"
+        ttk.Label(
+            shortcuts_frame,
+            text=shortcuts_text,
+            font=("Arial", 8),
+            foreground="#666666"
+        ).pack(anchor=tk.W)
     
     def refresh_data(self):
         """刷新任务数据"""
@@ -161,8 +209,21 @@ class TaskPanel:
             for item in self.task_tree.get_children():
                 self.task_tree.delete(item)
             
+            # 首先尝试从任务管理器获取任务
+            tasks = []
             if hasattr(self.app, 'attendance_system') and self.app.attendance_system:
                 tasks = self.app.attendance_system.task_manager.get_tasks()
+            else:
+                # 如果系统未启动，直接从文件读取任务
+                try:
+                    from tasks import TaskManager
+                    temp_task_manager = TaskManager()
+                    tasks = temp_task_manager.get_tasks()
+                except Exception as e:
+                    print(f"从文件读取任务失败: {e}")
+                    tasks = []
+            
+            if tasks:
                 current_time = datetime.now()
                 
                 for task in tasks:
@@ -192,10 +253,11 @@ class TaskPanel:
                 # 更新统计信息
                 self.stats_label.config(text=f"任务统计: 总共 {len(tasks)} 个任务")
             else:
-                self.stats_label.config(text="任务统计: 系统未启动")
+                self.stats_label.config(text="任务统计: 无任务")
                 
         except Exception as e:
-            messagebox.showerror("错误", f"刷新任务数据失败: {str(e)}")
+            print(f"刷新任务数据失败: {str(e)}")  # 使用print而不是messagebox，避免频繁弹窗
+            self.stats_label.config(text="任务统计: 获取失败")
     
     def calculate_next_run(self, scheduled_time, current_time):
         """计算下次执行时间"""
@@ -224,25 +286,46 @@ class TaskPanel:
         selection = self.task_tree.selection()
         
         if selection:
-            item = self.task_tree.item(selection[0])
-            values = item['values']
-            
-            if values:
-                task_id = values[0]
-                task_type = values[1]
-                scheduled_time = values[2]
+            if len(selection) == 1:
+                # 单选时显示详细信息
+                item = self.task_tree.item(selection[0])
+                values = item['values']
                 
-                # 更新选中任务信息
+                if values:
+                    task_id = values[0]
+                    task_type = values[1]
+                    scheduled_time = values[2]
+                    
+                    # 更新选中任务信息
+                    self.selected_task_label.config(
+                        text=f"选中任务: ID {task_id} - {task_type} ({scheduled_time})"
+                    )
+                    
+                    # 更新任务状态
+                    self.update_task_status(task_id)
+                    
+                    # 启用单任务操作按钮
+                    self.execute_task_btn.config(state=tk.NORMAL)
+            else:
+                # 多选时显示选中数量
+                selected_ids = []
+                for item_id in selection:
+                    item = self.task_tree.item(item_id)
+                    values = item['values']
+                    if values:
+                        selected_ids.append(values[0])
+                
                 self.selected_task_label.config(
-                    text=f"选中任务: ID {task_id} - {task_type} ({scheduled_time})"
+                    text=f"已选中 {len(selection)} 个任务: {', '.join(map(str, selected_ids))}"
                 )
+                self.task_status_label.config(text="状态: 多任务选中")
                 
-                # 启用操作按钮
-                self.delete_task_btn.config(state=tk.NORMAL)
-                self.execute_task_btn.config(state=tk.NORMAL)
-                
-                # 更新任务状态
-                self.update_task_status(task_id)
+                # 多选时禁用单任务操作按钮
+                self.execute_task_btn.config(state=tk.DISABLED)
+            
+            # 有选中项时启用删除按钮
+            self.delete_task_btn.config(state=tk.NORMAL)
+            
         else:
             # 没有选中任务
             self.selected_task_label.config(text="选中任务: 无")
@@ -286,53 +369,87 @@ class TaskPanel:
                 foreground=StatusColors.SECONDARY
             )
     
-    def delete_selected_task(self):
-        """删除选中的任务"""
+    def delete_selected_tasks(self):
+        """删除选中的任务（支持多选）"""
         selection = self.task_tree.selection()
         
         if not selection:
             messagebox.showwarning("警告", "请先选择要删除的任务")
             return
         
-        item = self.task_tree.item(selection[0])
-        values = item['values']
+        # 收集选中的任务信息
+        selected_tasks = []
+        for item_id in selection:
+            item = self.task_tree.item(item_id)
+            values = item['values']
+            if values:
+                selected_tasks.append({
+                    'id': values[0],
+                    'type': values[1],
+                    'time': values[2]
+                })
         
-        if not values:
+        if not selected_tasks:
+            messagebox.showwarning("警告", "没有有效的任务可删除")
             return
         
-        task_id = values[0]
-        task_type = values[1]
+        # 构建确认消息
+        if len(selected_tasks) == 1:
+            task = selected_tasks[0]
+            confirm_msg = f"确定要删除任务 ID {task['id']} ({task['type']}) 吗？"
+        else:
+            task_list = []
+            for task in selected_tasks:
+                task_list.append(f"ID {task['id']} ({task['type']})")
+            confirm_msg = f"确定要删除以下 {len(selected_tasks)} 个任务吗？\n\n" + "\n".join(task_list)
         
-        if not ask_yes_no(
-            self.parent, 
-            "确认删除", 
-            f"确定要删除任务 ID {task_id} ({task_type}) 吗？"
-        ):
+        if not ask_yes_no(self.parent, "确认删除", confirm_msg):
             return
         
         try:
             if hasattr(self.app, 'attendance_system') and self.app.attendance_system:
-                success = self.app.attendance_system.task_manager.remove_task_by_id(int(task_id))
+                success_count = 0
+                failed_tasks = []
                 
-                if success:
-                    messagebox.showinfo("成功", f"任务 ID {task_id} 已删除")
-                    
-                    # 清除调度器中的任务
+                # 逐个删除任务
+                for task in selected_tasks:
+                    try:
+                        task_id = int(task['id'])
+                        success = self.app.attendance_system.task_manager.remove_task_by_id(task_id)
+                        if success:
+                            success_count += 1
+                        else:
+                            failed_tasks.append(f"ID {task_id}")
+                    except Exception as e:
+                        failed_tasks.append(f"ID {task['id']} (错误: {str(e)})")
+                
+                # 重新加载调度器
+                if success_count > 0:
                     import schedule
                     schedule.clear()
-                    
-                    # 重新加载剩余任务到调度器
                     self.reload_scheduler_tasks()
-                    
-                    # 刷新显示
-                    self.refresh_data()
+                
+                # 显示结果
+                if success_count == len(selected_tasks):
+                    messagebox.showinfo("成功", f"成功删除 {success_count} 个任务")
+                elif success_count > 0:
+                    messagebox.showwarning("部分成功", 
+                        f"成功删除 {success_count} 个任务\n失败的任务: {', '.join(failed_tasks)}")
                 else:
-                    messagebox.showerror("错误", f"删除任务 ID {task_id} 失败")
+                    messagebox.showerror("失败", f"所有任务删除失败\n失败的任务: {', '.join(failed_tasks)}")
+                
+                # 刷新显示
+                self.refresh_data()
+                
             else:
                 messagebox.showerror("错误", "系统未启动，无法删除任务")
                 
         except Exception as e:
             messagebox.showerror("错误", f"删除任务失败: {str(e)}")
+    
+    def delete_selected_task(self):
+        """兼容旧方法名，调用新的多选删除方法"""
+        self.delete_selected_tasks()
     
     def clear_all_tasks(self):
         """清空所有任务"""
@@ -407,6 +524,46 @@ class TaskPanel:
         except Exception as e:
             messagebox.showerror("错误", f"执行任务失败: {str(e)}")
     
+    def select_all_tasks(self):
+        """全选所有任务"""
+        try:
+            all_items = self.task_tree.get_children()
+            if all_items:
+                self.task_tree.selection_set(all_items)
+                # 手动触发选择事件
+                self.on_task_select(None)
+        except Exception as e:
+            print(f"全选任务失败: {str(e)}")
+    
+    def deselect_all_tasks(self):
+        """取消全选"""
+        try:
+            self.task_tree.selection_remove(self.task_tree.selection())
+            # 手动触发选择事件
+            self.on_task_select(None)
+        except Exception as e:
+            print(f"取消全选失败: {str(e)}")
+    
+    def invert_selection(self):
+        """反选"""
+        try:
+            all_items = self.task_tree.get_children()
+            current_selection = set(self.task_tree.selection())
+            all_items_set = set(all_items)
+            
+            # 计算反选项目
+            new_selection = all_items_set - current_selection
+            
+            # 清除当前选择并设置新选择
+            self.task_tree.selection_remove(self.task_tree.selection())
+            if new_selection:
+                self.task_tree.selection_set(list(new_selection))
+            
+            # 手动触发选择事件
+            self.on_task_select(None)
+        except Exception as e:
+            print(f"反选失败: {str(e)}")
+    
     def reload_scheduler_tasks(self):
         """重新加载调度器中的任务"""
         try:
@@ -421,17 +578,21 @@ class TaskPanel:
                     scheduled_time = task['scheduled_time']
                     
                     if task_type == 'punch_in':
-                        async def punch_in_job():
-                            await self.app.attendance_system.punch_in()
-                        schedule.every().day.at(scheduled_time).do(
-                            lambda: asyncio.create_task(punch_in_job())
-                        )
+                        def punch_in_job():
+                            if self.app.event_loop and self.app.event_loop.is_running():
+                                asyncio.run_coroutine_threadsafe(
+                                    self.app.attendance_system.punch_in(),
+                                    self.app.event_loop
+                                )
+                        schedule.every().day.at(scheduled_time).do(punch_in_job)
                     elif task_type == 'punch_out':
-                        async def punch_out_job():
-                            await self.app.attendance_system.punch_out()
-                        schedule.every().day.at(scheduled_time).do(
-                            lambda: asyncio.create_task(punch_out_job())
-                        )
+                        def punch_out_job():
+                            if self.app.event_loop and self.app.event_loop.is_running():
+                                asyncio.run_coroutine_threadsafe(
+                                    self.app.attendance_system.punch_out(),
+                                    self.app.event_loop
+                                )
+                        schedule.every().day.at(scheduled_time).do(punch_out_job)
                         
         except Exception as e:
             print(f"重新加载调度器任务失败: {str(e)}")

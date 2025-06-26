@@ -228,6 +228,14 @@ class MainWindow:
         except Exception as e:
             print(f"刷新数据时发生错误: {str(e)}")
     
+    def update_watchdog_status(self, status):
+        """更新看门狗状态显示"""
+        try:
+            if hasattr(self, 'status_panel'):
+                self.status_panel.update_watchdog_status(status)
+        except Exception as e:
+            print(f"更新看门狗状态时发生错误: {str(e)}")
+    
     def open_log_directory(self):
         """打开日志目录"""
         import subprocess

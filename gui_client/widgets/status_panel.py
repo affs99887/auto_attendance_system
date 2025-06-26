@@ -144,6 +144,14 @@ class StatusPanel:
         ttk.Label(heartbeat_frame, text="心跳状态:").pack(side=tk.LEFT)
         self.heartbeat_label = ttk.Label(heartbeat_frame, text="--")
         self.heartbeat_label.pack(side=tk.RIGHT)
+        
+        # 看门狗状态
+        watchdog_frame = ttk.Frame(frame)
+        watchdog_frame.pack(fill=tk.X, pady=2)
+        
+        ttk.Label(watchdog_frame, text="看门狗状态:").pack(side=tk.LEFT)
+        self.watchdog_label = ttk.Label(watchdog_frame, text="--")
+        self.watchdog_label.pack(side=tk.RIGHT)
     
     def create_config_info(self, parent):
         """创建配置信息组"""
@@ -240,11 +248,17 @@ class StatusPanel:
     
     def update_system_info(self):
         """更新系统信息"""
-        # 系统运行状态
-        if self.app.system_running:
-            self.system_status_label.config(text="🟢 运行中", foreground=StatusColors.SUCCESS)
-        else:
-            self.system_status_label.config(text="🔴 未运行", foreground=StatusColors.ERROR)
+        # 系统运行状态 - 使用新的状态管理
+        system_status = getattr(self.app, 'system_status', 'stopped')
+        status_config = {
+            'stopped': ("🔴 已停止", StatusColors.ERROR),
+            'starting': ("🟡 启动中...", StatusColors.WARNING),
+            'running': ("🟢 运行中", StatusColors.SUCCESS),
+            'stopping': ("🟡 关闭中...", StatusColors.WARNING)
+        }
+        
+        status_text, status_color = status_config.get(system_status, ("❓ 未知状态", StatusColors.SECONDARY))
+        self.system_status_label.config(text=status_text, foreground=status_color)
         
         # 获取系统资源信息
         try:
@@ -296,6 +310,9 @@ class StatusPanel:
                     self.heartbeat_label.config(text="❓ 未知", foreground=StatusColors.SECONDARY)
             else:
                 self.heartbeat_label.config(text="❓ 未知", foreground=StatusColors.SECONDARY)
+            
+            # 看门狗状态
+            self.update_watchdog_status()
                 
         except Exception as e:
             self.memory_label.config(text="--")
@@ -417,3 +434,141 @@ class StatusPanel:
             self.work_end_label.config(text="--")
             self.late_threshold_label.config(text="--")
             self.early_threshold_label.config(text="--")
+    
+    def update_watchdog_status(self, status=None):
+        """更新看门狗状态"""
+        try:
+            # 如果有传入状态，使用集成看门狗状态
+            if status and isinstance(status, dict):
+                self.update_integrated_watchdog_status(status)
+                return
+            
+            # 否则检查外部看门狗进程和集成看门狗状态
+            external_watchdog_running = self.is_external_watchdog_running()
+            integrated_watchdog_status = self.get_integrated_watchdog_status()
+            
+            if integrated_watchdog_status.get('enabled', False):
+                if integrated_watchdog_status.get('running', False):
+                    restart_count = integrated_watchdog_status.get('restart_count', 0)
+                    max_restarts = integrated_watchdog_status.get('max_restarts', 10)
+                    
+                    if restart_count > 0:
+                        self.watchdog_label.config(
+                            text=f"🟢 运行中 (重启: {restart_count}/{max_restarts})",
+                            foreground=StatusColors.SUCCESS
+                        )
+                    else:
+                        self.watchdog_label.config(
+                            text="🟢 运行中 (集成)",
+                            foreground=StatusColors.SUCCESS
+                        )
+                else:
+                    self.watchdog_label.config(
+                        text="🟡 已启用但未运行",
+                        foreground=StatusColors.WARNING
+                    )
+            elif external_watchdog_running:
+                # 外部看门狗在运行
+                self.watchdog_label.config(
+                    text="🟡 外部看门狗运行中",
+                    foreground=StatusColors.WARNING
+                )
+            else:
+                # 都没有运行
+                self.watchdog_label.config(
+                    text="🔴 未启用",
+                    foreground=StatusColors.ERROR
+                )
+                
+        except Exception as e:
+            self.watchdog_label.config(text="❓ 检测失败", foreground=StatusColors.SECONDARY)
+    
+    def update_integrated_watchdog_status(self, status):
+        """更新集成看门狗状态显示"""
+        try:
+            # 获取状态信息
+            enabled = status.get('enabled', False)
+            running = status.get('running', False)
+            status_text = status.get('status_text', '')
+            restart_count = status.get('restart_count', 0)
+            max_restarts = status.get('max_restarts', 10)
+            health_status = status.get('health_status', {})
+            
+            # 处理中间状态
+            if status_text in ['starting', 'stopping']:
+                status_config = {
+                    'starting': ("🟡 启动中...", StatusColors.WARNING),
+                    'stopping': ("🟡 关闭中...", StatusColors.WARNING)
+                }
+                text, color = status_config.get(status_text, ("❓ 未知状态", StatusColors.SECONDARY))
+                self.watchdog_label.config(text=text, foreground=color)
+                return
+            
+            # 处理其他状态
+            if status_text == 'error':
+                self.watchdog_label.config(
+                    text="🔴 错误状态",
+                    foreground=StatusColors.ERROR
+                )
+            elif not enabled or status_text == 'disabled':
+                self.watchdog_label.config(
+                    text="🔴 已禁用",
+                    foreground=StatusColors.ERROR
+                )
+            elif not running:
+                self.watchdog_label.config(
+                    text="🟡 已启用但未运行",
+                    foreground=StatusColors.WARNING
+                )
+            else:
+                # 检查健康状态
+                gui_healthy = health_status.get('gui_healthy', True)
+                memory_percent = health_status.get('memory_percent', 0)
+                
+                if restart_count > max_restarts * 0.8:  # 接近最大重启次数
+                    self.watchdog_label.config(
+                        text=f"🔴 运行中 (重启过多: {restart_count}/{max_restarts})",
+                        foreground=StatusColors.ERROR
+                    )
+                elif not gui_healthy:
+                    self.watchdog_label.config(
+                        text=f"🟡 运行中 (健康异常: {restart_count}/{max_restarts})",
+                        foreground=StatusColors.WARNING
+                    )
+                elif restart_count > 0:
+                    self.watchdog_label.config(
+                        text=f"🟢 运行中 (重启: {restart_count}/{max_restarts})",
+                        foreground=StatusColors.SUCCESS
+                    )
+                else:
+                    self.watchdog_label.config(
+                        text="🟢 运行中 (健康)",
+                        foreground=StatusColors.SUCCESS
+                    )
+                    
+        except Exception as e:
+            self.watchdog_label.config(text="❓ 状态解析失败", foreground=StatusColors.SECONDARY)
+    
+    def get_integrated_watchdog_status(self):
+        """获取集成看门狗状态"""
+        try:
+            if hasattr(self.app, 'get_watchdog_status'):
+                return self.app.get_watchdog_status()
+            else:
+                return {}
+        except Exception:
+            return {}
+    
+    def is_external_watchdog_running(self):
+        """检查外部看门狗进程是否在运行"""
+        try:
+            for proc in psutil.process_iter(['name', 'cmdline']):
+                try:
+                    cmdline = proc.info.get('cmdline', [])
+                    if cmdline and any('watchdog.py' in arg for arg in cmdline):
+                        return True
+                except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+                    continue
+            return False
+        except Exception:
+            return False

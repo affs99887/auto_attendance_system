@@ -98,11 +98,35 @@ class PunchPanel:
         type_combo = ttk.Combobox(
             type_frame,
             textvariable=self.punch_type_var,
-            values=[("punch_in", "上班打卡"), ("punch_out", "下班打卡")],
+            values=["punch_in", "punch_out"],
             state="readonly",
             width=12
         )
         type_combo.pack(side=tk.LEFT, padx=(10, 0))
+        
+        # 设置显示值映射
+        def update_type_display(*args):
+            current_value = self.punch_type_var.get()
+            if current_value == "punch_in":
+                type_combo.set("上班打卡")
+            elif current_value == "punch_out":
+                type_combo.set("下班打卡")
+        
+        # 重新配置为显示友好名称
+        type_combo.configure(values=["上班打卡", "下班打卡"])
+        type_combo.set("下班打卡")  # 默认值
+        
+        # 绑定选择事件来更新内部值
+        def on_type_select(event):
+            selected = type_combo.get()
+            if selected == "上班打卡":
+                self.punch_type_var.set("punch_in")
+            elif selected == "下班打卡":
+                self.punch_type_var.set("punch_out")
+        
+        type_combo.bind('<<ComboboxSelected>>', on_type_select)
+        # 初始化内部值
+        self.punch_type_var.set("punch_out")
         
         # 时间设置
         time_frame = ttk.Frame(setting_frame)
@@ -268,17 +292,57 @@ class PunchPanel:
             if not ask_yes_no(self.parent, "确认", f"确定要设置 {time_str} 的{type_name}定时任务吗？"):
                 return
             
-            # 这里应该调用实际的设置定时任务方法
-            # 由于原系统的定时任务设置较为复杂，这里先显示设置结果
-            messagebox.showinfo("成功", f"已设置 {time_str} 的{type_name}定时任务")
+            # 实际添加任务到系统
+            if hasattr(self.app, 'attendance_system') and self.app.attendance_system:
+                # 添加到任务管理器
+                task_id = self.app.attendance_system.task_manager.add_task(punch_type, time_str)
+                
+                # 添加到调度器
+                self.add_to_scheduler(punch_type, time_str)
+                
+                messagebox.showinfo("成功", f"已设置 {time_str} 的{type_name}定时任务\n任务ID: {task_id}")
+            else:
+                messagebox.showerror("错误", "系统未启动，无法设置定时任务")
+                return
             
             # 刷新定时任务显示
             self.refresh_scheduled_tasks()
+            
+            # 同时刷新任务面板（如果存在）
+            if hasattr(self.app, 'main_window') and hasattr(self.app.main_window, 'task_panel'):
+                self.app.main_window.task_panel.refresh_data()
             
         except ValueError:
             messagebox.showerror("错误", "请输入有效的数字")
         except Exception as e:
             messagebox.showerror("错误", f"设置定时任务失败: {str(e)}")
+    
+    def add_to_scheduler(self, task_type, scheduled_time):
+        """将任务添加到调度器"""
+        try:
+            import schedule
+            import asyncio
+            
+            if task_type == 'punch_in':
+                def punch_in_job():
+                    if self.app.event_loop and self.app.event_loop.is_running():
+                        asyncio.run_coroutine_threadsafe(
+                            self.app.attendance_system.punch_in(),
+                            self.app.event_loop
+                        )
+                schedule.every().day.at(scheduled_time).do(punch_in_job).tag(f'punch_in_{scheduled_time}')
+                
+            elif task_type == 'punch_out':
+                def punch_out_job():
+                    if self.app.event_loop and self.app.event_loop.is_running():
+                        asyncio.run_coroutine_threadsafe(
+                            self.app.attendance_system.punch_out(),
+                            self.app.event_loop
+                        )
+                schedule.every().day.at(scheduled_time).do(punch_out_job).tag(f'punch_out_{scheduled_time}')
+                
+        except Exception as e:
+            print(f"添加到调度器失败: {str(e)}")
     
     def refresh_data(self):
         """刷新面板数据"""
