@@ -21,72 +21,68 @@ The system consists of several key components:
 - **browser_automation.py** - BrowserController class for browser automation and window control
 - **image_recognition.py** - ImageRecognizer class for OCR and template matching
 
-### Web GUI (Next.js)
-- **gui/** - Next.js application providing web interface
-- **gui/lib/server.js** - Express server for API endpoints
-- **gui/components/** - React components for dashboard, settings, logs, etc.
+### Desktop GUI Client
+- **gui_client/** - Tkinter-based desktop application providing complete graphical interface
+- **gui_client/main_gui.py** - Main GUI application with system tray integration
+- **gui_client/widgets/** - GUI components (MainWindow, StatusPanel, PunchPanel, TaskPanel, LogPanel, ConfigPanel)
+- **gui_client/utils/** - GUI utilities for window management and icons
 
 ### Key Technologies
 - **Computer Vision**: OpenCV, PyAutoGUI, Tesseract OCR for screen automation
 - **Telegram Bot**: python-telegram-bot for remote control
 - **Scheduling**: schedule library with chinese-calendar for workday detection
-- **Frontend**: Next.js, React, Tailwind CSS, shadcn/ui components
+- **Desktop GUI**: Tkinter with pystray for system tray integration
 
 ## Common Development Commands
 
-### Python Backend
+### Environment Setup
 ```bash
+# Create and activate virtual environment
+python3 -m venv venv
+source venv/bin/activate  # Linux/WSL
+# or
+venv\Scripts\activate     # Windows
+
 # Install dependencies
 pip install -r requirements.txt
-
-# Run main attendance system
-python main.py
-
-# Run with watchdog (recommended)
-python watchdog.py
-
-# Run tests
-python test_startup.py
-python test_alert_detection.py
-python test_network_recovery.py
 ```
 
-### Web GUI
+### Running the System
 ```bash
-# Navigate to gui directory first
-cd gui
+# Activate virtual environment first
+source venv/bin/activate
 
-# Install dependencies
-npm install
-# or
-pnpm install
+# Run main attendance system (CLI mode)
+python main.py
 
-# Development server
-npm run dev
-# or
-pnpm dev
+# Run with watchdog (recommended for production)
+python watchdog.py
 
-# Development with backend
-npm run dev:all
-# or
-pnpm dev:all
+# Run desktop GUI application
+python run_gui.py
 
-# Build for production
-npm run build
-npm run start
+# Run GUI in background (Windows)
+python run_gui.pyw
+```
 
-# Lint
-npm run lint
+### Development
+```bash
+# Activate virtual environment first
+source venv/bin/activate
 ```
 
 ## Configuration
 
 ### Environment Variables (.env)
 - LOGIN_USERNAME, LOGIN_PASSWORD, LOGIN_URL - Login credentials
+- LOGIN_USERNAME2, LOGIN_PASSWORD2 - Second user credentials (multi-user support)
 - TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID - Telegram bot configuration
 - TESSERACT_PATH - Path to Tesseract OCR executable
 - WORK_START_TIME, WORK_END_TIME - Punch in/out times
-- EMAIL_* - Email notification settings
+- LATE_THRESHOLD, EARLY_LEAVE_THRESHOLD - Threshold settings for alerts
+- DAILY_STATUS_TIME - Time for daily status reports
+- EMAIL_SENDER, EMAIL_PASSWORD - Email notification credentials
+- EMAIL_SMTP_SERVER, EMAIL_SMTP_PORT - SMTP server configuration
 
 ### Template Images
 The system uses template matching with images in `templates/` directory:
@@ -118,14 +114,51 @@ The system supports multiple users with separate:
 - Task scheduling and management
 - Process monitoring and auto-restart
 
-## Testing
+## System Operation Modes
 
-Run individual test files to verify specific functionality:
-- test_startup.py - System initialization tests
-- test_alert_detection.py - UI recognition tests  
-- test_network_recovery.py - Network resilience tests
+### CLI Mode (main.py)
+- Full system with Telegram bot integration
+- Runs in background with console logging
+- Suitable for server deployments
 
-### Refactored Module Tests (2025-06-24)
-- test_email_service.py - Complete email functionality testing with retry mechanisms
-- test_imports.py - Module import and dependency verification
-- test_refactor_basic.py - Basic refactoring validation and syntax checking
+### GUI Mode (run_gui.py)
+- Desktop application with graphical interface
+- System tray integration for background operation
+- Real-time monitoring and manual controls
+- Configuration management interface
+
+### Watchdog Mode (watchdog.py)
+- Process monitoring and automatic restart
+- Resource usage monitoring with alerts
+- Standalone operation with configurable restart limits
+
+## Key Integration Points
+
+### Data Flow Architecture
+1. **Punch Operation**: BrowserController → ImageRecognizer → BrowserController → PunchRecordManager → EmailService → TelegramBot
+2. **Task Scheduling**: TaskManager → AttendanceSystem → (punch operation flow)
+3. **GUI Updates**: AttendanceSystem → MainWindow → GUI Components (real-time status)
+
+### Module Dependencies
+- **AttendanceSystem**: Core orchestrator using all service modules
+- **TelegramBot**: Remote control interface with comprehensive command handling
+- **Service Modules**: EmailService, BrowserController, ImageRecognizer (loosely coupled)
+- **GUI Client**: Integrates with AttendanceSystem via background threading
+
+### Error Handling Strategy
+- **Network Issues**: Automatic retry with exponential backoff in EmailService and TelegramBot
+- **Process Crashes**: Watchdog monitoring with automatic restart and rate limiting  
+- **UI Recognition Failures**: Template matching fallbacks with threshold adjustments
+- **Connection Monitoring**: Health checks and reconnection logic for external services
+
+## Development Environment Notes
+
+### WSL/Linux Considerations
+- GUI applications require X11 server or run in CLI mode only
+- Virtual environment activation required: `source venv/bin/activate`
+- Some Windows-specific packages (pywin32) will not install but system works without them
+
+### Multi-User Development
+- User-specific data stored in `punch_records/{username}/` and `screenshots/{username}/`
+- Environment variables support multiple user credentials (LOGIN_USERNAME2, etc.)
+- Settings and configurations isolated per user
