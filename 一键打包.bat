@@ -1,0 +1,3 @@
+@echo off
+echo 启动打包工具...
+call tools\快速打包.bat

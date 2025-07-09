@@ -1,0 +1,12 @@
+{
+  "theme": "system",
+  "theme_colors": {
+    "primary": "#2196F3",
+    "secondary": "#9C27B0",
+    "surface": "#FFFFFF",
+    "error": "#D32F2F",
+    "success": "#00C853",
+    "warning": "#FF8F00"
+  },
+  "design_version": "2.0"
+}
