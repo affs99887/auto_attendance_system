@@ -166,6 +166,7 @@ class TelegramBot:
                     self.app.add_handler(CommandHandler('errors', self.get_recent_errors))
                     self.app.add_handler(CommandHandler('kill', self.kill_command))
                     self.app.add_handler(CommandHandler('set_time', self.settime_command))
+                    self.app.add_handler(CommandHandler('check', self.check_command))
                     self.app.add_handler(CallbackQueryHandler(self.button_callback))
                     self.app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self.handle_message))
                     
@@ -197,7 +198,9 @@ class TelegramBot:
             "/status - 查看状态（包含看门狗状态）\n"
             "/errors - 查看最近错误日志\n"
             "/kill - 查看并管理定时任务\n"
-            "/kill <任务ID> - 直接删除指定任务\n\n"
+            "/kill <任务ID> - 直接删除指定任务\n"
+            "/check - 查看最新打卡图片\n"
+            "/check <用户名> - 查看指定用户的打卡图片\n\n"
             "🛡️ 看门狗功能已内置启用"
         )
 
@@ -637,6 +640,146 @@ class TelegramBot:
             )
         else:
             await message.reply_text("删除任务失败")
+
+    async def check_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """处理/check命令 - 查看最新的打卡图片"""
+        if str(update.message.chat_id) != self.chat_id:
+            await update.message.reply_text("您没有权限使用此机器人")
+            return
+        
+        try:
+            # 解析命令参数
+            args = context.args
+            
+            # 获取所有用户列表
+            if not self.attendance_system or not self.attendance_system.users:
+                await update.message.reply_text("❌ 系统未初始化或无用户配置")
+                return
+                
+            all_users = [user['username'] for user in self.attendance_system.users]
+            
+            # 如果没有参数，显示可用用户列表
+            if not args:
+                user_list = '\n'.join([f"• {user}" for user in all_users])
+                await update.message.reply_text(
+                    f"📋 可用用户列表：\n{user_list}\n\n"
+                    f"使用方法：\n"
+                    f"/check 用户名 - 查看该用户的最新打卡图片\n"
+                    f"/check 用户名 punch_in - 只查看上班打卡图片\n"
+                    f"/check 用户名 punch_out - 只查看下班打卡图片"
+                )
+                return
+            
+            # 解析用户名和类型
+            username = args[0]
+            punch_type = args[1] if len(args) > 1 else 'all'
+            
+            # 验证用户名
+            if username not in all_users:
+                await update.message.reply_text(f"❌ 用户 '{username}' 不存在\n可用用户: {', '.join(all_users)}")
+                return
+            
+            # 验证打卡类型
+            if punch_type not in ['all', 'punch_in', 'punch_out']:
+                await update.message.reply_text("❌ 无效的打卡类型，请使用：all、punch_in 或 punch_out")
+                return
+            
+            # 获取截图目录
+            screenshot_base_dir = 'screenshots'
+            user_screenshot_dir = os.path.join(screenshot_base_dir, username)
+            
+            if not os.path.exists(user_screenshot_dir):
+                await update.message.reply_text(f"❌ 用户 '{username}' 还没有打卡记录")
+                return
+            
+            # 收集图片文件
+            images_to_send = []
+            
+            # 根据类型收集图片
+            if punch_type == 'all' or punch_type == 'punch_in':
+                punch_in_dir = os.path.join(user_screenshot_dir, 'punch_in')
+                if os.path.exists(punch_in_dir):
+                    images_to_send.extend(self._get_recent_images(punch_in_dir, 'punch_in', 5))
+            
+            if punch_type == 'all' or punch_type == 'punch_out':
+                punch_out_dir = os.path.join(user_screenshot_dir, 'punch_out')
+                if os.path.exists(punch_out_dir):
+                    images_to_send.extend(self._get_recent_images(punch_out_dir, 'punch_out', 5))
+            
+            # 按时间排序
+            images_to_send.sort(key=lambda x: x['time'], reverse=True)
+            
+            # 限制最多10张图片
+            if len(images_to_send) > 10:
+                images_to_send = images_to_send[:10]
+            
+            if not images_to_send:
+                await update.message.reply_text(f"❌ 用户 '{username}' 没有找到相关的打卡图片")
+                return
+            
+            # 发送图片
+            await update.message.reply_text(f"📸 正在发送 {username} 的最新打卡图片...")
+            
+            for i, image_info in enumerate(images_to_send):
+                try:
+                    with open(image_info['path'], 'rb') as photo:
+                        caption = f"👤 用户: {username}\n📅 时间: {image_info['time_str']}\n🔄 类型: {image_info['type']}"
+                        await self.app.bot.send_photo(
+                            chat_id=self.chat_id,
+                            photo=photo,
+                            caption=caption
+                        )
+                    
+                    # 避免发送过快被限制
+                    if i < len(images_to_send) - 1:
+                        await asyncio.sleep(0.5)
+                        
+                except Exception as e:
+                    logging.error(f"发送图片 {image_info['path']} 失败: {e}")
+                    await update.message.reply_text(f"❌ 发送图片失败: {os.path.basename(image_info['path'])}")
+            
+            await update.message.reply_text(f"✅ 已发送 {len(images_to_send)} 张图片")
+            
+        except Exception as e:
+            logging.error(f"处理/check命令时发生错误: {e}")
+            await update.message.reply_text(f"❌ 处理命令时发生错误: {str(e)}")
+
+    def _get_recent_images(self, directory, punch_type, limit=5):
+        """获取目录中最近的图片文件"""
+        images = []
+        try:
+            if not os.path.exists(directory):
+                return images
+            
+            # 获取所有图片文件
+            for filename in os.listdir(directory):
+                if filename.lower().endswith(('.png', '.jpg', '.jpeg')):
+                    filepath = os.path.join(directory, filename)
+                    try:
+                        # 获取文件修改时间
+                        mtime = os.path.getmtime(filepath)
+                        time_str = datetime.fromtimestamp(mtime).strftime('%Y-%m-%d %H:%M:%S')
+                        
+                        images.append({
+                            'path': filepath,
+                            'time': mtime,
+                            'time_str': time_str,
+                            'type': '上班打卡' if punch_type == 'punch_in' else '下班打卡',
+                            'filename': filename
+                        })
+                    except Exception as e:
+                        logging.warning(f"获取文件 {filepath} 信息失败: {e}")
+                        continue
+            
+            # 按修改时间排序，最新的在前
+            images.sort(key=lambda x: x['time'], reverse=True)
+            
+            # 限制数量
+            return images[:limit]
+            
+        except Exception as e:
+            logging.error(f"获取目录 {directory} 中的图片失败: {e}")
+            return images
 
     async def button_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """处理按钮回调"""
@@ -2250,6 +2393,20 @@ class AttendanceSystem:
                         # 保存并发送当前的浏览器窗口截图
                         screenshot_path = f'logs/punch_{"in" if punch_type == "上班" else "out"}_result.png'
                         cv2.imwrite(screenshot_path, screen)
+                        
+                        # 同时保存到用户特定的screenshots目录
+                        if username:
+                            punch_dir = "punch_in" if punch_type == "上班" else "punch_out"
+                            user_screenshot_dir = os.path.join('screenshots', username, punch_dir)
+                            
+                            # 确保目录存在
+                            os.makedirs(user_screenshot_dir, exist_ok=True)
+                            
+                            # 生成带时间戳的文件名
+                            timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+                            user_screenshot_path = os.path.join(user_screenshot_dir, f'{punch_dir}_{timestamp}.png')
+                            cv2.imwrite(user_screenshot_path, screen)
+                            logging.info(f"已保存用户 {username} 的打卡截图到: {user_screenshot_path}")
                         
                         success_msg = f"{punch_type}打卡成功 - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
                         await self.send_notification("打卡流程", success_msg)
