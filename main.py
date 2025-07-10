@@ -14,8 +14,8 @@ import traceback
 import psutil
 import subprocess
 from chinese_calendar import is_workday, is_holiday
-from tasks import TaskManager
-from punch_records import PunchRecordManager
+from core.tasks import TaskManager
+from core.punch_records import PunchRecordManager
 import telegram
 import re
 import pytesseract
@@ -34,9 +34,9 @@ import win32con
 import win32api
 
 # 导入重构后的模块
-from email_service import email_service
-from browser_automation import browser_controller
-from image_recognition import image_recognizer
+from core.email_service import email_service
+from core.browser_automation import browser_controller
+from core.image_recognition import image_recognizer
 
 # 加载环境变量
 load_dotenv()
