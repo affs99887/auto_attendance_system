@@ -128,17 +128,64 @@ class TelegramBot:
         self.update_timeout = 600  # 10分钟无更新则重启轮询
         self.polling_task = None
         self.is_polling = False
-        # 添加连接池配置
-        self.connection_pool_size = 100  # 增加连接池大小
-        self.connection_timeout = 30
-        self.pool_timeout = 30
-        self.read_timeout = 30
-        self.write_timeout = 30
-        self.connect_timeout = 30
+        # 添加连接池配置 - 减少连接池大小和超时时间以提高稳定性
+        self.connection_pool_size = 20  # 减少连接池大小
+        self.connection_timeout = 20   # 减少连接超时
+        self.pool_timeout = 20
+        self.read_timeout = 20
+        self.write_timeout = 20
+        self.connect_timeout = 20
         # 添加设置定时打卡的状态变量
         self.setting_time_state = {}  # 用于存储用户的设置状态
         self.setting_time_timer = {}  # 用于存储设置超时计时器
+        # 添加初始化状态跟踪
+        self._is_initialized = False
+        self._initialization_lock = asyncio.Lock()
 
+    async def _ensure_app_initialized(self):
+        """确保Application已正确初始化"""
+        async with self._initialization_lock:
+            if not self._is_initialized or not self.app:
+                try:
+                    # 如果已有app实例，先清理
+                    if self.app:
+                        try:
+                            await self.app.stop()
+                            await self.app.shutdown()
+                        except Exception as e:
+                            logging.warning(f"清理旧应用实例时发生错误: {e}")
+                    
+                    # 创建新的Application实例
+                    self.app = Application.builder().token(self.token).pool_timeout(self.pool_timeout).connect_timeout(self.connect_timeout).read_timeout(self.read_timeout).write_timeout(self.write_timeout).connection_pool_size(self.connection_pool_size).get_updates_connection_pool_size(self.connection_pool_size).build()
+                    
+                    # 注册处理器
+                    self.app.add_handler(CommandHandler('start', self.start_command))
+                    self.app.add_handler(CommandHandler('punch_in', self.punch_in_command))
+                    self.app.add_handler(CommandHandler('punch_out', self.punch_out_command))
+                    self.app.add_handler(CommandHandler('status', self.status_command))
+                    self.app.add_handler(CommandHandler('errors', self.get_recent_errors))
+                    self.app.add_handler(CommandHandler('kill', self.kill_command))
+                    self.app.add_handler(CommandHandler('set_time', self.settime_command))
+                    self.app.add_handler(CallbackQueryHandler(self.button_callback))
+                    self.app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self.handle_message))
+                    
+                    # 添加更新时间记录处理器
+                    async def update_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+                        self.last_update_time = datetime.now()
+                        self.connection_error_count = 0  # 重置错误计数
+                    
+                    self.app.add_handler(MessageHandler(filters.ALL, update_handler))
+                    
+                    # 初始化应用
+                    await self.app.initialize()
+                    self._is_initialized = True
+                    logging.info("Telegram Bot Application 初始化完成")
+                    
+                except Exception as e:
+                    self._is_initialized = False
+                    self.app = None
+                    logging.error(f"初始化Telegram Bot Application失败: {e}")
+                    raise
 
     async def start_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """处理/start命令"""
@@ -434,21 +481,38 @@ class TelegramBot:
 
     async def send_message(self, title, content):
         """发送Telegram消息"""
-        if not self.app:
-            return False
-            
         for retry in range(self.max_retries):
             try:
+                # 确保应用已初始化
+                await self._ensure_app_initialized()
+                
+                if not self.app:
+                    error_msg = "Telegram Bot应用未初始化"
+                    logging.error(error_msg)
+                    return False
+                
                 message = f"{title}\n\n{content}"
                 await self.app.bot.send_message(chat_id=self.chat_id, text=message)
                 # 成功发送后重置错误计数
                 self.connection_error_count = 0
                 self.last_connection_error = None
                 return True
-            except telegram.error.NetworkError as e:
-                self.connection_error_count += 1
-                self.last_connection_error = datetime.now()
-                error_msg = f"发送Telegram消息时发生网络错误 (尝试 {retry + 1}/{self.max_retries}): {str(e)}"
+                
+            except Exception as e:
+                error_type = type(e).__name__
+                error_msg = str(e)
+                
+                # 检查是否是HTTPXRequest初始化错误
+                if "HTTPXRequest" in error_msg and "not initialized" in error_msg:
+                    self._is_initialized = False  # 标记需要重新初始化
+                    error_msg = f"发送Telegram消息时发生HTTPXRequest错误 (尝试 {retry + 1}/{self.max_retries}): {error_msg}"
+                elif "NetworkError" in error_type or "TimedOut" in error_type:
+                    self.connection_error_count += 1
+                    self.last_connection_error = datetime.now()
+                    error_msg = f"发送Telegram消息时发生网络错误 (尝试 {retry + 1}/{self.max_retries}): {error_msg}"
+                else:
+                    error_msg = f"发送Telegram消息时发生其他错误 (尝试 {retry + 1}/{self.max_retries}): {error_msg}"
+                
                 print(error_msg)
                 logging.error(error_msg)
                 
@@ -457,7 +521,7 @@ class TelegramBot:
                     await asyncio.sleep(self.retry_delay * (retry + 1))
                     continue
                     
-                # 如果错误次数过多，可能需要重启程序
+                # 最后一次重试失败，检查是否需要重启程序
                 if self.connection_error_count >= self.max_connection_errors:
                     error_msg = "网络错误次数过多，准备重启程序..."
                     print(error_msg)
@@ -465,14 +529,6 @@ class TelegramBot:
                     if self.attendance_system:
                         await self.attendance_system.restart_program()
                     return False
-            except Exception as e:
-                error_msg = f"发送Telegram消息时发生其他错误: {str(e)}"
-                print(error_msg)
-                logging.error(error_msg)
-                if retry < self.max_retries - 1:
-                    await asyncio.sleep(self.retry_delay * (retry + 1))
-                    continue
-                return False
                 
         return False
 
@@ -795,58 +851,24 @@ class TelegramBot:
         logging.info("正在重启 Telegram Bot 轮询...")
         await self.stop_polling()
         
-        # 完全关闭和清理旧的应用实例
+        # 标记需要重新初始化
+        self._is_initialized = False
+        self.app = None
+        
+        await asyncio.sleep(5)  # 等待5秒后重启
+        
         try:
+            # 使用_ensure_app_initialized来重新创建应用
+            await self._ensure_app_initialized()
+            
             if self.app:
-                # 停止和关闭应用
-                try:
-                    await self.app.stop()
-                except Exception as e:
-                    logging.warning(f"停止应用时发生错误，将继续执行: {str(e)}")
-                    
-                try:
-                    await self.app.shutdown()
-                except Exception as e:
-                    logging.warning(f"关闭应用时发生错误，将继续执行: {str(e)}")
+                await self.app.start()
+                await self.start_polling()
+            else:
+                logging.error("重启轮询失败：应用初始化失败")
                 
-                # 清理连接
-                await self.cleanup_connections()
-                
-                # 清空引用
-                self.app = None
-                
-            await asyncio.sleep(5)  # 等待5秒后重启
-            
-            # 重新创建应用实例
-            self.app = Application.builder().token(self.token).pool_timeout(self.pool_timeout).connect_timeout(self.connect_timeout).read_timeout(self.read_timeout).write_timeout(self.write_timeout).connection_pool_size(self.connection_pool_size).get_updates_connection_pool_size(self.connection_pool_size).build()
-            
-            # 重新注册处理器
-            self.app.add_handler(CommandHandler('start', self.start_command))
-            self.app.add_handler(CommandHandler('punch_in', self.punch_in_command))
-            self.app.add_handler(CommandHandler('punch_out', self.punch_out_command))
-            self.app.add_handler(CommandHandler('status', self.status_command))
-            self.app.add_handler(CommandHandler('errors', self.get_recent_errors))
-            self.app.add_handler(CommandHandler('kill', self.kill_command))
-            self.app.add_handler(CommandHandler('set_time', self.settime_command))
-            self.app.add_handler(CallbackQueryHandler(self.button_callback))
-            # 注册消息处理器，必须在其他处理器之后添加
-            self.app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self.handle_message))
-            
-            # 添加更新时间记录处理器
-            async def update_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-                self.last_update_time = datetime.now()
-                self.connection_error_count = 0  # 重置错误计数
-            
-            self.app.add_handler(MessageHandler(filters.ALL, update_handler))
-            
-            # 初始化并启动
-            await self.app.initialize()
-            await self.app.start()
-            await self.start_polling()
-            
         except Exception as e:
-            logging.error(f"重新创建应用实例时发生错误: {str(e)}")
-            # 不抛出异常，允许程序继续运行
+            logging.error(f"重启轮询失败: {str(e)}")
             
         self.last_update_time = datetime.now()
         logging.info("Telegram Bot 轮询重启完成")
@@ -869,49 +891,9 @@ class TelegramBot:
                             await self.restart_polling()
                         except Exception as e:
                             logging.error(f"重启轮询失败: {str(e)}")
-                            
-                            # 如果重启失败，尝试完全重新创建应用实例
-                            try:
-                                if self.app:
-                                    try:
-                                        await self.app.stop()
-                                        await self.app.shutdown()
-                                    except Exception as stop_e:
-                                        logging.warning(f"停止旧应用实例时发生错误: {str(stop_e)}")
-                                    
-                                    await self.cleanup_connections()
-                                    self.app = None
-                                
-                                await asyncio.sleep(5)  # 等待5秒
-                                
-                                # 尝试创建新的应用实例
-                                self.app = Application.builder().token(self.token).pool_timeout(self.pool_timeout).connect_timeout(self.connect_timeout).read_timeout(self.read_timeout).write_timeout(self.write_timeout).connection_pool_size(self.connection_pool_size).get_updates_connection_pool_size(self.connection_pool_size).build()
-                                
-                                # 重新注册处理器
-                                self.app.add_handler(CommandHandler('start', self.start_command))
-                                self.app.add_handler(CommandHandler('punch_in', self.punch_in_command))
-                                self.app.add_handler(CommandHandler('punch_out', self.punch_out_command))
-                                self.app.add_handler(CommandHandler('status', self.status_command))
-                                self.app.add_handler(CommandHandler('errors', self.get_recent_errors))
-                                self.app.add_handler(CommandHandler('kill', self.kill_command))
-                                self.app.add_handler(CommandHandler('set_time', self.settime_command))
-                                self.app.add_handler(CallbackQueryHandler(self.button_callback))
-                                # 注册消息处理器，必须在其他处理器之后添加
-                                self.app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self.handle_message))
-                                
-                                # 添加更新时间记录处理器
-                                async def update_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-                                    self.last_update_time = datetime.now()
-                                    self.connection_error_count = 0  # 重置错误计数
-                                
-                                self.app.add_handler(MessageHandler(filters.ALL, update_handler))
-                                
-                                # 初始化并启动
-                                await self.app.initialize()
-                                await self.app.start()
-                                await self.start_polling()
-                            except Exception as init_e:
-                                logging.error(f"初始化应用实例失败: {str(init_e)}")
+                            # 如果重启失败，标记需要重新初始化
+                            self._is_initialized = False
+                            self.app = None
                 
                 await asyncio.sleep(60)
             except Exception as e:
@@ -1359,33 +1341,88 @@ class AttendanceSystem:
         self.current_message += f"\n{new_line}"
         return self.current_message
 
+    async def _force_reinitialize_bot(self):
+        """强制重新初始化bot，解决HTTPXRequest错误"""
+        try:
+            logging.info("开始强制重新初始化Telegram Bot...")
+            
+            # 停止当前应用
+            if self.bot.app:
+                try:
+                    await self.bot.app.stop()
+                    await self.bot.app.shutdown()
+                except Exception as e:
+                    logging.warning(f"停止旧bot应用时发生错误: {e}")
+                
+                # 等待一段时间确保连接完全关闭
+                await asyncio.sleep(3)
+            
+            # 重置状态
+            self.bot.app = None
+            self.bot._is_initialized = False
+            
+            # 重新初始化
+            await self.bot._ensure_app_initialized()
+            
+            # 验证初始化是否成功
+            if self.bot.app and self.bot._is_initialized:
+                logging.info("Telegram Bot强制重新初始化成功")
+            else:
+                logging.error("Telegram Bot强制重新初始化失败")
+                
+        except Exception as e:
+            logging.error(f"强制重新初始化bot时发生错误: {e}")
+
     async def send_notification(self, title, content):
         """发送/更新Telegram消息"""
         message = self.update_progress(f"{title}: {content}")
         
-        # 确保bot和app已初始化
-        if not hasattr(self.bot, 'app') or self.bot.app is None:
-            logging.warning(f"无法发送通知，Telegram bot应用尚未初始化: {title} - {content}")
+        # 确保bot已初始化
+        if not self.bot:
+            logging.warning(f"无法发送通知，Telegram bot实例不存在: {title} - {content}")
             return
             
-        if self.message_id:
+        # 使用bot的send_message方法，它会自动处理初始化
+        try:
+            if self.message_id:
+                # 尝试更新现有消息
+                try:
+                    await self.bot._ensure_app_initialized()
+                    if self.bot.app:
+                        await self.bot.app.bot.edit_message_text(
+                            chat_id=self.bot.chat_id,
+                            message_id=self.message_id,
+                            text=message
+                        )
+                except Exception as e:
+                    logging.warning(f"更新消息失败: {str(e)}")
+                    # 如果更新失败，发送新消息
+                    success = await self.bot.send_message(title, content)
+                    if success:
+                        # 由于无法获取新消息ID，重置message_id
+                        self.message_id = None
+            else:
+                # 发送新消息
+                try:
+                    await self.bot._ensure_app_initialized()
+                    if self.bot.app:
+                        message_obj = await self.bot.app.bot.send_message(
+                            chat_id=self.bot.chat_id,
+                            text=message
+                        )
+                        if message_obj:
+                            self.message_id = message_obj.message_id
+                except Exception as e:
+                    logging.warning(f"发送新消息失败: {str(e)}")
+                    # 使用备用方法发送
+                    await self.bot.send_message(title, content)
+        except Exception as e:
+            logging.error(f"发送通知时发生错误: {str(e)}")
+            # 最后的备用方法
             try:
-                await self.bot.app.bot.edit_message_text(
-                    chat_id=self.bot.chat_id,
-                    message_id=self.message_id,
-                    text=message
-                )
-            except Exception as e:
-                print(f"更新消息失败: {str(e)}")
-        else:
-            try:
-                message = await self.bot.app.bot.send_message(
-                    chat_id=self.bot.chat_id,
-                    text=message
-                )
-                self.message_id = message.message_id
-            except Exception as e:
-                print(f"发送消息失败: {str(e)}")
+                await self.bot.send_message(title, content)
+            except Exception as backup_e:
+                logging.error(f"备用通知发送也失败: {str(backup_e)}")
 
     def get_browser_window(self):
         """获取浏览器窗口句柄"""
@@ -2162,7 +2199,15 @@ class AttendanceSystem:
                                     os.remove(email_screenshot_path)
                                     
                             except Exception as e:
-                                await self.send_notification("打卡流程", f"通知发送失败: {str(e)}")
+                                error_type = type(e).__name__
+                                error_msg_detail = str(e)
+                                
+                                # 检查是否是HTTPXRequest初始化错误
+                                if "HTTPXRequest" in error_msg_detail and "not initialized" in error_msg_detail:
+                                    self.bot._is_initialized = False  # 标记需要重新初始化
+                                    await self.send_notification("打卡流程", f"通知发送失败 (HTTPXRequest错误): {error_msg_detail}")
+                                else:
+                                    await self.send_notification("打卡流程", f"通知发送失败: {error_msg_detail}")
                             return (False, remaining_time_info)
                         else:
                             # 只有在没有unable_escape时才记录下班时间
@@ -2200,6 +2245,13 @@ class AttendanceSystem:
                         for retry in range(max_retries):
                             try:
                                 if os.path.exists(screenshot_path):
+                                    # 确保bot应用已初始化
+                                    await self.bot._ensure_app_initialized()
+                                    
+                                    if not self.bot.app:
+                                        await self.send_notification("打卡流程", "无法发送截图：Telegram Bot未正确初始化")
+                                        break
+                                    
                                     with open(screenshot_path, 'rb') as photo:
                                         await self.bot.app.bot.send_photo(
                                             chat_id=self.bot.chat_id,
@@ -2233,15 +2285,37 @@ class AttendanceSystem:
                                     break
                                 else:
                                     await self.send_notification("打卡流程", f"截图文件不存在: {screenshot_path}")
-                            except telegram.error.NetworkError as e:
-                                if retry < max_retries - 1:
-                                    await self.send_notification("打卡流程", f"发送截图时发生网络错误，{retry + 1}/{max_retries} 次重试: {str(e)}")
-                                    await asyncio.sleep(retry_delay * (retry + 1))
-                                else:
-                                    await self.send_notification("打卡流程", f"发送截图失败，网络错误: {str(e)}")
+                                    break
                             except Exception as e:
-                                await self.send_notification("打卡流程", f"发送截图失败: {str(e)}")
-                                break
+                                error_type = type(e).__name__
+                                error_msg = str(e)
+                                
+                                # 检查是否是HTTPXRequest初始化错误
+                                if "HTTPXRequest" in error_msg and "not initialized" in error_msg:
+                                    self.bot._is_initialized = False  # 标记需要重新初始化
+                                    error_msg = f"发送截图时发生HTTPXRequest错误，{retry + 1}/{max_retries} 次重试: {error_msg}"
+                                    
+                                    # 强制清理并重新初始化bot
+                                    if retry < max_retries - 1:
+                                        await self._force_reinitialize_bot()
+                                        
+                                elif "NetworkError" in error_type or "TimedOut" in error_type:
+                                    error_msg = f"发送截图时发生网络错误，{retry + 1}/{max_retries} 次重试: {error_msg}"
+                                else:
+                                    error_msg = f"发送截图时发生其他错误，{retry + 1}/{max_retries} 次重试: {error_msg}"
+                                
+                                if retry < max_retries - 1:
+                                    await self.send_notification("打卡流程", error_msg)
+                                    # 对于HTTPXRequest错误，使用渐进式延迟
+                                    if "HTTPXRequest" in error_msg:
+                                        # 渐进式延迟：第1次1秒，第2次5秒，第3次15秒
+                                        delay = [1, 5, 15][retry]
+                                    else:
+                                        delay = retry_delay * (retry + 1)
+                                    await asyncio.sleep(delay)
+                                else:
+                                    await self.send_notification("打卡流程", f"发送截图失败，网络错误: {error_msg}")
+                                    break
                 
                         # 关闭浏览器窗口
                         await self.send_notification("打卡流程", "正在关闭浏览器窗口...")
@@ -2927,10 +3001,13 @@ async def main():
         # 显示看门狗状态
         print("\n🛡️ 看门狗模式已启用 - 系统将自动监控进程状态和资源使用情况")
         
-        # 初始化 Telegram 机器人
-        app = Application.builder().token(attendance_system.bot.token).build()
-        attendance_system.bot.app = app
+        # 初始化 Telegram 机器人 - 使用新的初始化机制
         attendance_system.bot.attendance_system = attendance_system
+        await attendance_system.bot._ensure_app_initialized()
+        
+        if not attendance_system.bot.app:
+            logging.error("Telegram Bot 初始化失败")
+            return
         
         # 在Telegram机器人初始化之后检查邮箱连接
         await attendance_system.check_email_connection()
@@ -2938,25 +3015,6 @@ async def main():
         # 启动看门狗监控（如果启用）
         attendance_system.start_watchdog()
         
-        # 注册命令处理器
-        app.add_handler(CommandHandler('start', attendance_system.bot.start_command))
-        app.add_handler(CommandHandler('punch_in', attendance_system.bot.punch_in_command))
-        app.add_handler(CommandHandler('punch_out', attendance_system.bot.punch_out_command))
-        app.add_handler(CommandHandler('status', attendance_system.bot.status_command))
-        app.add_handler(CommandHandler('errors', attendance_system.bot.get_recent_errors))
-        app.add_handler(CommandHandler('kill', attendance_system.bot.kill_command))
-        app.add_handler(CommandHandler('set_time', attendance_system.bot.settime_command))
-        # 注册按钮回调处理器
-        app.add_handler(CallbackQueryHandler(attendance_system.bot.button_callback))
-        # 注册消息处理器，必须在其他处理器之后添加
-        app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, attendance_system.bot.handle_message))
-        
-        # 添加更新时间记录处理器
-        async def update_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-            attendance_system.bot.last_update_time = datetime.now()
-            
-        app.add_handler(MessageHandler(filters.ALL, update_handler))
-
         # 设置全局的attendance_system变量，供run_schedule函数使用
         global attendance_system_global
         attendance_system_global = attendance_system
@@ -2966,8 +3024,7 @@ async def main():
         
         try:
             # 启动机器人
-            await app.initialize()
-            await app.start()
+            await attendance_system.bot.app.start()
             
             # 启动轮询
             await attendance_system.bot.start_polling()
@@ -2985,17 +3042,13 @@ async def main():
             # 清理资源
             schedule_task.cancel()
             await attendance_system.bot.stop_polling()
-            await app.stop()
-            await app.shutdown()
+            if attendance_system.bot.app:
+                await attendance_system.bot.app.stop()
+                await attendance_system.bot.app.shutdown()
     except Exception as e:
         logging.critical(f"程序启动失败: {str(e)}")
         if attendance_system:
             await attendance_system.handle_error(e, "程序启动")
-    finally:
-        # 清理资源
-        if attendance_system:
-            attendance_system.cleanup()
-            logging.info("程序已停止，资源已清理")
 
 if __name__ == "__main__":
     try:
