@@ -1249,6 +1249,13 @@ class AttendanceSystem:
         self.late_threshold = int(os.getenv('LATE_THRESHOLD', "15"))   # 晚到阈值（分钟）
         self.early_leave_threshold = int(os.getenv('EARLY_LEAVE_THRESHOLD', "15"))  # 早退阈值（分钟）
         
+        # 添加打卡提醒状态跟踪（用于防止重复提醒）
+        self.notification_sent_today = {
+            'punch_in_reminder': False,
+            'punch_out_reminder': False,
+            'last_check_date': None
+        }
+        
         # 初始化任务管理器和打卡记录管理器
         self.task_manager = TaskManager()
         self.punch_record_manager = PunchRecordManager()
@@ -2229,6 +2236,14 @@ class AttendanceSystem:
                         # 识别并更新打卡记录
                         await self.get_punch_records_from_page()
                         
+                        # 重置相应的提醒状态（如果用户补打卡了）
+                        if punch_type == "上班":
+                            self.notification_sent_today['punch_in_reminder'] = False
+                            logging.info("上班打卡成功，重置上班打卡提醒状态")
+                        else:
+                            self.notification_sent_today['punch_out_reminder'] = False
+                            logging.info("下班打卡成功，重置下班打卡提醒状态")
+                        
                         # 打卡完成后发送状态信息
                         await self.send_daily_status()
                         
@@ -2696,7 +2711,16 @@ class AttendanceSystem:
             
             # 如果不是工作日，不进行检查
             if not is_workday(current_date):
-                    return
+                return
+            
+            # 检查是否是新的一天，如果是则重置提醒状态
+            if self.notification_sent_today['last_check_date'] != current_date:
+                self.notification_sent_today = {
+                    'punch_in_reminder': False,
+                    'punch_out_reminder': False,
+                    'last_check_date': current_date
+                }
+                logging.info(f"新的一天开始，重置打卡提醒状态: {current_date}")
                 
             # 重置昨天的打卡记录
             if self.today_punch_records['punch_in_time'] and \
@@ -2705,23 +2729,32 @@ class AttendanceSystem:
                     'punch_in_time': None,
                     'punch_out_time': None
                 }
+                logging.info(f"重置昨天的打卡记录")
             
-            # 检查上班打卡
-            if not self.today_punch_records['punch_in_time'] and \
-               current_time.time() > datetime.strptime(self.work_start_time, "%H:%M").time():
+            # 检查上班打卡（只在未发送过提醒时发送）
+            if (not self.today_punch_records['punch_in_time'] and 
+                not self.notification_sent_today['punch_in_reminder'] and
+                current_time.time() > datetime.strptime(self.work_start_time, "%H:%M").time()):
+                
                 await self.send_notification(
                     "打卡提醒",
                     "⚠️ 今日未检测到上班打卡记录，请及时补卡！"
                 )
+                self.notification_sent_today['punch_in_reminder'] = True
+                logging.info(f"已发送上班打卡提醒，标记为已发送")
             
-            # 检查下班打卡
-            if self.today_punch_records['punch_in_time'] and \
-               not self.today_punch_records['punch_out_time'] and \
-               current_time.time() > datetime.strptime("18:00", "%H:%M").time():
+            # 检查下班打卡（只在未发送过提醒时发送）
+            if (self.today_punch_records['punch_in_time'] and 
+                not self.today_punch_records['punch_out_time'] and
+                not self.notification_sent_today['punch_out_reminder'] and
+                current_time.time() > datetime.strptime("18:00", "%H:%M").time()):
+                
                 await self.send_notification(
                     "打卡提醒",
                     "⚠️ 今日未检测到下班打卡记录，请及时补卡！"
                 )
+                self.notification_sent_today['punch_out_reminder'] = True
+                logging.info(f"已发送下班打卡提醒，标记为已发送")
                 
         except Exception as e:
             logging.error(f"检查打卡状态时发生错误: {str(e)}")
@@ -2971,8 +3004,9 @@ async def run_schedule():
             
             # 执行心跳检测
             if attendance_system_global:
-                # 每小时检查一次打卡状态
-                if datetime.now().minute == 0:
+                # 每2小时检查一次打卡状态，避免过于频繁的检查
+                current_hour = datetime.now().hour
+                if datetime.now().minute == 0 and current_hour % 2 == 0:
                     await attendance_system_global.check_punch_status()
                 
             await asyncio.sleep(1)
