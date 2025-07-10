@@ -199,7 +199,7 @@ class TelegramBot:
             "/errors - 查看最近错误日志\n"
             "/kill - 查看并管理定时任务\n"
             "/kill <任务ID> - 直接删除指定任务\n"
-            "/check - 查看最新打卡图片\n"
+            "/check - 查看最新打卡图片（交互式选择）\n"
             "/check <用户名> - 查看指定用户的打卡图片\n\n"
             "🛡️ 看门狗功能已内置启用"
         )
@@ -658,15 +658,20 @@ class TelegramBot:
                 
             all_users = [user['username'] for user in self.attendance_system.users]
             
-            # 如果没有参数，显示可用用户列表
+            # 如果没有参数，显示交互式按钮界面
             if not args:
-                user_list = '\n'.join([f"• {user}" for user in all_users])
+                keyboard = [
+                    [
+                        InlineKeyboardButton("📅 查看上班图片", callback_data='check_punch_in'),
+                        InlineKeyboardButton("🌅 查看下班图片", callback_data='check_punch_out')
+                    ]
+                ]
+                reply_markup = InlineKeyboardMarkup(keyboard)
                 await update.message.reply_text(
-                    f"📋 可用用户列表：\n{user_list}\n\n"
-                    f"使用方法：\n"
-                    f"/check 用户名 - 查看该用户的最新打卡图片\n"
-                    f"/check 用户名 punch_in - 只查看上班打卡图片\n"
-                    f"/check 用户名 punch_out - 只查看下班打卡图片"
+                    f"📸 请选择要查看的打卡类型：\n\n"
+                    f"💡 可用用户: {', '.join(all_users)}\n"
+                    f"将显示所有用户的相关打卡图片",
+                    reply_markup=reply_markup
                 )
                 return
             
@@ -780,6 +785,74 @@ class TelegramBot:
         except Exception as e:
             logging.error(f"获取目录 {directory} 中的图片失败: {e}")
             return images
+
+    async def _handle_check_callback(self, query, punch_type):
+        """处理查看打卡图片的回调"""
+        try:
+            # 更新消息状态
+            type_name = "上班" if punch_type == "punch_in" else "下班"
+            await query.message.edit_text(f"🔍 正在搜索所有用户的{type_name}打卡图片...")
+            
+            # 获取所有用户列表
+            if not self.attendance_system or not self.attendance_system.users:
+                await query.message.edit_text("❌ 系统未初始化或无用户配置")
+                return
+                
+            all_users = [user['username'] for user in self.attendance_system.users]
+            all_images = []
+            
+            # 遍历所有用户收集图片
+            for username in all_users:
+                user_screenshot_dir = os.path.join('screenshots', username, punch_type)
+                if os.path.exists(user_screenshot_dir):
+                    user_images = self._get_recent_images(user_screenshot_dir, punch_type, 3)  # 每个用户最多3张
+                    # 为每张图片添加用户信息
+                    for img in user_images:
+                        img['username'] = username
+                    all_images.extend(user_images)
+            
+            if not all_images:
+                await query.message.edit_text(f"❌ 没有找到任何用户的{type_name}打卡图片")
+                return
+            
+            # 按时间排序，最新的在前
+            all_images.sort(key=lambda x: x['time'], reverse=True)
+            
+            # 限制最多显示10张图片
+            if len(all_images) > 10:
+                all_images = all_images[:10]
+            
+            # 更新消息显示找到的图片数量
+            await query.message.edit_text(f"📸 找到 {len(all_images)} 张{type_name}打卡图片，正在发送...")
+            
+            # 发送图片
+            for i, image_info in enumerate(all_images):
+                try:
+                    with open(image_info['path'], 'rb') as photo:
+                        caption = f"👤 用户: {image_info['username']}\n📅 时间: {image_info['time_str']}\n🔄 类型: {image_info['type']}"
+                        await self.app.bot.send_photo(
+                            chat_id=query.message.chat_id,
+                            photo=photo,
+                            caption=caption
+                        )
+                    
+                    # 避免发送过快被限制
+                    if i < len(all_images) - 1:
+                        await asyncio.sleep(0.5)
+                        
+                except Exception as e:
+                    logging.error(f"发送图片 {image_info['path']} 失败: {e}")
+                    await self.app.bot.send_message(
+                        chat_id=query.message.chat_id,
+                        text=f"❌ 发送图片失败: {os.path.basename(image_info['path'])}"
+                    )
+            
+            # 最终状态更新
+            await query.message.edit_text(f"✅ 已发送 {len(all_images)} 张{type_name}打卡图片")
+            
+        except Exception as e:
+            logging.error(f"处理查看{punch_type}图片回调时发生错误: {e}")
+            await query.message.edit_text(f"❌ 处理请求时发生错误: {str(e)}")
 
     async def button_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """处理按钮回调"""
@@ -906,6 +979,13 @@ class TelegramBot:
                 else:
                     await query.message.edit_text("请输入小时数（0-23）：")
 
+            # 处理查看打卡图片的回调
+            elif query.data == 'check_punch_in':
+                await self._handle_check_callback(query, 'punch_in')
+                
+            elif query.data == 'check_punch_out':
+                await self._handle_check_callback(query, 'punch_out')
+                
             # 处理错误日志翻页
             elif query.data.startswith('errors_page_'):
                 page = int(query.data.split('_')[-1])
