@@ -12,6 +12,7 @@ job_log_interval = 60  # 至少间隔60秒输出一次任务日志
 
 async def run_schedule():
     global attendance_system_global, last_job_check, last_job_count
+    startup_delay = True  # 启动时延迟输出详细日志
 
     while True:
         try:
@@ -19,8 +20,15 @@ async def run_schedule():
             jobs = schedule.get_jobs()
             current_time = datetime.now()
 
+            # 启动后延迟60秒再开始输出详细日志
+            if startup_delay:
+                if last_job_check is None:
+                    last_job_check = current_time
+                elif (current_time - last_job_check).total_seconds() > 60:
+                    startup_delay = False
+
             # 只在任务数量变化或者每隔一段时间输出一次日志
-            if (jobs and (last_job_check is None or
+            if (not startup_delay and jobs and (last_job_check is None or
                          (current_time - last_job_check).total_seconds() > job_log_interval or
                          len(jobs) != last_job_count)):
                 logging.info(f"当前定时任务数量: {len(jobs)}")

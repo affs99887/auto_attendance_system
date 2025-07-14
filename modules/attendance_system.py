@@ -45,6 +45,9 @@ class AttendanceSystem:
     """自动打卡系统主类"""
 
     def __init__(self):
+        # 静默初始化模式，避免启动时输出过多信息
+        self._silent_init = True
+        
         # 设置pytesseract路径
         pytesseract.pytesseract.tesseract_cmd = os.getenv('TESSERACT_PATH', r'C:\Program Files\Tesseract-OCR\tesseract.exe')
 
@@ -132,28 +135,134 @@ class AttendanceSystem:
 
         # 确保logs目录存在，用于保存截图
         os.makedirs('logs', exist_ok=True)
+        
+        # 初始化完成，取消静默模式
+        self._silent_init = False
 
     def get_surname_honorific(self, username):
-        """从用户名中提取姓氏并添加先生/女士称谓
+        """根据用户名获取姓氏和合适的敬语称谓"""
+        if not username:
+            return "用户"
+        
+        # 提取姓氏（通常是第一个字符）
+        surname = username[0] if len(username) > 0 else "用户"
+        
+        # 根据性别和姓氏添加敬语
+        # 这里可以根据实际需要调整敬语规则
+        common_male_surnames = ['王', '李', '张', '刘', '陈', '杨', '赵', '黄', '周', '吴']
+        common_female_surnames = ['王', '李', '张', '刘', '陈', '杨', '赵', '黄', '周', '吴']
+        
+        # 简单处理，都使用通用敬语
+        return f"{surname}先生/女士"
 
-        根据中文姓名习惯，通常第一个字为姓氏。如果无法确定，则返回默认称谓。
+    def save_user_screenshot(self, screen, username, punch_type, success=True):
+        """
+        统一的用户截图保存方法，确保每个用户每种类型最多保留3张图片
+        
+        Args:
+            screen: cv2截图数据
+            username: 用户名
+            punch_type: 打卡类型 "上班" 或 "下班"
+            success: 是否成功打卡，用于文件名标识
+        
+        Returns:
+            str: 保存的文件路径，如果失败返回None
         """
         try:
-            if not username or not isinstance(username, str):
-                return "用户"
-
-            # 对于中文用户名，取第一个字作为姓氏
-            if any('\u4e00' <= char <= '\u9fff' for char in username):
-                surname = username[0] if username else "用户"
-                # 这里可以根据用户名判断性别，但这不准确，所以默认使用"先生/女士"
-                return f"{surname}先生/女士"
+            if not username or screen is None:
+                logging.warning(f"用户名为空或截图数据为空，跳过保存 (username: {username}, screen: {screen is not None})")
+                return None
+            
+            # 转换打卡类型为目录名
+            punch_dir = "punch_in" if punch_type == "上班" else "punch_out"
+            
+            # 处理用户名，支持中文字符但移除文件系统不安全的字符
+            # 移除可能导致文件系统问题的字符，但保留中文字符
+            unsafe_chars = ['/', '\\', ':', '*', '?', '"', '<', '>', '|']
+            safe_username = username
+            for char in unsafe_chars:
+                safe_username = safe_username.replace(char, '_')
+            safe_username = safe_username.strip()
+            if not safe_username:
+                safe_username = "unknown_user"
+            
+            # 创建用户截图目录
+            user_screenshot_dir = os.path.join('screenshots', safe_username, punch_dir)
+            os.makedirs(user_screenshot_dir, exist_ok=True)
+            
+            # 生成带时间戳和状态标识的文件名
+            timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+            status_suffix = "success" if success else "fail"
+            filename = f'{punch_dir}_{timestamp}_{status_suffix}.png'
+            filepath = os.path.join(user_screenshot_dir, filename)
+            
+            # 保存新截图，使用支持中文路径的方法
+            abs_filepath = os.path.abspath(filepath)
+            logging.debug(f"尝试保存用户截图到: {abs_filepath}")
+            
+            # 使用cv2.imencode + 文件写入的方式来支持中文路径
+            try:
+                # 编码图片为PNG格式
+                success, encoded_img = cv2.imencode('.png', screen)
+                if success:
+                    # 写入文件
+                    with open(abs_filepath, 'wb') as f:
+                        f.write(encoded_img.tobytes())
+                    save_result = True
+                else:
+                    save_result = False
+                    logging.error(f"图片编码失败")
+            except Exception as encode_error:
+                logging.error(f"使用编码方式保存失败: {encode_error}")
+                # 如果编码方式失败，尝试原来的方法
+                save_result = cv2.imwrite(abs_filepath, screen)
+            
+            if save_result:
+                logging.info(f"已保存用户 {username} 的{punch_type}打卡截图到: {abs_filepath}")
+                
+                # 验证文件是否存在
+                if os.path.exists(abs_filepath):
+                    file_size = os.path.getsize(abs_filepath)
+                    logging.info(f"截图文件大小: {file_size} bytes")
+                else:
+                    logging.error(f"截图文件保存后不存在: {abs_filepath}")
+                    return None
             else:
-                # 对于非中文用户名，返回完整用户名
-                return username
-
+                logging.error(f"保存用户截图失败: {abs_filepath}")
+                logging.error(f"原始用户名: {username}")
+                logging.error(f"安全用户名: {safe_username}")
+                logging.error(f"文件路径: {abs_filepath}")
+                if screen is not None:
+                    logging.error(f"截图数据形状: {screen.shape}")
+                    logging.error(f"截图数据类型: {screen.dtype}")
+                return None
+            
+            # 清理旧截图，只保留最新3张
+            try:
+                import glob
+                pattern = os.path.join(user_screenshot_dir, '*.png')
+                files = glob.glob(pattern)
+                
+                # 按修改时间排序，最新的在前
+                files.sort(key=os.path.getmtime, reverse=True)
+                
+                # 如果超过3张，删除最旧的图片
+                if len(files) > 3:
+                    files_to_remove = files[3:]  # 保留前3张，删除其余的
+                    for old_file in files_to_remove:
+                        try:
+                            os.remove(old_file)
+                            logging.info(f"已删除旧截图文件: {old_file}")
+                        except Exception as e:
+                            logging.error(f"删除旧截图文件 {old_file} 失败: {e}")
+            except Exception as e:
+                logging.warning(f"清理旧截图文件时发生错误: {e}")
+            
+            return abs_filepath
+            
         except Exception as e:
-            logging.error(f"获取用户姓氏称谓时出错: {str(e)}")
-            return "用户"  # 发生错误时返回默认称谓
+            logging.error(f"保存用户截图失败 (用户: {username}, 类型: {punch_type}): {e}")
+            return None
 
     def setup_logging(self):
         """配置日志记录"""
@@ -904,17 +1013,8 @@ class AttendanceSystem:
                         screenshot_path = 'punch_error.png'
                         cv2.imwrite(screenshot_path, screen)
 
-                        # 使用滚动保存机制保存到用户目录
-                        punch_dir = "punch_in" if punch_type == "上班" else "punch_out"
                         # 保存失败截图到用户目录
-                        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-                        user_screenshot_path = f'screenshots/{username}/{punch_dir}/{punch_dir}_{timestamp}_fail.png'
-                        os.makedirs(os.path.dirname(user_screenshot_path), exist_ok=True)
-                        save_result = cv2.imwrite(user_screenshot_path, screen)
-                        if save_result:
-                            logging.info(f'已保存用户 {username} 的{punch_dir}失败截图到: {user_screenshot_path}')
-                        else:
-                            logging.error(f'保存用户 {username} 的{punch_dir}失败截图失败: {user_screenshot_path}')
+                        self.save_user_screenshot(screen, username, punch_type, success=False)
                         try:
                             with open(screenshot_path, 'rb') as photo:
                                 await self.bot.app.bot.send_photo(
@@ -945,17 +1045,8 @@ class AttendanceSystem:
                         screenshot_path = 'punch_error.png'
                         cv2.imwrite(screenshot_path, screen)
 
-                        # 使用滚动保存机制保存到用户目录
-                        punch_dir = "punch_in" if punch_type == "上班" else "punch_out"
                         # 保存失败截图到用户目录
-                        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-                        user_screenshot_path = f'screenshots/{username}/{punch_dir}/{punch_dir}_{timestamp}_fail.png'
-                        os.makedirs(os.path.dirname(user_screenshot_path), exist_ok=True)
-                        save_result = cv2.imwrite(user_screenshot_path, screen)
-                        if save_result:
-                            logging.info(f'已保存用户 {username} 的{punch_dir}失败截图到: {user_screenshot_path}')
-                        else:
-                            logging.error(f'保存用户 {username} 的{punch_dir}失败截图失败: {user_screenshot_path}')
+                        self.save_user_screenshot(screen, username, punch_type, success=False)
                         try:
                             with open(screenshot_path, 'rb') as photo:
                                 await self.bot.app.bot.send_photo(
@@ -1051,17 +1142,8 @@ class AttendanceSystem:
                             screenshot_path = 'punch_out_unable.png'
                             cv2.imwrite(screenshot_path, screen)
 
-                            # 同时使用滚动保存机制保存到用户目录
-                            if username:
-                                # 保存失败截图到用户目录
-                                timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-                                user_screenshot_path = f'screenshots/{username}/punch_out/punch_out_{timestamp}_fail.png'
-                                os.makedirs(os.path.dirname(user_screenshot_path), exist_ok=True)
-                                save_result = cv2.imwrite(user_screenshot_path, screen)
-                                if save_result:
-                                    logging.info(f'已保存用户 {username} 的punch_out失败截图到: {user_screenshot_path}')
-                                else:
-                                    logging.error(f'保存用户 {username} 的punch_out失败截图失败: {user_screenshot_path}')
+                            # 保存失败截图到用户目录
+                            self.save_user_screenshot(screen, username, punch_type, success=False)
 
                             try:
                                 # 发送Telegram消息
@@ -1146,29 +1228,8 @@ class AttendanceSystem:
                             screenshot_path = f'logs/punch_{"in" if punch_type == "上班" else "out"}_result.png'
                             cv2.imwrite(screenshot_path, screenshot_data)
                             
-                            # 同时保存到screenshots目录
-                            if username:
-                                punch_dir = "punch_in" if punch_type == "上班" else "punch_out"
-                                timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-                                user_screenshot_path = f'screenshots/{username}/{punch_dir}/{punch_dir}_{timestamp}_success.png'
-                                os.makedirs(os.path.dirname(user_screenshot_path), exist_ok=True)
-                                save_result = cv2.imwrite(user_screenshot_path, screenshot_data)
-                                if save_result:
-                                    logging.info(f"已保存用户 {username} 的{punch_dir}打卡截图到: {user_screenshot_path}")
-                                else:
-                                    logging.error(f"保存用户 {username} 的{punch_dir}打卡截图失败: {user_screenshot_path}")
-                                
-                                # 保持滚动清理功能：保留最新3张图片
-                                try:
-                                    import glob
-                                    pattern = f'screenshots/{username}/{punch_dir}/*.png'
-                                    files = glob.glob(pattern)
-                                    files.sort(key=os.path.getmtime, reverse=True)
-                                    for old_file in files[3:]:  # 保留前3张，删除其余
-                                        os.remove(old_file)
-                                        logging.info(f"已删除旧截图文件: {old_file}")
-                                except Exception as e:
-                                    logging.warning(f"清理旧截图文件时发生错误: {e}")
+                            # 保存成功截图到用户目录
+                            self.save_user_screenshot(screenshot_data, username, punch_type, success=True)
                         else:
                             logging.error("截图数据为空，无法保存截图")
 
@@ -1270,15 +1331,7 @@ class AttendanceSystem:
                             cv2.imwrite(screenshot_path, screen)
 
                             # 保存失败截图到用户目录
-                            punch_dir = "punch_in" if punch_type == "上班" else "punch_out"
-                            timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-                            user_screenshot_path = f'screenshots/{username}/{punch_dir}/{punch_dir}_{timestamp}_fail.png'
-                            os.makedirs(os.path.dirname(user_screenshot_path), exist_ok=True)
-                            save_result = cv2.imwrite(user_screenshot_path, screen)
-                            if save_result:
-                                logging.info(f'已保存用户 {username} 的{punch_dir}失败截图到: {user_screenshot_path}')
-                            else:
-                                logging.error(f'保存用户 {username} 的{punch_dir}失败截图失败: {user_screenshot_path}')
+                            self.save_user_screenshot(screen, username, punch_type, success=False)
 
                             try:
                                 with open(screenshot_path, 'rb') as photo:
@@ -1307,17 +1360,8 @@ class AttendanceSystem:
                     screenshot_path = 'punch_error.png'
                     cv2.imwrite(screenshot_path, screen)
 
-                    # 使用滚动保存机制保存到用户目录
-                    punch_dir = "punch_in" if punch_type == "上班" else "punch_out"
                     # 保存失败截图到用户目录
-                    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-                    user_screenshot_path = f'screenshots/{username}/{punch_dir}/{punch_dir}_{timestamp}_fail.png'
-                    os.makedirs(os.path.dirname(user_screenshot_path), exist_ok=True)
-                    save_result = cv2.imwrite(user_screenshot_path, screen)
-                    if save_result:
-                        logging.info(f'已保存用户 {username} 的{punch_dir}失败截图到: {user_screenshot_path}')
-                    else:
-                        logging.error(f'保存用户 {username} 的{punch_dir}失败截图失败: {user_screenshot_path}')
+                    self.save_user_screenshot(screen, username, punch_type, success=False)
                     try:
                         # 发送Telegram截图
                         with open(screenshot_path, 'rb') as photo:
@@ -1365,17 +1409,8 @@ class AttendanceSystem:
                 screenshot_path = 'punch_error.png'
                 cv2.imwrite(screenshot_path, screen)
 
-                # 使用滚动保存机制保存到用户目录
-                punch_dir = "punch_in" if punch_type == "上班" else "punch_out"
                 # 保存失败截图到用户目录
-                timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-                user_screenshot_path = f'screenshots/{username}/{punch_dir}/{punch_dir}_{timestamp}_fail.png'
-                os.makedirs(os.path.dirname(user_screenshot_path), exist_ok=True)
-                save_result = cv2.imwrite(user_screenshot_path, screen)
-                if save_result:
-                    logging.info(f'已保存用户 {username} 的{punch_dir}失败截图到: {user_screenshot_path}')
-                else:
-                    logging.error(f'保存用户 {username} 的{punch_dir}失败截图失败: {user_screenshot_path}')
+                self.save_user_screenshot(screen, username, punch_type, success=False)
                 try:
                     # 发送Telegram消息
                     with open(screenshot_path, 'rb') as photo:
@@ -1879,26 +1914,31 @@ class AttendanceSystem:
     async def check_email_connection(self):
         """检查与邮件服务器的连接"""
         try:
-            status_msg = "正在检查邮件服务器连接..."
-            logging.info(status_msg)
-            print(status_msg)
+            # 在静默初始化期间不输出控制台信息
+            if not getattr(self, '_silent_init', False):
+                status_msg = "正在检查邮件服务器连接..."
+                logging.info(status_msg)
+                print(status_msg)
 
             # 使用EmailService检查连接
             if self.email_service.check_email_connection():
                 success_msg = "邮件服务器连接测试成功"
                 logging.info(success_msg)
-                print(success_msg)
+                if not getattr(self, '_silent_init', False):
+                    print(success_msg)
                 return True
             else:
                 error_msg = "邮件服务器连接失败"
                 logging.error(error_msg)
-                print(error_msg)
-                await self.send_notification("邮箱连接", f"❌ {error_msg}")
+                if not getattr(self, '_silent_init', False):
+                    print(error_msg)
+                    await self.send_notification("邮箱连接", f"❌ {error_msg}")
                 return False
 
         except Exception as e:
             error_msg = f"邮件服务器连接异常: {str(e)}"
             logging.error(error_msg)
-            print(error_msg)
-            await self.send_notification("邮箱连接", f"❌ {error_msg}")
+            if not getattr(self, '_silent_init', False):
+                print(error_msg)
+                await self.send_notification("邮箱连接", f"❌ {error_msg}")
             return False
