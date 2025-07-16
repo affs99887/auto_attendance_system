@@ -10,6 +10,13 @@ import sys
 import time
 from datetime import datetime
 
+# 导入colorama支持Windows ANSI颜色
+import colorama
+from colorama import init
+
+# 初始化colorama以支持Windows上的ANSI转义序列
+init()
+
 # 导入重构后的模块
 from modules.config import config
 from modules.attendance_system import AttendanceSystem
