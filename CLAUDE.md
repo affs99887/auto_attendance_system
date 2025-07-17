@@ -141,6 +141,12 @@ The system supports multiple users with separate:
 - Environment variables support multiple user credentials (LOGIN_USERNAME2, etc.)
 - Settings and configurations isolated per user
 
+## Important Coding Guidelines
+- 当我提和重构相关的需求的时候，需要严格基于原本的代码以及功能进行重构，避免节外生枝
+
+## Memory Notes
+- 始终使用中文回复
+
 # important-instruction-reminders
 Do what has been asked; nothing more, nothing less.
 NEVER create files unless they're absolutely necessary for achieving your goal.

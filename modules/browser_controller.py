@@ -1,3 +1,9 @@
+"""
+浏览器自动化控制模块
+
+负责浏览器窗口控制、鼠标点击、键盘输入等自动化操作
+"""
+
 import cv2
 import numpy as np
 import pyautogui

@@ -1,8 +1,17 @@
+"""
+任务管理模块
+
+负责定时任务的创建、存储、调度和管理
+"""
+
 import json
 import os
 from datetime import datetime
 
+
 class TaskManager:
+    """任务管理类"""
+    
     def __init__(self):
         self.tasks_file = 'scheduled_tasks.json'
         self.tasks = self.load_tasks()
@@ -79,4 +88,8 @@ class TaskManager:
     def clear_tasks(self):
         """清除所有定时任务"""
         self.tasks = []
-        self.save_tasks() 
+        self.save_tasks()
+
+
+# 全局任务管理器实例
+task_manager = TaskManager()

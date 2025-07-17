@@ -1,10 +1,20 @@
+"""
+打卡记录管理模块
+
+负责打卡记录的存储、读取和管理
+"""
+
 import json
 import os
 from datetime import datetime
+from modules.config import config
+
 
 class PunchRecordManager:
+    """打卡记录管理类"""
+    
     def __init__(self):
-        self.records_dir = 'punch_records'
+        self.records_dir = config.PUNCH_RECORDS_DIR
         self.ensure_records_dir()
         self.current_month_file = self._get_current_month_file()
         self.records = self.load_records()
@@ -74,4 +84,8 @@ class PunchRecordManager:
             except Exception as e:
                 print(f"加载历史记录失败: {str(e)}")
                 return {}
-        return {} 
+        return {}
+
+
+# 全局打卡记录管理器实例
+punch_record_manager = PunchRecordManager()

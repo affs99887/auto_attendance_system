@@ -1,3 +1,9 @@
+"""
+邮件服务模块
+
+负责所有邮件发送相关功能，包括打卡通知、错误报告等
+"""
+
 import smtplib
 import ssl
 import os
@@ -10,29 +16,23 @@ from email.mime.application import MIMEApplication
 from datetime import datetime
 from typing import List, Optional
 import logging
-from dotenv import load_dotenv
-
-# 加载环境变量
-load_dotenv()
+from modules.config import config
 
 
 class EmailService:
     """邮件服务类，负责处理所有邮件发送相关功能"""
     
     def __init__(self):
-        self.email_sender = os.getenv('EMAIL_SENDER', '')
-        self.email_password = os.getenv('EMAIL_PASSWORD', '')
-        self.email_smtp_server = os.getenv('EMAIL_SMTP_SERVER', 'smtp.qq.com')
-        self.email_smtp_port = int(os.getenv('EMAIL_SMTP_PORT', '465'))
+        self.email_sender = config.EMAIL_SENDER
+        self.email_password = config.EMAIL_PASSWORD
+        self.email_smtp_server = config.EMAIL_SMTP_SERVER
+        self.email_smtp_port = config.EMAIL_SMTP_PORT
         
         # 默认收件人列表
-        self.email_recipients = [
-            'laidexin12138@icloud.com',
-            # 'dududulalala@icloud.com'
-        ]
+        self.email_recipients = config.EMAIL_RECIPIENTS
         
         # 重试配置
-        self.max_retries = 3
+        self.max_retries = config.MAX_RETRIES
         self.retry_delay = 2  # 重试间隔（秒）
         
         self.logger = logging.getLogger(__name__)
@@ -176,7 +176,8 @@ class EmailService:
     def send_email_with_retry(self, subject: str, body: str, 
                              recipients: Optional[List[str]] = None,
                              image_path: Optional[str] = None, 
-                             is_html: bool = False) -> bool:
+                             is_html: bool = False,
+                             send_to_all: bool = False) -> bool:
         """带重试机制的邮件发送
         
         Args:
@@ -185,12 +186,17 @@ class EmailService:
             recipients: 收件人列表（可选，默认使用配置的收件人）
             image_path: 图片附件路径（可选）
             is_html: 是否为HTML格式邮件
+            send_to_all: 是否发送给所有收件人，默认False只发送给第一个收件人
             
         Returns:
             bool: 发送成功返回True，失败返回False
         """
         if recipients is None:
             recipients = self.email_recipients
+            
+        # 如果不是发送给所有人，则只发送给第一个收件人
+        if not send_to_all and recipients:
+            recipients = [recipients[0]]
         
         if not recipients:
             self.logger.warning("没有配置收件人，无法发送邮件")
@@ -218,6 +224,7 @@ class EmailService:
                         recipients: Optional[List[str]] = None,
                         image_path: Optional[str] = None, 
                         is_html: bool = False,
+                        send_to_all: bool = False,
                         callback: Optional[callable] = None) -> None:
         """异步发送邮件（不阻塞主流程）
         
@@ -227,11 +234,12 @@ class EmailService:
             recipients: 收件人列表（可选，默认使用配置的收件人）
             image_path: 图片附件路径（可选）
             is_html: 是否为HTML格式邮件
+            send_to_all: 是否发送给所有收件人，默认False只发送给第一个收件人
             callback: 发送完成后的回调函数（可选）
         """
         def send_thread():
             try:
-                success = self.send_email_with_retry(subject, body, recipients, image_path, is_html)
+                success = self.send_email_with_retry(subject, body, recipients, image_path, is_html, send_to_all)
                 if callback:
                     callback(success, subject)
             except Exception as e:
@@ -320,9 +328,9 @@ class EmailService:
         """
         
         if async_send:
-            self.send_email_async(subject, body, image_path=screenshot_path, is_html=True)
+            self.send_email_async(subject, body, image_path=screenshot_path, is_html=True, send_to_all=True)
         else:
-            self.send_email_with_retry(subject, body, image_path=screenshot_path, is_html=True)
+            self.send_email_with_retry(subject, body, image_path=screenshot_path, is_html=True, send_to_all=True)
 
 
 # 全局邮件服务实例
