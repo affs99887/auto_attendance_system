@@ -87,6 +87,7 @@ class TelegramBot:
                     self.app.add_handler(CommandHandler('start', self.start_command))
                     self.app.add_handler(CommandHandler('punch_in', self.punch_in_command))
                     self.app.add_handler(CommandHandler('punch_out', self.punch_out_command))
+                    self.app.add_handler(CommandHandler('stop', self.stop_command))
                     self.app.add_handler(CommandHandler('status', self.status_command))
                     self.app.add_handler(CommandHandler('errors', self.get_recent_errors))
                     self.app.add_handler(CommandHandler('kill', self.kill_command))
@@ -120,13 +121,15 @@ class TelegramBot:
             "支持的命令：\n"
             "/punch_in - 上班打卡\n"
             "/punch_out - 下班打卡\n"
-            "/status - 查看状态（包含看门狗状态）\n"
+            "/stop - 终止当前正在进行的打卡操作\n"
+            "/status - 查看状态（包含当前操作状态）\n"
             "/errors - 查看最近错误日志\n"
             "/kill - 查看并管理定时任务\n"
             "/kill <任务ID> - 直接删除指定任务\n"
             "/check - 查看最新打卡图片\n"
             "/check <用户名> - 查看指定用户的打卡图片\n\n"
-            "🛡️ 看门狗功能已内置启用"
+            "🛡️ 看门狗功能已内置启用\n"
+            "🔄 打卡操作现在支持后台运行，可随时使用 /stop 终止"
         )
 
     async def punch_in_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -144,10 +147,13 @@ class TelegramBot:
             await update.message.reply_text(f"命令已过期（发送时间：{command_time.strftime('%H:%M:%S')}）\n为确保安全，超过5分钟的命令将不会执行。")
             return
 
-        await update.message.reply_text("正在执行上班打卡...")
-        await self.attendance_system.punch_in()
-        # 打卡完成后返回状态
-        await self.status_command(update, context)
+        # 尝试启动打卡操作
+        success, message = await self.attendance_system.start_punch_operation("punch_in")
+        
+        if success:
+            await update.message.reply_text(f"✅ 上班打卡操作已启动\n📍 您可以使用 /status 查看进度\n🛑 您可以使用 /stop 终止操作")
+        else:
+            await update.message.reply_text(f"❌ {message}")
 
     async def punch_out_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """处理下班打卡命令"""
@@ -164,10 +170,13 @@ class TelegramBot:
             await update.message.reply_text(f"命令已过期（发送时间：{command_time.strftime('%H:%M:%S')}）\n为确保安全，超过5分钟的命令将不会执行。")
             return
 
-        await update.message.reply_text("正在执行下班打卡...")
-        await self.attendance_system.punch_out()
-        # 打卡完成后返回状态
-        await self.status_command(update, context)
+        # 尝试启动打卡操作
+        success, message = await self.attendance_system.start_punch_operation("punch_out")
+        
+        if success:
+            await update.message.reply_text(f"✅ 下班打卡操作已启动\n📍 您可以使用 /status 查看进度\n🛑 您可以使用 /stop 终止操作")
+        else:
+            await update.message.reply_text(f"❌ {message}")
 
     async def status_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """处理状态查询命令"""
@@ -206,7 +215,27 @@ class TelegramBot:
                 f"📅 当前时间：{current_time.strftime('%Y-%m-%d %H:%M:%S')}\n"
                 f"📌 今日类型：{'🏖️ 节假日' if is_holiday_today else '💼 工作日' if is_workday_today else '🎉 休息日'}\n"
                 f"⏰ 工作状态：{'🟢 工作时间' if is_work_time else '🔴 非工作时间'}\n\n"
+            )
 
+            # 添加当前操作状态显示
+            if self.attendance_system.current_operation is not None:
+                operation_display = "上班打卡" if self.attendance_system.current_operation == "punch_in" else "下班打卡"
+                elapsed_time = ""
+                if self.attendance_system.operation_start_time:
+                    elapsed = current_time - self.attendance_system.operation_start_time
+                    elapsed_minutes = int(elapsed.total_seconds() / 60)
+                    elapsed_seconds = int(elapsed.total_seconds() % 60)
+                    elapsed_time = f"（已运行 {elapsed_minutes}分{elapsed_seconds}秒）"
+                
+                status_text += (
+                    "🔄 当前操作状态\n"
+                    f"正在执行：{operation_display} {elapsed_time}\n"
+                    f"使用 /stop 命令可终止当前操作\n\n"
+                )
+            else:
+                status_text += "🔄 当前操作状态\n无正在进行的操作\n\n"
+
+            status_text += (
                 "📍 今日打卡记录\n"
                 f"上班打卡：{'✅ ' + punch_in_time.strftime('%H:%M:%S') if punch_in_time else '❌ 未打卡'}\n"
                 f"下班打卡：{'✅ ' + punch_out_time.strftime('%H:%M:%S') if punch_out_time else '❌ 未打卡'}\n\n"
@@ -256,6 +285,37 @@ class TelegramBot:
 
         except Exception as e:
             error_msg = f"获取状态信息时发生错误: {str(e)}"
+            logging.error(error_msg)
+            await update.message.reply_text(error_msg)
+
+    async def stop_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """处理/stop命令，终止当前操作"""
+        if str(update.message.chat_id) != self.chat_id:
+            await update.message.reply_text("您没有权限使用此机器人")
+            return
+
+        try:
+            # 检查是否有正在进行的操作
+            if self.attendance_system.current_operation is None:
+                await update.message.reply_text("当前没有进行中的操作需要终止")
+                return
+
+            operation_type = self.attendance_system.current_operation
+            operation_display = "上班打卡" if operation_type == "punch_in" else "下班打卡"
+            
+            # 通知用户正在终止操作
+            await update.message.reply_text(f"正在终止{operation_display}操作...")
+            
+            # 调用取消操作方法
+            success, message = await self.attendance_system.cancel_current_operation()
+            
+            if success:
+                await update.message.reply_text(f"✅ {message}")
+            else:
+                await update.message.reply_text(f"❌ {message}")
+                
+        except Exception as e:
+            error_msg = f"处理/stop命令时发生错误: {str(e)}"
             logging.error(error_msg)
             await update.message.reply_text(error_msg)
 
@@ -1143,6 +1203,7 @@ class TelegramBot:
         self.app.add_handler(CommandHandler("start", self.start_command))
         self.app.add_handler(CommandHandler("punch_in", self.punch_in_command))
         self.app.add_handler(CommandHandler("punch_out", self.punch_out_command))
+        self.app.add_handler(CommandHandler("stop", self.stop_command))
         self.app.add_handler(CommandHandler("status", self.status_command))
         self.app.add_handler(CommandHandler("errors", self.get_recent_errors))
         self.app.add_handler(CommandHandler("kill", self.kill_command))
@@ -1198,7 +1259,7 @@ class TelegramBot:
         }
 
         # 设置1分钟超时
-        if self.chat_id in self.setting_time_timer:
+        if self.chat_id in self.setting_time_timer and self.setting_time_timer[self.chat_id] is not None:
             self.setting_time_timer[self.chat_id].cancel()
         self.setting_time_timer[self.chat_id] = asyncio.create_task(self._cancel_settime_timeout(self.chat_id))
 
@@ -1224,7 +1285,7 @@ class TelegramBot:
             return
 
         # 重置超时计时器
-        if self.chat_id in self.setting_time_timer:
+        if self.chat_id in self.setting_time_timer and self.setting_time_timer[self.chat_id] is not None:
             self.setting_time_timer[self.chat_id].cancel()
         self.setting_time_timer[self.chat_id] = asyncio.create_task(self._cancel_settime_timeout(self.chat_id))
 
@@ -1242,7 +1303,8 @@ class TelegramBot:
                 target_time = datetime.now() + timedelta(minutes=delay_minutes)
                 await self._schedule_punch(state['type'], target_time.hour, target_time.minute)
                 del self.setting_time_state[self.chat_id]
-                self.setting_time_timer[self.chat_id].cancel()
+                if self.chat_id in self.setting_time_timer and self.setting_time_timer[self.chat_id] is not None:
+                    self.setting_time_timer[self.chat_id].cancel()
 
             except ValueError:
                 await update.message.reply_text("请输入有效的数字")
@@ -1265,7 +1327,8 @@ class TelegramBot:
                 if 0 <= minute <= 59:
                     await self._schedule_punch(state['type'], state['hour'], minute)
                     del self.setting_time_state[self.chat_id]
-                    self.setting_time_timer[self.chat_id].cancel()
+                    if self.chat_id in self.setting_time_timer and self.setting_time_timer[self.chat_id] is not None:
+                        self.setting_time_timer[self.chat_id].cancel()
                 else:
                     await update.message.reply_text("请输入0-59之间的数字")
             except ValueError:
