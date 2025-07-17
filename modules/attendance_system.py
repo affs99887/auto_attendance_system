@@ -136,6 +136,13 @@ class AttendanceSystem:
         # 确保logs目录存在，用于保存截图
         os.makedirs('logs', exist_ok=True)
         
+        # 添加操作状态管理变量
+        self.current_operation = None  # 当前操作类型 ("punch_in", "punch_out", None)
+        self.operation_task = None  # 当前操作的asyncio.Task对象
+        self.operation_cancel_event = None  # 用于取消操作的asyncio.Event
+        self.operation_lock = asyncio.Lock()  # 确保互斥的锁
+        self.operation_start_time = None  # 操作开始时间
+        
         # 初始化完成，取消静默模式
         self._silent_init = False
 
@@ -1573,15 +1580,108 @@ class AttendanceSystem:
 
             return (False, None)
 
-    async def punch_in(self):
-        """执行上班打卡"""
+    async def start_punch_operation(self, operation_type):
+        """启动打卡操作（公共接口）"""
+        async with self.operation_lock:
+            if self.current_operation is not None:
+                return False, f"当前已有{self.current_operation}操作正在进行中，请等待完成或使用/stop命令取消"
+            
+            # 设置操作状态
+            self.current_operation = operation_type
+            self.operation_start_time = datetime.now()
+            self.operation_cancel_event = asyncio.Event()
+            
+            # 启动后台任务
+            if operation_type == "punch_in":
+                self.operation_task = asyncio.create_task(self.punch_in_internal(self.operation_cancel_event))
+            elif operation_type == "punch_out":
+                self.operation_task = asyncio.create_task(self.punch_out_internal(self.operation_cancel_event))
+            else:
+                self.current_operation = None
+                self.operation_start_time = None
+                self.operation_cancel_event = None
+                return False, "无效的操作类型"
+            
+            # 添加任务完成回调
+            self.operation_task.add_done_callback(self._operation_completed_callback)
+            
+            return True, f"{operation_type}操作已启动"
+
+    def _operation_completed_callback(self, task):
+        """操作完成时的回调函数"""
+        asyncio.create_task(self._cleanup_operation_state())
+
+    async def _cleanup_operation_state(self):
+        """清理操作状态"""
+        self.current_operation = None
+        self.operation_task = None
+        self.operation_cancel_event = None
+        self.operation_start_time = None
+
+    async def cancel_current_operation(self):
+        """取消当前操作"""
+        if self.current_operation is None:
+            return False, "当前没有进行中的操作"
+        
+        operation_type = self.current_operation
+        
+        # 设置取消事件
+        if self.operation_cancel_event:
+            self.operation_cancel_event.set()
+        
+        # 等待任务完成（取消）
+        if self.operation_task and not self.operation_task.done():
+            try:
+                await asyncio.wait_for(self.operation_task, timeout=10)
+            except asyncio.TimeoutError:
+                # 如果任务没有响应取消，强制取消
+                if self.operation_task and not self.operation_task.done():
+                    self.operation_task.cancel()
+                    try:
+                        await self.operation_task
+                    except asyncio.CancelledError:
+                        pass
+        
+        # 确保浏览器被关闭
+        await self.cleanup_browser()
+        
+        # 清理状态
+        await self._cleanup_operation_state()
+        
+        return True, f"{operation_type}操作已取消"
+
+    async def cleanup_browser(self):
+        """清理浏览器资源"""
         try:
+            await self.send_notification("系统清理", "正在关闭浏览器...")
+            browser_closed = self.bot.close_browser()
+            if browser_closed:
+                await self.send_notification("系统清理", "浏览器已关闭")
+            else:
+                await self.send_notification("系统清理", "浏览器关闭失败，可能需要手动关闭")
+        except Exception as e:
+            logging.error(f"清理浏览器时发生错误: {e}")
+
+    async def punch_in_internal(self, cancel_event):
+        """执行上班打卡（内部方法，支持取消）"""
+        try:
+            # 检查取消
+            if cancel_event.is_set():
+                await self.send_notification("操作取消", "上班打卡操作已被取消")
+                return "cancelled"
+
             if not self.users or len(self.users) == 0:
                 await self.send_notification("打卡错误", "未配置用户信息，无法执行打卡")
                 return False
 
             success_count = 0
             for i, user in enumerate(self.users):
+                # 检查取消
+                if cancel_event.is_set():
+                    await self.send_notification("操作取消", f"用户 {user.get('username')} 的上班打卡操作已被取消")
+                    await self.cleanup_browser()
+                    return "cancelled"
+
                 username = user.get('username')
                 password = user.get('password')
 
@@ -1590,6 +1690,12 @@ class AttendanceSystem:
 
                 # 执行打卡
                 result, _ = await self._do_punch("上班", username, password)
+
+                # 检查取消
+                if cancel_event.is_set():
+                    await self.send_notification("操作取消", f"用户 {username} 打卡完成后操作被取消")
+                    await self.cleanup_browser()
+                    return "cancelled"
 
                 if result:
                     success_count += 1
@@ -1614,18 +1720,39 @@ class AttendanceSystem:
                 # 如果还有下一个用户，等待一段时间再继续
                 if i < len(self.users) - 1:
                     await self.send_notification("打卡流程", f"等待5秒后开始下一个用户的打卡...")
-                    await asyncio.sleep(5)
+                    # 在等待期间也检查取消
+                    for _ in range(5):
+                        if cancel_event.is_set():
+                            await self.send_notification("操作取消", "在等待期间操作被取消")
+                            await self.cleanup_browser()
+                            return "cancelled"
+                        await asyncio.sleep(1)
 
             # 所有用户打卡完成后发送总结消息
             await self.send_notification("打卡完成", f"上班打卡完成，成功: {success_count}/{len(self.users)}")
             return success_count > 0
         except Exception as e:
+            await self.cleanup_browser()
             await self.handle_error(e, "上班打卡")
             return False
 
-    async def punch_out(self):
-        """执行下班打卡"""
+    async def punch_in(self):
+        """执行上班打卡（兼容性方法）"""
+        success, message = await self.start_punch_operation("punch_in")
+        if success:
+            # 等待操作完成
+            if self.operation_task:
+                return await self.operation_task
+        return False
+
+    async def punch_out_internal(self, cancel_event):
+        """执行下班打卡（内部方法，支持取消）"""
         try:
+            # 检查取消
+            if cancel_event.is_set():
+                await self.send_notification("操作取消", "下班打卡操作已被取消")
+                return "cancelled"
+
             if not self.users or len(self.users) == 0:
                 await self.send_notification("打卡错误", "未配置用户信息，无法执行打卡")
                 return False
@@ -1634,6 +1761,12 @@ class AttendanceSystem:
             remaining_times = []  # 用于存储每个用户的剩余工作时间
 
             for i, user in enumerate(self.users):
+                # 检查取消
+                if cancel_event.is_set():
+                    await self.send_notification("操作取消", f"用户 {user.get('username')} 的下班打卡操作已被取消")
+                    await self.cleanup_browser()
+                    return "cancelled"
+
                 username = user.get('username')
                 password = user.get('password')
 
@@ -1642,6 +1775,12 @@ class AttendanceSystem:
 
                 # 执行打卡，并捕获剩余工作时间
                 result, remaining_time_info = await self._do_punch("下班", username, password, collect_remaining_time=True)
+
+                # 检查取消
+                if cancel_event.is_set():
+                    await self.send_notification("操作取消", f"用户 {username} 打卡完成后操作被取消")
+                    await self.cleanup_browser()
+                    return "cancelled"
 
                 if result:
                     success_count += 1
@@ -1673,7 +1812,18 @@ class AttendanceSystem:
                 # 如果还有下一个用户，等待一段时间再继续
                 if i < len(self.users) - 1:
                     await self.send_notification("打卡流程", f"等待5秒后开始下一个用户的打卡...")
-                    await asyncio.sleep(5)
+                    # 在等待期间也检查取消
+                    for _ in range(5):
+                        if cancel_event.is_set():
+                            await self.send_notification("操作取消", "在等待期间操作被取消")
+                            await self.cleanup_browser()
+                            return "cancelled"
+                        await asyncio.sleep(1)
+
+            # 检查取消
+            if cancel_event.is_set():
+                await self.send_notification("操作取消", "在处理定时任务前操作被取消")
+                return "cancelled"
 
             # 所有用户打卡完成后，处理统一的定时任务
             if remaining_times:
@@ -1729,8 +1879,18 @@ class AttendanceSystem:
             await self.send_notification("打卡完成", f"下班打卡完成，成功: {success_count}/{len(self.users)}")
             return success_count > 0
         except Exception as e:
+            await self.cleanup_browser()
             await self.handle_error(e, "下班打卡")
             return False
+
+    async def punch_out(self):
+        """执行下班打卡（兼容性方法）"""
+        success, message = await self.start_punch_operation("punch_out")
+        if success:
+            # 等待操作完成
+            if self.operation_task:
+                return await self.operation_task
+        return False
 
 
     def cleanup(self):
@@ -2014,11 +2174,16 @@ class AttendanceSystem:
                 else:
                     logging.error(f"邮件发送失败: {email_subject}")
 
+            # 根据打卡结果决定是否发送给所有用户
+            # 如果是失败、错误相关的打卡，发送给所有用户
+            send_to_all = any(keyword in punch_type for keyword in ["失败", "错误", "异常"])
+            
             # 异步发送邮件
             self.email_service.send_email_async(
                 subject=subject,
                 body=body,
                 image_path=attachment_path,
+                send_to_all=send_to_all,
                 callback=email_callback
             )
 
