@@ -53,4 +53,5 @@ Thumbs.db
 
 # 项目特定文件
 punch_records/
-screenshots/ 
+screenshots/
+scheduled_tasks.json 

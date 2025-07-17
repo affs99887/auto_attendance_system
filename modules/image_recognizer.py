@@ -1,3 +1,9 @@
+"""
+图像识别和OCR处理模块
+
+负责模板匹配、OCR文字识别、图像处理等功能
+"""
+
 import cv2
 import numpy as np
 import pytesseract
@@ -6,6 +12,7 @@ import re
 from PIL import Image
 from typing import Tuple, Optional, List, Dict
 import logging
+from modules.config import config
 
 
 class ImageRecognizer:
@@ -15,15 +22,15 @@ class ImageRecognizer:
         self.logger = logging.getLogger(__name__)
         
         # 设置Tesseract路径
-        tesseract_path = os.getenv('TESSERACT_PATH', r'C:\Program Files\Tesseract-OCR\tesseract.exe')
+        tesseract_path = config.TESSERACT_PATH
         if os.path.exists(tesseract_path):
             pytesseract.pytesseract.tesseract_cmd = tesseract_path
         
         # 模板匹配阈值
-        self.match_threshold = 0.8
+        self.match_threshold = config.MATCH_THRESHOLD
         
         # OCR配置
-        self.ocr_config = '--oem 3 --psm 6 -c tessedit_char_whitelist=0123456789:'
+        self.ocr_config = config.OCR_CONFIG
     
     def find_element_by_image(self, screenshot_path: str, template_path: str, 
                              threshold: float = None) -> Optional[Tuple[int, int]]:
