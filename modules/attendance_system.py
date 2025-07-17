@@ -469,7 +469,13 @@ class AttendanceSystem:
             return None
 
     def find_element_by_image(self, template_path, threshold=0.8):
-        """通过图像模板匹配找到元素位置，增加重试机制"""
+        """通过图像模板匹配找到元素位置，增加重试机制和多阈值尝试"""
+        # 对于关键模板，使用多个阈值进行尝试
+        if 'unable_escape.png' in template_path or 'left_time.png' in template_path:
+            thresholds = [0.7, 0.6, 0.5, 0.4]
+        else:
+            thresholds = [threshold]
+        
         for attempt in range(self.max_retries):
             screen = self.take_screenshot()
             if screen is None:
@@ -487,20 +493,31 @@ class AttendanceSystem:
             result = cv2.matchTemplate(screen, template, cv2.TM_CCOEFF_NORMED)
             min_val, max_val, min_loc, max_loc = cv2.minMaxLoc(result)
 
-            if max_val >= threshold:
-                # 获取浏览器窗口位置
-                hwnd = self.get_browser_window()
-                if hwnd:
-                    window_x, window_y = win32gui.GetWindowRect(hwnd)[:2]
-                    # 返回相对于屏幕的绝对坐标
-                    center_x = window_x + max_loc[0] + template_width // 2
-                    center_y = window_y + max_loc[1] + template_height // 2
-                    return (center_x, center_y)
+            # 尝试多个阈值
+            for thresh in thresholds:
+                if max_val >= thresh:
+                    # 获取浏览器窗口位置
+                    hwnd = self.get_browser_window()
+                    if hwnd:
+                        window_x, window_y = win32gui.GetWindowRect(hwnd)[:2]
+                        # 返回相对于屏幕的绝对坐标
+                        center_x = window_x + max_loc[0] + template_width // 2
+                        center_y = window_y + max_loc[1] + template_height // 2
+                        
+                        # 记录匹配结果和阈值，便于调试
+                        if 'unable_escape.png' in template_path or 'left_time.png' in template_path:
+                            logging.info(f"模板匹配成功 {template_path}：置信度={max_val:.3f}, 使用阈值={thresh}")
+                        
+                        return (center_x, center_y)
 
             if attempt < self.max_retries - 1:
-                print(f"未找到元素 {template_path}（匹配度：{max_val:.2f}），{attempt + 1} 次重试...")
+                logging.info(f"未找到元素 {template_path}（最高匹配度：{max_val:.3f}），{attempt + 1} 次重试...")
                 time.sleep(self.retry_interval)
 
+        # 记录最终匹配失败的详细信息
+        if 'unable_escape.png' in template_path or 'left_time.png' in template_path:
+            logging.warning(f"关键模板匹配失败 {template_path}：最高置信度={max_val:.3f}, 尝试次数={self.max_retries}")
+        
         return None
 
     def find_element_with_label(self, template_path, label_template_path, threshold=0.8):
@@ -684,7 +701,7 @@ class AttendanceSystem:
             return False
 
     async def get_remaining_time(self):
-        """获取剩余时间并计算还需工作时间"""
+        """获取剩余时间并计算还需工作时间，增强OCR识别准确性"""
         try:
             # 查找剩余时间模板
             await self.send_notification("时间识别", "开始查找剩余时间...")
@@ -716,25 +733,92 @@ class AttendanceSystem:
                     relative_x:min(screen.shape[1], relative_x + 200)
                 ]
 
-                # 保存临时文件用于OCR识别
-                cv2.imwrite('time_region.png', time_region)
+                # 临时保存用于OCR
+                
+                # 增强图像预处理提高OCR准确性
+                # 转换为灰度
+                gray = cv2.cvtColor(time_region, cv2.COLOR_BGR2GRAY)
+                # 二值化
+                _, binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+                # 去噪
+                denoised = cv2.medianBlur(binary, 3)
+                
+                # 保存临时文件用于OCR
+                temp_path = 'temp_time_region.png'
+                cv2.imwrite(temp_path, denoised)
 
                 await self.send_notification("时间识别", "开始OCR识别...")
-                # 使用OCR识别时间文本，添加配置参数
-                custom_config = r'--oem 3 --psm 6 -c preserve_interword_spaces=1'
-                time_text = pytesseract.image_to_string(
-                    Image.open('time_region.png'),
-                    lang='chi_sim',  # 使用中文简体识别
-                    config=custom_config
-                )
-                os.remove('time_region.png')  # 删除临时文件
+                
+                # 尝试多种OCR配置
+                ocr_configs = [
+                    r'--oem 3 --psm 6 -c preserve_interword_spaces=1',
+                    r'--oem 3 --psm 7 -c preserve_interword_spaces=1',
+                    r'--oem 3 --psm 8',
+                    r'--oem 1 --psm 6'
+                ]
+                
+                time_text = None
+                for i, config in enumerate(ocr_configs):
+                    try:
+                        # 先尝试处理后的图像
+                        text = pytesseract.image_to_string(
+                            Image.open(temp_path),
+                            lang='chi_sim',
+                            config=config
+                        ).strip()
+                        
+                        if text and any(char in text for char in ['时', '分', '小', '钟']):
+                            time_text = text
+                            logging.info(f"OCR配置{i+1}识别成功: {text}")
+                            break
+                        
+                        # 如果预处理图像失败，尝试原始图像
+                        temp_original_path = 'temp_time_region_original.png'
+                        cv2.imwrite(temp_original_path, time_region)
+                        text = pytesseract.image_to_string(
+                            Image.open(temp_original_path),
+                            lang='chi_sim',
+                            config=config
+                        ).strip()
+                        
+                        if text and any(char in text for char in ['时', '分', '小', '钟']):
+                            time_text = text
+                            logging.info(f"OCR配置{i+1}（原始图像）识别成功: {text}")
+                            os.remove(temp_original_path)
+                            break
+                        
+                        os.remove(temp_original_path)
+                            
+                    except Exception as e:
+                        logging.warning(f"OCR配置{i+1}失败: {e}")
+                        continue
+
+                # 删除临时文件
+                try:
+                    os.remove(temp_path)
+                except:
+                    pass
+
+                if not time_text:
+                    await self.send_notification("时间识别", "所有OCR配置都无法识别时间文本")
+                    return None
 
                 await self.send_notification("时间识别", f"OCR识别结果: {time_text}")
 
-                # 提取小时和分钟，使用更灵活的正则表达式
-                # 匹配"仅"字后面的数字和时间单位
-                time_pattern = r'[仅仅]?(\d+)\s*[小时時].*?(\d+)\s*分[钟鐘]'
-                time_match = re.search(time_pattern, time_text)
+                # 使用更强大的正则表达式匹配
+                time_patterns = [
+                    r'[仅仅]?(\d+)\s*[小时時].*?(\d+)\s*分[钟鐘]',  # 原有模式
+                    r'(\d+)\s*[小时時].*?(\d+)\s*分[钟鐘]',        # 不包含"仅"字
+                    r'(\d+).*?(\d+)\s*分',                       # 简化模式
+                    r'(\d+)[时時].*?(\d+)[分鐘]'                  # 更紧凑的模式
+                ]
+                
+                time_match = None
+                for pattern in time_patterns:
+                    time_match = re.search(pattern, time_text)
+                    if time_match:
+                        logging.info(f"时间匹配成功，使用模式: {pattern}")
+                        break
 
                 if time_match:
                     hours = int(time_match.group(1))
@@ -746,19 +830,25 @@ class AttendanceSystem:
                     worked_minutes = hours * 60 + minutes
                     remaining_minutes = total_minutes - worked_minutes
 
-                    remaining_hours = remaining_minutes // 60
-                    remaining_mins = remaining_minutes % 60
-
-                    result = f"{remaining_hours}小时{remaining_mins}分钟"
+                    if remaining_minutes <= 0:
+                        result = "0小时0分钟"  # 已满足工作时间要求
+                    else:
+                        remaining_hours = remaining_minutes // 60
+                        remaining_mins = remaining_minutes % 60
+                        result = f"{remaining_hours}小时{remaining_mins}分钟"
+                    
                     await self.send_notification("时间识别", f"计算结果 - 还需工作: {result}")
                     return result
                 else:
-                    await self.send_notification("时间识别", f"无法从文本中提取时间: {time_text}")
+                    await self.send_notification("时间识别", f"无法从文本中提取时间信息: {time_text}")
+                    logging.warning(f"时间提取失败，OCR结果: {time_text}")
             else:
                 await self.send_notification("时间识别", "未找到剩余时间位置")
+                logging.warning("left_time模板匹配失败")
             return None
         except Exception as e:
             await self.send_notification("时间识别", f"获取剩余时间失败: {str(e)}")
+            logging.error(f"get_remaining_time异常: {e}")
             return None
 
     async def schedule_retry_punch_out(self, delay_minutes, clear_existing=True):
@@ -1111,8 +1201,23 @@ class AttendanceSystem:
                     else:  # 下班打卡
                         # 检查是否存在unable_escape情况
                         await self.send_notification("打卡流程", "检查是否满足下班条件...")
+                        
                         unable_escape_loc = self.find_element_by_image('templates/unable_escape.png')
+                        
+                        # 获取模板匹配的置信度信息（通过重新匹配）
+                        unable_escape_confidence = 0.0
+                        try:
+                            template = cv2.imread('templates/unable_escape.png')
+                            if template is not None:
+                                result = cv2.matchTemplate(screen, template, cv2.TM_CCOEFF_NORMED)
+                                _, max_val, _, _ = cv2.minMaxLoc(result)
+                                unable_escape_confidence = max_val
+                                logging.info(f"unable_escape模板匹配置信度: {unable_escape_confidence:.3f}")
+                        except Exception as e:
+                            logging.warning(f"无法获取unable_escape置信度: {e}")
+                        
                         if unable_escape_loc:
+                            await self.send_notification("打卡流程", f"检测到下班限制（置信度: {unable_escape_confidence:.3f}）")
                             # 获取剩余工作时间
                             remaining_time = await self.get_remaining_time()
                             if remaining_time:
@@ -1187,7 +1292,22 @@ class AttendanceSystem:
                                     await self.send_notification("打卡流程", f"通知发送失败: {error_msg_detail}")
                             return (False, remaining_time_info)
                         else:
-                            # 只有在没有unable_escape时才记录下班时间
+                            # 【关键修复】采用保守策略：仅在明确验证可以下班时才认为成功
+                            # 如果unable_escape置信度较低，可能是匹配失败，需要进一步验证
+                            
+                            # 保守策略判断：如果置信度太低，认为状态不确定
+                            if unable_escape_confidence > 0.3:  # 存在一定的unable_escape特征
+                                error_msg = f"下班状态不确定（unable_escape置信度: {unable_escape_confidence:.3f}），采用保守策略"
+                                await self.send_notification("打卡流程", error_msg)
+                                logging.warning(f"下班打卡状态不确定，置信度: {unable_escape_confidence:.3f}，采用保守策略拒绝")
+                                
+                                return (False, f"状态不确定，置信度{unable_escape_confidence:.3f}")
+                            
+                            # 置信度很低，认为确实没有unable_escape，可以下班
+                            await self.send_notification("打卡流程", f"确认可以下班（置信度: {unable_escape_confidence:.3f}）")
+                            logging.info(f"确认可以下班，unable_escape置信度很低: {unable_escape_confidence:.3f}")
+                            
+                            # 进行下班成功的处理
                             if self._is_early_leave(current_time):
                                 await self.send_notification(
                                     "打卡异常",
