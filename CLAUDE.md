@@ -45,11 +45,16 @@ pip install -r requirements.txt
 # Activate virtual environment first
 source venv/bin/activate
 
-# Run main attendance system (CLI mode)
-python main.py
+# Run with unified launcher (recommended)
+python start.py                    # Default watchdog mode
+python start.py --interactive       # Interactive mode selection
+python start.py --mode main         # Direct main.py execution
+python start.py --mode watchdog     # Watchdog mode
+python start.py --mode status       # Check running status
 
-# Run with watchdog (recommended for production)
-python watchdog.py
+# Direct execution (alternative)
+python main.py                      # CLI mode with Telegram integration
+python watchdog.py                  # Watchdog mode with process monitoring
 ```
 
 ### Development
