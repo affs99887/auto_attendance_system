@@ -93,6 +93,7 @@ class TelegramBot:
                     self.app.add_handler(CommandHandler('kill', self.kill_command))
                     self.app.add_handler(CommandHandler('set_time', self.settime_command))
                     self.app.add_handler(CommandHandler('check', self.check_command))
+                    self.app.add_handler(CommandHandler('auto_byebye', self.auto_byebye_command))
                     self.app.add_handler(CallbackQueryHandler(self.button_callback))
                     self.app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self.handle_message))
 
@@ -121,6 +122,7 @@ class TelegramBot:
             "支持的命令：\n"
             "/punch_in - 上班打卡\n"
             "/punch_out - 下班打卡\n"
+            "/auto_byebye - 自动下班打卡（根据上班时间计算8小时16分钟后自动下班）\n"
             "/stop - 终止当前正在进行的打卡操作\n"
             "/status - 查看状态（包含当前操作状态）\n"
             "/errors - 查看最近错误日志\n"
@@ -177,6 +179,64 @@ class TelegramBot:
             await update.message.reply_text(f"✅ 下班打卡操作已启动\n📍 您可以使用 /status 查看进度\n🛑 您可以使用 /stop 终止操作")
         else:
             await update.message.reply_text(f"❌ {message}")
+
+    async def auto_byebye_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """处理自动下班打卡命令"""
+        if str(update.message.chat_id) != self.chat_id:
+            await update.message.reply_text("您没有权限使用此机器人")
+            return
+
+        # 检查命令发送时间是否超过5分钟
+        command_time = update.message.date
+        current_time = datetime.now(command_time.tzinfo)  # 使用相同时区
+        time_diff = (current_time - command_time).total_seconds() / 60  # 转换为分钟
+
+        if time_diff > 5:
+            await update.message.reply_text(f"命令已过期（发送时间：{command_time.strftime('%H:%M:%S')}）\n为确保安全，超过5分钟的命令将不会执行。")
+            return
+
+        try:
+            await update.message.reply_text("🕐 正在获取当日上班打卡时间...")
+            
+            # 获取当日上班打卡时间
+            success, punch_in_time, message = await self.attendance_system.get_today_punch_in_time()
+            
+            if not success:
+                await update.message.reply_text(f"❌ 获取上班时间失败：{message}")
+                return
+            
+            # 计算下班时间
+            calc_success, punch_out_time, calc_message = self.attendance_system.calculate_punch_out_time(punch_in_time)
+            
+            if not calc_success:
+                await update.message.reply_text(f"❌ 计算下班时间失败：{calc_message}")
+                return
+            
+            # 创建确认按钮
+            keyboard = [
+                [
+                    InlineKeyboardButton("✅ 确认设置", callback_data=f'auto_byebye_confirm_{punch_out_time}'),
+                    InlineKeyboardButton("❌ 取消", callback_data='auto_byebye_cancel')
+                ]
+            ]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            
+            # 发送确认消息
+            confirm_message = (
+                f"🎯 自动下班打卡设置\n\n"
+                f"📍 上班时间：{punch_in_time}\n"
+                f"🕐 计算下班时间：{punch_out_time}\n"
+                f"⏰ 工作时长：8小时16分钟\n\n"
+                f"💡 确认后将自动设置定时任务，到时间后自动执行下班打卡。\n\n"
+                f"请选择操作："
+            )
+            
+            await update.message.reply_text(confirm_message, reply_markup=reply_markup)
+            
+        except Exception as e:
+            error_msg = f"执行auto_byebye命令时发生错误: {str(e)}"
+            logging.error(error_msg)
+            await update.message.reply_text(f"❌ {error_msg}")
 
     async def status_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """处理状态查询命令"""
@@ -1064,6 +1124,54 @@ class TelegramBot:
                 # 删除原消息
                 await query.message.delete()
 
+            # 处理 auto_byebye 按钮回调
+            elif query.data.startswith('auto_byebye_confirm_'):
+                # 提取下班时间
+                punch_out_time = query.data.replace('auto_byebye_confirm_', '')
+                
+                try:
+                    # 验证时间格式
+                    datetime.strptime(punch_out_time, '%H:%M:%S')
+                    
+                    # 设置定时任务
+                    await query.message.edit_text("⏳ 正在设置定时任务...")
+                    
+                    # 计算延迟时间（分钟）
+                    current_time = datetime.now()
+                    punch_out_datetime = datetime.strptime(punch_out_time, '%H:%M:%S').time()
+                    today_punch_out = datetime.combine(current_time.date(), punch_out_datetime)
+                    
+                    # 如果设定时间已过，则设置为明天
+                    if today_punch_out <= current_time:
+                        today_punch_out = today_punch_out + timedelta(days=1)
+                    
+                    delay_minutes = int((today_punch_out - current_time).total_seconds() / 60)
+                    
+                    # 设置定时任务
+                    retry_time = await self.attendance_system.schedule_retry_punch_out(delay_minutes, clear_existing=False)
+                    
+                    if retry_time:
+                        success_message = (
+                            f"✅ 自动下班打卡设置成功！\n\n"
+                            f"🕐 下班时间：{punch_out_time}\n"
+                            f"⏰ 执行时间：{today_punch_out.strftime('%Y-%m-%d %H:%M:%S')}\n"
+                            f"📋 任务已添加到定时任务列表\n\n"
+                            f"💡 您可以使用 /status 查看任务状态"
+                        )
+                        await query.message.edit_text(success_message)
+                    else:
+                        await query.message.edit_text("❌ 设置定时任务失败，请稍后重试")
+                        
+                except ValueError:
+                    await query.message.edit_text("❌ 时间格式错误，操作已取消")
+                except Exception as e:
+                    error_msg = f"设置定时任务时发生错误: {str(e)}"
+                    logging.error(error_msg)
+                    await query.message.edit_text(f"❌ {error_msg}")
+
+            elif query.data == 'auto_byebye_cancel':
+                await query.message.edit_text("❌ 自动下班打卡设置已取消")
+
         except Exception as e:
             error_msg = f"处理按钮回调时发生错误: {str(e)}"
             logging.error(error_msg)
@@ -1208,6 +1316,7 @@ class TelegramBot:
         self.app.add_handler(CommandHandler("errors", self.get_recent_errors))
         self.app.add_handler(CommandHandler("kill", self.kill_command))
         self.app.add_handler(CommandHandler("set_time", self.settime_command))  # 修改命令名称
+        self.app.add_handler(CommandHandler("auto_byebye", self.auto_byebye_command))
 
         # 注册按钮回调处理器
         self.app.add_handler(CallbackQueryHandler(self.button_callback))
