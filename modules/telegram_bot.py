@@ -95,6 +95,7 @@ class TelegramBot:
                     self.app.add_handler(CommandHandler('check', self.check_command))
                     self.app.add_handler(CommandHandler('auto_byebye', self.auto_byebye_command))
                     self.app.add_handler(CommandHandler('parallel', self.parallel_login_command))
+                    self.app.add_handler(CommandHandler('mode', self.mode_command))
                     self.app.add_handler(CallbackQueryHandler(self.button_callback))
                     self.app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self.handle_message))
 
@@ -131,7 +132,8 @@ class TelegramBot:
             "/kill <任务ID> - 直接删除指定任务\n"
             "/check - 查看最新打卡图片\n"
             "/check <用户名> - 查看指定用户的打卡图片\n"
-            "/parallel - 并行登录多个用户\n\n"
+            "/parallel - 并行登录多个用户\n"
+            "/mode - 切换登录模式（Selenium无头/传统图像识别）\n\n"
             "🛡️ 看门狗功能已内置启用\n"
             "🔄 打卡操作现在支持后台运行，可随时使用 /stop 终止"
         )
@@ -320,6 +322,55 @@ class TelegramBot:
             logging.error(error_msg, exc_info=True)
             await update.message.reply_text(f"❌ {error_msg}")
 
+    async def mode_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """处理切换登录模式命令"""
+        if str(update.message.chat_id) != self.chat_id:
+            await update.message.reply_text("您没有权限使用此机器人")
+            return
+            
+        try:
+            # 检查系统是否已初始化
+            if not self.attendance_system:
+                await update.message.reply_text("❌ 系统未初始化")
+                return
+            
+            # 获取当前模式状态
+            current_use_selenium = self.attendance_system.use_selenium_login
+            current_mode = "Selenium无头模式" if current_use_selenium else "传统图像识别模式"
+            
+            # 切换模式：USE_SELENIUM_LOGIN 和 SELENIUM_HEADLESS 同时切换
+            new_use_selenium = not current_use_selenium
+            new_headless = new_use_selenium  # Selenium开启时自动开启无头模式
+            
+            self.attendance_system.use_selenium_login = new_use_selenium
+            self.attendance_system.selenium_headless = new_headless
+            
+            new_mode = "Selenium无头模式" if new_use_selenium else "传统图像识别模式"
+            
+            # 保存配置到动态配置文件（永久生效）
+            from modules.config import config
+            config.set_selenium_config('USE_SELENIUM_LOGIN', new_use_selenium)
+            config.set_selenium_config('SELENIUM_HEADLESS', new_headless)
+            
+            response_msg = (
+                f"🔄 登录模式已切换\n\n"
+                f"🔹 原模式: {current_mode}\n"
+                f"🔹 新模式: {new_mode}\n\n"
+                f"📝 说明:\n"
+                f"• ✅ 配置已永久保存，重启后仍然有效\n"
+                f"• 🤖 Selenium无头模式: 稳定高效，后台运行\n"
+                f"• 🖼️ 传统图像识别: 轻量级，适合简单界面\n"
+                f"• 📄 配置保存在 dynamic_config.json 文件中\n\n"
+                f"🚀 现在可以使用新的登录模式进行打卡了！"
+            )
+            
+            await update.message.reply_text(response_msg)
+            
+        except Exception as e:
+            error_msg = f"切换登录模式时发生错误: {str(e)}"
+            logging.error(error_msg, exc_info=True)
+            await update.message.reply_text(f"❌ {error_msg}")
+
     async def status_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """处理状态查询命令"""
         if str(update.message.chat_id) != self.chat_id:
@@ -393,6 +444,7 @@ class TelegramBot:
                 f"下班时间：{config.WORK_END_TIME}\n"
                 f"迟到阈值：{config.LATE_THRESHOLD}分钟\n"
                 f"早退阈值：{config.EARLY_LEAVE_THRESHOLD}分钟\n"
+                f"登录模式：{'🤖 Selenium无头模式' if self.attendance_system.use_selenium_login else '🖼️ 传统图像识别'}\n"
             )
 
             # 获取定时任务列表

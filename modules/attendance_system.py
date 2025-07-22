@@ -130,8 +130,8 @@ class AttendanceSystem:
         self.use_virtual_mouse = True
 
         # Selenium登录配置
-        self.use_selenium_login = config.USE_SELENIUM_LOGIN
-        self.selenium_headless = config.SELENIUM_HEADLESS
+        self.use_selenium_login = config.get_use_selenium_login()
+        self.selenium_headless = config.get_selenium_headless()
         self.selenium_controller = None  # 延迟初始化
 
         # 初始化所有服务实例（使用新的导入模块）
