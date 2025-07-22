@@ -94,6 +94,7 @@ class TelegramBot:
                     self.app.add_handler(CommandHandler('set_time', self.settime_command))
                     self.app.add_handler(CommandHandler('check', self.check_command))
                     self.app.add_handler(CommandHandler('auto_byebye', self.auto_byebye_command))
+                    self.app.add_handler(CommandHandler('parallel', self.parallel_login_command))
                     self.app.add_handler(CallbackQueryHandler(self.button_callback))
                     self.app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self.handle_message))
 
@@ -129,7 +130,8 @@ class TelegramBot:
             "/kill - 查看并管理定时任务\n"
             "/kill <任务ID> - 直接删除指定任务\n"
             "/check - 查看最新打卡图片\n"
-            "/check <用户名> - 查看指定用户的打卡图片\n\n"
+            "/check <用户名> - 查看指定用户的打卡图片\n"
+            "/parallel - 并行登录多个用户\n\n"
             "🛡️ 看门狗功能已内置启用\n"
             "🔄 打卡操作现在支持后台运行，可随时使用 /stop 终止"
         )
@@ -236,6 +238,86 @@ class TelegramBot:
         except Exception as e:
             error_msg = f"执行auto_byebye命令时发生错误: {str(e)}"
             logging.error(error_msg)
+            await update.message.reply_text(f"❌ {error_msg}")
+
+    async def parallel_login_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """处理并行登录命令"""
+        if str(update.message.chat_id) != self.chat_id:
+            await update.message.reply_text("您没有权限使用此机器人")
+            return
+
+        try:
+            await update.message.reply_text("🚀 开始并行登录...")
+            
+            # 检查系统是否已初始化
+            if not self.attendance_system:
+                await update.message.reply_text("❌ 系统未初始化，无法执行并行登录")
+                return
+            
+            # 准备用户配置
+            users_config = self.attendance_system.prepare_users_config_from_env()
+            
+            if not users_config or len(users_config) < 1:
+                await update.message.reply_text(f"❌ 需要至少1个用户才能执行并行登录\n当前用户数: {len(users_config)}")
+                return
+            
+            await update.message.reply_text(f"👥 准备并行登录 {len(users_config)} 个用户...")
+            
+            # 执行并行登录
+            start_time = time.time()
+            results = await self.attendance_system.parallel_punch_login(
+                users_config=users_config,
+                max_concurrent=3  # 最大并发数
+            )
+            end_time = time.time()
+            
+            # 统计结果
+            total_users = len(results)
+            successful_users = sum(1 for success, _ in results.values() if success)
+            failed_users = total_users - successful_users
+            elapsed_time = end_time - start_time
+            
+            # 发送结果汇总
+            result_msg = (
+                f"🚀 并行登录完成\n\n"
+                f"👥 总用户数: {total_users}\n"
+                f"✅ 成功: {successful_users}\n"
+                f"❌ 失败: {failed_users}\n"
+                f"⏱️ 用时: {elapsed_time:.2f}秒\n\n"
+                f"📊 详细结果:\n"
+            )
+            
+            for user_id, (success, message) in results.items():
+                status_icon = "✅" if success else "❌"
+                result_msg += f"{status_icon} {user_id}: {message[:50]}{'...' if len(message) > 50 else ''}\n"
+            
+            await update.message.reply_text(result_msg)
+            
+            # 如果有失败的用户，提供详细错误信息
+            if failed_users > 0:
+                error_details = "❌ 失败详情:\n"
+                for user_id, (success, message) in results.items():
+                    if not success:
+                        error_details += f"• {user_id}: {message}\n"
+                
+                if len(error_details) > 4000:  # Telegram消息长度限制
+                    error_details = error_details[:4000] + "\n..."
+                
+                await update.message.reply_text(error_details)
+            
+            # 性能对比信息
+            estimated_sequential_time = len(users_config) * 15  # 假设每个用户串行需要15秒
+            performance_msg = (
+                f"⚡ 性能对比:\n"
+                f"并行模式: {elapsed_time:.2f}秒\n"
+                f"串行模式(预估): {estimated_sequential_time}秒\n"
+                f"提升倍数: {estimated_sequential_time / elapsed_time:.1f}x"
+            )
+            await update.message.reply_text(performance_msg)
+            
+        except Exception as e:
+            error_msg = f"执行并行登录时发生错误: {str(e)}"
+            logging.error(error_msg, exc_info=True)
             await update.message.reply_text(f"❌ {error_msg}")
 
     async def status_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):

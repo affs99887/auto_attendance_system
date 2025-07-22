@@ -39,6 +39,7 @@ from modules.image_recognizer import image_recognizer
 from modules.record_manager import punch_record_manager
 from modules.task_manager import task_manager
 from modules.telegram_bot import TelegramBot
+from modules.selenium_login import SeleniumLoginController, ParallelSeleniumLogin
 
 
 class AttendanceSystem:
@@ -128,6 +129,11 @@ class AttendanceSystem:
         # 添加虚拟鼠标控制
         self.use_virtual_mouse = True
 
+        # Selenium登录配置
+        self.use_selenium_login = config.USE_SELENIUM_LOGIN
+        self.selenium_headless = config.SELENIUM_HEADLESS
+        self.selenium_controller = None  # 延迟初始化
+
         # 初始化所有服务实例（使用新的导入模块）
         self.email_service = email_service
         self.browser_controller = browser_controller
@@ -162,12 +168,62 @@ class AttendanceSystem:
         # 简单处理，都使用通用敬语
         return f"{surname}先生/女士"
 
+    def _save_screenshot_data(self, screen_data, filepath):
+        """保存截图数据到文件
+        
+        Args:
+            screen_data: 截图数据，可能是numpy数组(传统方式)或bytes(Selenium)
+            filepath: 保存路径
+            
+        Returns:
+            bool: 是否保存成功
+        """
+        try:
+            if isinstance(screen_data, bytes):
+                # Selenium截图数据 (PNG bytes)
+                with open(filepath, 'wb') as f:
+                    f.write(screen_data)
+                return True
+            elif isinstance(screen_data, np.ndarray):
+                # OpenCV截图数据 (numpy数组)
+                return cv2.imwrite(filepath, screen_data)
+            else:
+                logging.error(f"不支持的截图数据类型: {type(screen_data)}")
+                return False
+        except Exception as e:
+            logging.error(f"保存截图失败: {e}")
+            return False
+    
+    def _convert_screen_data_to_numpy(self, screen_data):
+        """将截图数据转换为numpy数组格式
+        
+        Args:
+            screen_data: 截图数据
+            
+        Returns:
+            numpy.ndarray or None: numpy格式的截图数据
+        """
+        try:
+            if isinstance(screen_data, np.ndarray):
+                return screen_data
+            elif isinstance(screen_data, bytes):
+                # 将bytes数据转换为numpy数组
+                nparr = np.frombuffer(screen_data, np.uint8)
+                img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+                return img
+            else:
+                logging.error(f"无法转换截图数据类型: {type(screen_data)}")
+                return None
+        except Exception as e:
+            logging.error(f"转换截图数据失败: {e}")
+            return None
+
     def save_user_screenshot(self, screen, username, punch_type, success=True):
         """
         统一的用户截图保存方法，确保每个用户每种类型最多保留3张图片
         
         Args:
-            screen: cv2截图数据
+            screen: 截图数据，可能是cv2截图数据(numpy数组)或Selenium截图数据(bytes)
             username: 用户名
             punch_type: 打卡类型 "上班" 或 "下班"
             success: 是否成功打卡，用于文件名标识
@@ -207,22 +263,8 @@ class AttendanceSystem:
             abs_filepath = os.path.abspath(filepath)
             logging.debug(f"尝试保存用户截图到: {abs_filepath}")
             
-            # 使用cv2.imencode + 文件写入的方式来支持中文路径
-            try:
-                # 编码图片为PNG格式
-                success, encoded_img = cv2.imencode('.png', screen)
-                if success:
-                    # 写入文件
-                    with open(abs_filepath, 'wb') as f:
-                        f.write(encoded_img.tobytes())
-                    save_result = True
-                else:
-                    save_result = False
-                    logging.error(f"图片编码失败")
-            except Exception as encode_error:
-                logging.error(f"使用编码方式保存失败: {encode_error}")
-                # 如果编码方式失败，尝试原来的方法
-                save_result = cv2.imwrite(abs_filepath, screen)
+            # 使用统一的截图保存方法
+            save_result = self._save_screenshot_data(screen, abs_filepath)
             
             if save_result:
                 logging.info(f"已保存用户 {username} 的{punch_type}打卡截图到: {abs_filepath}")
@@ -731,6 +773,76 @@ class AttendanceSystem:
             logging.error(f"登录流程异常: {str(e)}")
             return (False, screen)
 
+    async def _selenium_login_to_system(self, username, password, context="Selenium登录"):
+        """使用Selenium进行登录的流程
+        
+        Args:
+            username: 用户名
+            password: 密码
+            context: 操作上下文，用于日志记录
+            
+        Returns:
+            tuple: (success: bool, screenshot_data: bytes or None)
+        """
+        screenshot_data = None
+        
+        try:
+            await self.send_notification(context, "开始使用Selenium登录...")
+            
+            # 初始化Selenium控制器
+            if not self.selenium_controller:
+                self.selenium_controller = SeleniumLoginController(
+                    login_url=self.login_url,
+                    headless=self.selenium_headless,
+                    notification_callback=self.send_notification
+                )
+            
+            # 执行登录
+            success, message = await self.selenium_controller.login(username, password)
+            
+            if success:
+                await self.send_notification(context, f"Selenium登录成功: {message}")
+                # 获取截图
+                screenshot_data = self.selenium_controller.take_screenshot()
+                return (True, screenshot_data)
+            else:
+                await self.send_notification(context, f"Selenium登录失败: {message}")
+                # 获取失败时的截图
+                screenshot_data = self.selenium_controller.take_screenshot()
+                return (False, screenshot_data)
+                
+        except Exception as e:
+            error_msg = f"Selenium登录流程发生错误: {str(e)}"
+            await self.send_notification(context, error_msg)
+            logging.error(f"Selenium登录流程异常: {str(e)}")
+            
+            # 尝试获取错误时的截图
+            try:
+                if self.selenium_controller:
+                    screenshot_data = self.selenium_controller.take_screenshot()
+            except:
+                pass
+                
+            return (False, screenshot_data)
+
+    async def _unified_login_to_system(self, username, password, context="登录流程"):
+        """统一的登录流程，根据配置选择Selenium或传统方式
+        
+        Args:
+            username: 用户名
+            password: 密码
+            context: 操作上下文，用于日志记录
+            
+        Returns:
+            tuple: (success: bool, screen_data: numpy.ndarray or bytes or None)
+        """
+        if self.use_selenium_login:
+            await self.send_notification(context, "使用Selenium登录模式")
+            return await self._selenium_login_to_system(username, password, context)
+        else:
+            await self.send_notification(context, "使用传统PyAutoGUI登录模式")
+            return await self._login_to_system(username, password, context)
+
     async def login(self, username, password):
         """登录系统"""
         try:
@@ -1163,15 +1275,15 @@ class AttendanceSystem:
             self.current_message = f"开始{punch_type}打卡流程 - 用户: {username}"
             self.message_id = None
 
-            # 使用新的登录流程方法
-            login_success, screen = await self._login_to_system(username, password, "打卡流程")
+            # 使用统一的登录流程方法
+            login_success, screen = await self._unified_login_to_system(username, password, "打卡流程")
             if not login_success:
                 error_msg = "登录流程失败，无法进行打卡"
                 await self.send_notification("打卡流程", error_msg)
                 # 发送失败截图
                 if screen is not None:
                     screenshot_path = 'punch_error.png'
-                    cv2.imwrite(screenshot_path, screen)
+                    self._save_screenshot_data(screen, screenshot_path)
 
                     # 保存失败截图到用户目录
                     self.save_user_screenshot(screen, username, punch_type, success=False)
@@ -1698,11 +1810,23 @@ class AttendanceSystem:
         """清理浏览器资源"""
         try:
             await self.send_notification("系统清理", "正在关闭浏览器...")
+            
+            # 优先关闭Selenium浏览器
+            if self.selenium_controller:
+                try:
+                    self.selenium_controller.close()
+                    self.selenium_controller = None
+                    await self.send_notification("系统清理", "Selenium浏览器已关闭")
+                except Exception as e:
+                    logging.error(f"关闭Selenium浏览器失败: {e}")
+            
+            # 然后关闭传统方式的浏览器
             browser_closed = self.bot.close_browser()
             if browser_closed:
-                await self.send_notification("系统清理", "浏览器已关闭")
+                await self.send_notification("系统清理", "传统浏览器已关闭")
             else:
-                await self.send_notification("系统清理", "浏览器关闭失败，可能需要手动关闭")
+                await self.send_notification("系统清理", "传统浏览器关闭失败，可能需要手动关闭")
+                
         except Exception as e:
             logging.error(f"清理浏览器时发生错误: {e}")
 
@@ -2361,3 +2485,79 @@ class AttendanceSystem:
                 print(error_msg)
                 await self.send_notification("邮箱连接", f"❌ {error_msg}")
             return False
+
+    async def parallel_punch_login(self, users_config: List[Dict[str, str]], max_concurrent: int = 3) -> Dict[str, Tuple[bool, str]]:
+        """
+        并行执行多用户登录
+        
+        Args:
+            users_config: 用户配置列表，格式: [{'user_id': '', 'username': '', 'password': ''}, ...]
+            max_concurrent: 最大并发数，默认3个
+            
+        Returns:
+            Dict[str, Tuple[bool, str]]: 每个用户的登录结果
+        """
+        try:
+            await self.send_notification("并行登录", f"开始并行登录 {len(users_config)} 个用户")
+            
+            # 创建并行登录管理器
+            parallel_login = ParallelSeleniumLogin(
+                login_url=self.login_url,
+                headless=self.selenium_headless,
+                notification_callback=self.send_notification,
+                browser_type="edge"
+            )
+            
+            # 执行并行登录
+            results = await parallel_login.parallel_login(
+                users=users_config,
+                max_concurrent=max_concurrent
+            )
+            
+            # 记录结果
+            success_users = [user_id for user_id, (success, _) in results.items() if success]
+            failed_users = [user_id for user_id, (success, _) in results.items() if not success]
+            
+            await self.send_notification(
+                "并行登录完成",
+                f"✅ 成功: {len(success_users)} 个\n❌ 失败: {len(failed_users)} 个"
+            )
+            
+            if failed_users:
+                failed_details = []
+                for user_id in failed_users:
+                    _, error_msg = results[user_id]
+                    failed_details.append(f"• {user_id}: {error_msg}")
+                
+                await self.send_notification(
+                    "登录失败详情",
+                    "\n".join(failed_details[:5])  # 只显示前5个失败详情
+                )
+            
+            return results
+            
+        except Exception as e:
+            error_msg = f"并行登录异常: {str(e)}"
+            logging.error(error_msg, exc_info=True)
+            await self.send_notification("并行登录异常", error_msg)
+            return {user['user_id']: (False, error_msg) for user in users_config}
+    
+    def prepare_users_config_from_env(self) -> List[Dict[str, str]]:
+        """
+        从环境变量中准备用户配置
+        
+        Returns:
+            List[Dict[str, str]]: 用户配置列表
+        """
+        users = []
+        
+        # 直接使用现有的用户配置
+        for i, user in enumerate(self.users):
+            if user.get('username') and user.get('password'):
+                users.append({
+                    'user_id': f'user{i+1}',
+                    'username': user['username'],
+                    'password': user['password']
+                })
+        
+        return users
