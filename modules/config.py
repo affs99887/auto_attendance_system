@@ -81,6 +81,10 @@ class Config:
     # 图像识别配置
     MATCH_THRESHOLD = 0.8
     OCR_CONFIG = '--oem 3 --psm 6 -c tessedit_char_whitelist=0123456789:'
+    
+    # Selenium配置
+    USE_SELENIUM_LOGIN = os.getenv('USE_SELENIUM_LOGIN', 'false').lower() == 'true'
+    SELENIUM_HEADLESS = os.getenv('SELENIUM_HEADLESS', 'false').lower() == 'true'
 
     @classmethod
     def get_user_configs(cls):
