@@ -34,6 +34,8 @@ import win32con
 # 配置
 from modules.config import config
 
+from modules.selenium_login import SeleniumLoginController
+
 
 class TelegramBot:
     def __init__(self, chat_id):
@@ -96,6 +98,9 @@ class TelegramBot:
                     self.app.add_handler(CommandHandler('auto_byebye', self.auto_byebye_command))
                     self.app.add_handler(CommandHandler('parallel', self.parallel_login_command))
                     self.app.add_handler(CommandHandler('mode', self.mode_command))
+                    # Selenium完整流程命令
+                    self.app.add_handler(CommandHandler('selenium_complete_punch_in', self.selenium_complete_punch_in_command))
+                    self.app.add_handler(CommandHandler('selenium_complete_punch_out', self.selenium_complete_punch_out_command))
                     self.app.add_handler(CallbackQueryHandler(self.button_callback))
                     self.app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self.handle_message))
 
@@ -1305,6 +1310,53 @@ class TelegramBot:
 
             elif query.data == 'auto_byebye_cancel':
                 await query.message.edit_text("❌ 自动下班打卡设置已取消")
+            
+            # 处理Selenium完整下班流程的确认按钮
+            elif query.data.startswith('confirm_auto_punch_out:'):
+                # 提取下班时间
+                estimated_time = query.data.replace('confirm_auto_punch_out:', '')
+                
+                try:
+                    # 验证时间格式 (HH:MM)
+                    time_obj = datetime.strptime(estimated_time, '%H:%M')
+                    
+                    # 设置定时任务
+                    await query.message.edit_text("⏳ 正在设置自动下班任务...")
+                    
+                    # 计算目标时间
+                    current_time = datetime.now()
+                    target_time = datetime.combine(current_time.date(), time_obj.time())
+                    
+                    # 如果设定时间已过，则设置为明天
+                    if target_time <= current_time:
+                        target_time = target_time + timedelta(days=1)
+                    
+                    # 使用专用的Selenium自动下班任务设置方法
+                    await self._schedule_selenium_punch_out(
+                        target_time.hour, 
+                        target_time.minute,
+                        estimated_time
+                    )
+                    
+                    success_message = (
+                        f"✅ Selenium自动下班打卡设置成功！\n\n"
+                        f"🕐 预计下班时间：{estimated_time}\n"
+                        f"⏰ 执行时间：{target_time.strftime('%Y-%m-%d %H:%M')}\n"
+                        f"🔧 任务类型：Selenium完整下班流程\n"
+                        f"📋 任务已添加到定时任务列表\n\n"
+                        f"💡 您可以使用 /kill 查看和管理任务"
+                    )
+                    await query.message.edit_text(success_message)
+                    
+                except ValueError:
+                    await query.message.edit_text("❌ 时间格式错误，操作已取消")
+                except Exception as e:
+                    error_msg = f"设置自动下班任务时发生错误: {str(e)}"
+                    logging.error(error_msg)
+                    await query.message.edit_text(f"❌ {error_msg}")
+            
+            elif query.data == 'cancel_auto_punch_out':
+                await query.message.edit_text("❌ 自动下班打卡设置已取消")
 
         except Exception as e:
             error_msg = f"处理按钮回调时发生错误: {str(e)}"
@@ -1477,6 +1529,7 @@ class TelegramBot:
             pool_timeout=self.pool_timeout
         )
 
+
     async def settime_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """处理/settime命令"""
         if str(update.message.chat_id) != self.chat_id:
@@ -1576,6 +1629,55 @@ class TelegramBot:
                     await update.message.reply_text("请输入0-59之间的数字")
             except ValueError:
                 await update.message.reply_text("请输入有效的数字")
+
+    async def _schedule_selenium_punch_out(self, hour, minute, estimated_time):
+        """设置Selenium自动下班打卡任务"""
+        time_str = f"{hour:02d}:{minute:02d}"
+        target_time = datetime.strptime(time_str, "%H:%M").replace(
+            year=datetime.now().year,
+            month=datetime.now().month,
+            day=datetime.now().day
+        )
+
+        # 如果设置的时间已经过去，就设置为明天的这个时间
+        if target_time < datetime.now():
+            target_time = target_time + timedelta(days=1)
+
+        # 删除已有的Selenium下班任务
+        saved_tasks = self.attendance_system.task_manager.get_tasks()
+        for task in saved_tasks:
+            if task['type'] == 'selenium_punch_out':
+                self.attendance_system.task_manager.remove_task_by_id(task['id'])
+
+        # 添加新的Selenium下班任务
+        task_id = self.attendance_system.task_manager.add_task(
+            task_type="selenium_punch_out",
+            scheduled_time=time_str
+        )
+
+        # 定义Selenium下班任务执行函数
+        async def selenium_punch_out_job():
+            try:
+                await self.send_message(
+                    "⏰ Selenium自动下班", 
+                    f"开始执行Selenium自动下班打卡（预计时间：{estimated_time}）"
+                )
+                
+                # 使用现有的Selenium下班命令逻辑
+                await self.selenium_complete_punch_out_command(None)
+                
+            except Exception as e:
+                error_msg = f"Selenium自动下班执行失败: {str(e)}"
+                logging.error(error_msg)
+                await self.send_message("❌ 自动下班失败", error_msg)
+            finally:
+                # 执行完后删除任务
+                self.attendance_system.task_manager.remove_task_by_id(task_id)
+
+        # 使用schedule库设置定时任务
+        schedule.every().day.at(time_str).do(lambda: asyncio.create_task(selenium_punch_out_job()))
+        
+        logging.info(f"已设置Selenium自动下班任务: {target_time.strftime('%Y-%m-%d %H:%M')}")
 
     async def _schedule_punch(self, punch_type, hour, minute):
         """设置定时打卡任务"""
@@ -1713,3 +1815,160 @@ class TelegramBot:
             except Exception as e2:
                 logging.error(f"备选关闭方法也失败: {str(e2)}")
                 return False
+
+    async def _execute_selenium_complete_flow(self, update, flow_type: str, special_handler=None):
+        """执行Selenium完整打卡流程的通用方法"""
+        flow_name = "上班" if flow_type == "punch_in" else "下班"
+        
+        # 发送初始消息
+        status_message = await update.message.reply_text(f"🔧 Selenium完整{flow_name}打卡流程开始...")
+        message_content = f"🔧 Selenium完整{flow_name}打卡流程开始...\n"
+        
+        try:
+            # 更新状态：创建控制器
+            message_content += "📋 正在创建Selenium控制器...\n"
+            await status_message.edit_text(message_content)
+            
+            # 创建通知回调，用于更新消息
+            async def notification_callback(context: str, msg: str):
+                nonlocal message_content
+                message_content += f"[{context}] {msg}\n"
+                try:
+                    await status_message.edit_text(message_content)
+                except:
+                    pass  # 忽略编辑失败
+            
+            selenium_controller = SeleniumLoginController(
+                login_url=config.LOGIN_URL,
+                headless=config.get_selenium_headless(),
+                notification_callback=notification_callback
+            )
+            
+            # 执行完整打卡流程
+            message_content += f"🚀 开始执行完整{flow_name}打卡流程...\n"
+            await status_message.edit_text(message_content)
+            
+            # 根据流程类型选择对应的方法
+            if flow_type == "punch_in":
+                success, message_result, flow_data = await selenium_controller.complete_punch_in_flow(
+                    username=config.LOGIN_USERNAME,
+                    password=config.LOGIN_PASSWORD
+                )
+            else:  # punch_out
+                success, message_result, flow_data = await selenium_controller.complete_punch_out_flow(
+                    username=config.LOGIN_USERNAME,
+                    password=config.LOGIN_PASSWORD
+                )
+            
+            # 更新状态：流程完成
+            if success:
+                message_content += f"✅ 完整{flow_name}流程成功: {message_result}\n"
+                
+                # 显示详细结果
+                if flow_data:
+                    punch_result = flow_data.get('punch_result', {})
+                    if punch_result.get('punched'):
+                        message_content += f"✅ {flow_name}打卡已执行\n"
+                    elif punch_result.get('already_punched'):
+                        message_content += f"ℹ️ 之前已打过{flow_name}卡\n"
+                    
+                    # 调用特殊处理函数（如下班打卡的时间确认）
+                    if special_handler:
+                        message_content = await special_handler(update, message_content, flow_data)
+                    
+                    # 显示考勤状态
+                    attendance_status = flow_data.get('attendance_status', {})
+                    if attendance_status.get('today'):
+                        message_content += f"📅 今日状态: {attendance_status['today']}\n"
+            else:
+                message_content += f"❌ 完整{flow_name}流程失败: {message_result}\n"
+            
+            # 更新状态：获取截图
+            message_content += "📸 正在获取页面截图...\n"
+            await status_message.edit_text(message_content)
+            
+            # 截取最终状态截图
+            screenshot = selenium_controller.take_screenshot()
+            
+            if screenshot:
+                message_content += "✅ 截图获取成功\n"
+                await status_message.edit_text(message_content)
+                await update.message.reply_photo(photo=screenshot, caption=f"Selenium完整{flow_name}打卡流程结果截图")
+            else:
+                message_content += "⚠️ 无法获取截图\n"
+                await status_message.edit_text(message_content)
+            
+            # 关闭浏览器
+            message_content += "🔒 正在关闭浏览器...\n"
+            await status_message.edit_text(message_content)
+            selenium_controller.close()
+            
+            message_content += "✅ 完整流程完成！"
+            await status_message.edit_text(message_content)
+            
+        except Exception as e:
+            message_content += f"❌ 发生错误: {str(e)}\n"
+            try:
+                await status_message.edit_text(message_content)
+                if 'selenium_controller' in locals():
+                    screenshot = selenium_controller.take_screenshot()
+                    if screenshot:
+                        await update.message.reply_photo(photo=screenshot, caption=f"Selenium完整{flow_name}流程异常截图")
+            except:
+                pass
+    
+    async def _handle_punch_out_time_confirmation(self, update, message_content: str, flow_data: dict) -> str:
+        """处理下班打卡的时间确认逻辑"""
+        time_calculation = flow_data.get('time_calculation')
+        if time_calculation and time_calculation.get('confirmation_needed'):
+            message_content += "⚠️ 检测到工作时间不足\n"
+            message_content += f"⏰ 预计下班时间: {time_calculation['estimated_off_time']}\n"
+            message_content += f"📊 已工作: {time_calculation['worked_minutes']}分钟\n"
+            message_content += f"📊 还需: {time_calculation['remaining_minutes']}分钟\n"
+            
+            # 创建确认按钮
+            from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+            keyboard = [
+                [
+                    InlineKeyboardButton(
+                        f"✅ 确认设置自动下班({time_calculation['estimated_off_time']})", 
+                        callback_data=f"confirm_auto_punch_out:{time_calculation['estimated_off_time']}"
+                    )
+                ],
+                [
+                    InlineKeyboardButton("❌ 取消", callback_data="cancel_auto_punch_out")
+                ]
+            ]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            
+            await update.message.reply_text(
+                f"🔔 检测到工作时间不足，是否设置自动下班？\n"
+                f"⏰ 预计下班时间: {time_calculation['estimated_off_time']}\n"
+                f"📊 当前已工作: {time_calculation['worked_minutes']}分钟\n"
+                f"📊 还需工作: {time_calculation['remaining_minutes']}分钟",
+                reply_markup=reply_markup
+            )
+        return message_content
+
+    async def selenium_complete_punch_in_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Selenium完整上班打卡流程命令"""
+        if str(update.message.chat_id) != self.chat_id:
+            await update.message.reply_text("您没有权限使用此机器人")
+            return
+        
+        await self._execute_selenium_complete_flow(
+            update,
+            flow_type="punch_in"
+        )
+
+    async def selenium_complete_punch_out_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Selenium完整下班打卡流程命令"""
+        if str(update.message.chat_id) != self.chat_id:
+            await update.message.reply_text("您没有权限使用此机器人")
+            return
+        
+        await self._execute_selenium_complete_flow(
+            update,
+            flow_type="punch_out",
+            special_handler=self._handle_punch_out_time_confirmation
+        )

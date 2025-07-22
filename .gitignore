@@ -54,4 +54,5 @@ Thumbs.db
 # 项目特定文件
 punch_records/
 screenshots/
-scheduled_tasks.json 
+scheduled_tasks.json
+dynamic_config.json 
