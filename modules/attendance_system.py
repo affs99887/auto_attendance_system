@@ -132,7 +132,6 @@ class AttendanceSystem:
         # Selenium登录配置
         self.use_selenium_login = config.get_use_selenium_login()
         self.selenium_headless = config.get_selenium_headless()
-        self.selenium_controller = None  # 延迟初始化
 
         # 初始化所有服务实例（使用新的导入模块）
         self.email_service = email_service
@@ -773,57 +772,6 @@ class AttendanceSystem:
             logging.error(f"登录流程异常: {str(e)}")
             return (False, screen)
 
-    async def _selenium_login_to_system(self, username, password, context="Selenium登录"):
-        """使用Selenium进行登录的流程
-        
-        Args:
-            username: 用户名
-            password: 密码
-            context: 操作上下文，用于日志记录
-            
-        Returns:
-            tuple: (success: bool, screenshot_data: bytes or None)
-        """
-        screenshot_data = None
-        
-        try:
-            await self.send_notification(context, "开始使用Selenium登录...")
-            
-            # 初始化Selenium控制器
-            if not self.selenium_controller:
-                self.selenium_controller = SeleniumLoginController(
-                    login_url=self.login_url,
-                    headless=self.selenium_headless,
-                    notification_callback=self.send_notification
-                )
-            
-            # 执行登录
-            success, message = await self.selenium_controller.login(username, password)
-            
-            if success:
-                await self.send_notification(context, f"Selenium登录成功: {message}")
-                # 获取截图
-                screenshot_data = self.selenium_controller.take_screenshot()
-                return (True, screenshot_data)
-            else:
-                await self.send_notification(context, f"Selenium登录失败: {message}")
-                # 获取失败时的截图
-                screenshot_data = self.selenium_controller.take_screenshot()
-                return (False, screenshot_data)
-                
-        except Exception as e:
-            error_msg = f"Selenium登录流程发生错误: {str(e)}"
-            await self.send_notification(context, error_msg)
-            logging.error(f"Selenium登录流程异常: {str(e)}")
-            
-            # 尝试获取错误时的截图
-            try:
-                if self.selenium_controller:
-                    screenshot_data = self.selenium_controller.take_screenshot()
-            except:
-                pass
-                
-            return (False, screenshot_data)
 
     async def _unified_login_to_system(self, username, password, context="登录流程"):
         """统一的登录流程，根据配置选择Selenium或传统方式
@@ -837,8 +785,11 @@ class AttendanceSystem:
             tuple: (success: bool, screen_data: numpy.ndarray or bytes or None)
         """
         if self.use_selenium_login:
-            await self.send_notification(context, "使用Selenium登录模式")
-            return await self._selenium_login_to_system(username, password, context)
+            # Selenium模式现在通过_do_selenium_punch完整处理，不应该调用到这里
+            error_msg = "Selenium模式应该使用_do_selenium_punch方法，而不是统一登录流程"
+            await self.send_notification(context, error_msg)
+            logging.error(f"错误的调用路径: {context}")
+            return (False, None)
         else:
             await self.send_notification(context, "使用传统PyAutoGUI登录模式")
             return await self._login_to_system(username, password, context)
@@ -1275,7 +1226,14 @@ class AttendanceSystem:
             self.current_message = f"开始{punch_type}打卡流程 - 用户: {username}"
             self.message_id = None
 
-            # 使用统一的登录流程方法
+            # 根据配置选择打卡模式
+            if self.use_selenium_login:
+                await self.send_notification("打卡流程", f"使用Selenium模式执行{punch_type}打卡")
+                return await self._do_selenium_punch(punch_type, username, password, collect_remaining_time)
+            else:
+                await self.send_notification("打卡流程", f"使用PyAutoGUI模式执行{punch_type}打卡")
+
+            # 使用统一的登录流程方法（PyAutoGUI模式）
             login_success, screen = await self._unified_login_to_system(username, password, "打卡流程")
             if not login_success:
                 error_msg = "登录流程失败，无法进行打卡"
@@ -1736,6 +1694,191 @@ class AttendanceSystem:
 
             return (False, None)
 
+    async def _do_selenium_punch(self, punch_type="上班", username=None, password=None, collect_remaining_time=False):
+        """使用Selenium模式的打卡方法（增强版，支持完整功能）"""
+        from modules.selenium_login import SeleniumLoginController, SeleniumRecordManager
+        
+        flow_type = "punch_in" if punch_type == "上班" else "punch_out"
+        flow_name = punch_type
+        
+        # 创建消息内容追踪
+        message_content = f"🔧 Selenium完整{flow_name}打卡流程开始...\n"
+        status_message = None
+        
+        try:
+            # 发送初始消息
+            try:
+                from telegram import Update
+                # 尝试发送初始状态消息
+                status_message = await self.bot.app.bot.send_message(
+                    chat_id=self.bot.chat_id,
+                    text=message_content
+                )
+            except:
+                # 如果无法发送消息，则使用普通通知
+                await self.send_notification("Selenium打卡", f"开始{flow_name}流程...")
+            
+            # 创建增强的通知回调，支持实时消息更新
+            async def enhanced_notification_callback(context: str, msg: str):
+                nonlocal message_content
+                message_content += f"[{context}] {msg}\n"
+                try:
+                    if status_message:
+                        await status_message.edit_text(message_content)
+                    else:
+                        await self.send_notification(context, msg)
+                except:
+                    pass  # 忽略编辑失败
+            
+            # 创建SeleniumLoginController实例
+            message_content += "📋 正在创建Selenium控制器...\n"
+            if status_message:
+                await status_message.edit_text(message_content)
+            
+            selenium_controller = SeleniumLoginController(
+                login_url=self.login_url,
+                headless=self.selenium_headless,
+                notification_callback=enhanced_notification_callback
+            )
+            
+            # 执行完整打卡流程
+            message_content += f"🚀 开始执行完整{flow_name}打卡流程...\n"
+            if status_message:
+                await status_message.edit_text(message_content)
+            
+            # 根据流程类型选择对应的方法
+            if flow_type == "punch_in":
+                success, message_result, flow_data = await selenium_controller.complete_punch_in_flow(
+                    username=username or self.login_username,
+                    password=password or self.login_password
+                )
+            else:  # punch_out
+                success, message_result, flow_data = await selenium_controller.complete_punch_out_flow(
+                    username=username or self.login_username,
+                    password=password or self.login_password
+                )
+            
+            # 处理流程结果（增强版）
+            if success:
+                message_content += f"✅ 完整{flow_name}流程成功: {message_result}\n"
+                
+                # 显示详细结果
+                if flow_data:
+                    punch_result = flow_data.get('punch_result', {})
+                    if punch_result.get('punched'):
+                        message_content += f"✅ {flow_name}打卡已执行\n"
+                    elif punch_result.get('already_punched'):
+                        message_content += f"ℹ️ 之前已打过{flow_name}卡\n"
+                    
+                    # 显示下班时间确认信息（如果有）
+                    if flow_type == "punch_out":
+                        message_content = await self._display_punch_out_time_info(
+                            message_content, flow_data
+                        )
+                    
+                    # 显示考勤状态
+                    attendance_status = flow_data.get('attendance_status', {})
+                    if attendance_status.get('today'):
+                        message_content += f"📅 今日状态: {attendance_status['today']}\n"
+                
+                # 使用SeleniumRecordManager更新记录
+                record_manager = SeleniumRecordManager(username or "default")
+                current_time = datetime.now()
+                time_str = current_time.strftime('%H:%M:%S')
+                
+                # 更新打卡记录
+                additional_info = {}
+                if flow_data:
+                    additional_info.update(flow_data)
+                    
+                record_manager.update_punch_record(
+                    punch_type=flow_type,
+                    time_str=time_str,
+                    status_data={"success": True, "message": message_result},
+                    additional_info=additional_info
+                )
+                
+                message_content += f"📝 {flow_name}记录已保存\n"
+            else:
+                message_content += f"❌ 完整{flow_name}流程失败: {message_result}\n"
+            
+            # 更新状态：获取截图
+            message_content += "📸 正在获取页面截图...\n"
+            if status_message:
+                await status_message.edit_text(message_content)
+            
+            # 截取最终状态截图
+            screenshot = selenium_controller.take_screenshot()
+            screenshot_data = None
+            
+            if screenshot:
+                message_content += "✅ 截图获取成功\n"
+                if status_message:
+                    await status_message.edit_text(message_content)
+                try:
+                    await self.bot.app.bot.send_photo(
+                        chat_id=self.bot.chat_id,
+                        photo=screenshot,
+                        caption=f"Selenium完整{flow_name}打卡流程结果截图"
+                    )
+                    screenshot_data = screenshot.read() if hasattr(screenshot, 'read') else screenshot
+                except Exception as e:
+                    message_content += f"⚠️ 截图发送失败: {str(e)}\n"
+            else:
+                message_content += "⚠️ 无法获取截图\n"
+            
+            # 关闭浏览器
+            message_content += "🔒 正在关闭浏览器...\n"
+            if status_message:
+                await status_message.edit_text(message_content)
+            selenium_controller.close()
+            
+            message_content += "✅ 完整流程完成！"
+            if status_message:
+                await status_message.edit_text(message_content)
+            
+            return (success, screenshot_data)
+            
+        except Exception as e:
+            error_msg = f"Selenium{flow_name}打卡流程异常: {str(e)}"
+            logging.error(error_msg)
+            message_content += f"❌ 发生错误: {str(e)}\n"
+            
+            # 尝试获取异常截图
+            try:
+                if status_message:
+                    await status_message.edit_text(message_content)
+                if 'selenium_controller' in locals():
+                    screenshot = selenium_controller.take_screenshot()
+                    if screenshot:
+                        await self.bot.app.bot.send_photo(
+                            chat_id=self.bot.chat_id,
+                            photo=screenshot,
+                            caption=f"Selenium完整{flow_name}流程异常截图"
+                        )
+                    selenium_controller.close()
+            except Exception as cleanup_error:
+                logging.error(f"清理Selenium资源时发生错误: {str(cleanup_error)}")
+            
+            return (False, None)
+    
+    async def _display_punch_out_time_info(self, message_content: str, flow_data: dict) -> str:
+        """显示下班打卡的时间信息（基于selenium_login的计算结果）"""
+        time_calculation = flow_data.get('time_calculation')
+        if time_calculation:
+            if time_calculation.get('error'):
+                message_content += f"⚠️ 时间计算异常: {time_calculation['error']}\n"
+            elif time_calculation.get('confirmation_needed'):
+                message_content += "⚠️ 检测到工作时间不足\n"
+                message_content += f"⏰ 预计下班时间: {time_calculation['estimated_off_time']}\n"
+                message_content += f"📊 已工作: {time_calculation['worked_minutes']}分钟\n"
+                message_content += f"📊 还需: {time_calculation['remaining_minutes']}分钟\n"
+                
+                # 注意：时间确认逻辑已在selenium_login中处理，这里只显示信息
+                message_content += "ℹ️ 时间确认已在打卡流程中处理\n"
+        
+        return message_content
+
     async def start_punch_operation(self, operation_type):
         """启动打卡操作（公共接口）"""
         async with self.operation_lock:
@@ -1811,16 +1954,7 @@ class AttendanceSystem:
         try:
             await self.send_notification("系统清理", "正在关闭浏览器...")
             
-            # 优先关闭Selenium浏览器
-            if self.selenium_controller:
-                try:
-                    self.selenium_controller.close()
-                    self.selenium_controller = None
-                    await self.send_notification("系统清理", "Selenium浏览器已关闭")
-                except Exception as e:
-                    logging.error(f"关闭Selenium浏览器失败: {e}")
-            
-            # 然后关闭传统方式的浏览器
+            # 关闭浏览器（新的Selenium实现在各自的方法中管理，无需统一清理）
             browser_closed = self.bot.close_browser()
             if browser_closed:
                 await self.send_notification("系统清理", "传统浏览器已关闭")
