@@ -160,7 +160,7 @@ class TelegramBot:
 
         # 尝试启动打卡操作
         success, message = await self.attendance_system.start_punch_operation("punch_in")
-        
+
         if success:
             await update.message.reply_text(f"✅ 上班打卡操作已启动\n📍 您可以使用 /status 查看进度\n🛑 您可以使用 /stop 终止操作")
         else:
@@ -183,7 +183,7 @@ class TelegramBot:
 
         # 尝试启动打卡操作
         success, message = await self.attendance_system.start_punch_operation("punch_out")
-        
+
         if success:
             await update.message.reply_text(f"✅ 下班打卡操作已启动\n📍 您可以使用 /status 查看进度\n🛑 您可以使用 /stop 终止操作")
         else:
@@ -206,21 +206,21 @@ class TelegramBot:
 
         try:
             await update.message.reply_text("🕐 正在获取当日上班打卡时间...")
-            
+
             # 获取当日上班打卡时间
             success, punch_in_time, message = await self.attendance_system.get_today_punch_in_time()
-            
+
             if not success:
                 await update.message.reply_text(f"❌ 获取上班时间失败：{message}")
                 return
-            
+
             # 计算下班时间
             calc_success, punch_out_time, calc_message = self.attendance_system.calculate_punch_out_time(punch_in_time)
-            
+
             if not calc_success:
                 await update.message.reply_text(f"❌ 计算下班时间失败：{calc_message}")
                 return
-            
+
             # 创建确认按钮
             keyboard = [
                 [
@@ -229,19 +229,19 @@ class TelegramBot:
                 ]
             ]
             reply_markup = InlineKeyboardMarkup(keyboard)
-            
+
             # 发送确认消息
             confirm_message = (
                 f"🎯 自动下班打卡设置\n\n"
                 f"📍 上班时间：{punch_in_time}\n"
                 f"🕐 计算下班时间：{punch_out_time}\n"
-                f"⏰ 工作时长：8小时16分钟\n\n"
+                f"⏰ 工作时长：8小时20分钟（为保证正确打卡）\n\n"
                 f"💡 确认后将自动设置定时任务，到时间后自动执行下班打卡。\n\n"
                 f"请选择操作："
             )
-            
+
             await update.message.reply_text(confirm_message, reply_markup=reply_markup)
-            
+
         except Exception as e:
             error_msg = f"执行auto_byebye命令时发生错误: {str(e)}"
             logging.error(error_msg)
@@ -255,21 +255,21 @@ class TelegramBot:
 
         try:
             await update.message.reply_text("🚀 开始并行登录...")
-            
+
             # 检查系统是否已初始化
             if not self.attendance_system:
                 await update.message.reply_text("❌ 系统未初始化，无法执行并行登录")
                 return
-            
+
             # 准备用户配置
             users_config = self.attendance_system.prepare_users_config_from_env()
-            
+
             if not users_config or len(users_config) < 1:
                 await update.message.reply_text(f"❌ 需要至少1个用户才能执行并行登录\n当前用户数: {len(users_config)}")
                 return
-            
+
             await update.message.reply_text(f"👥 准备并行登录 {len(users_config)} 个用户...")
-            
+
             # 执行并行登录
             start_time = time.time()
             results = await self.attendance_system.parallel_punch_login(
@@ -277,13 +277,13 @@ class TelegramBot:
                 max_concurrent=3  # 最大并发数
             )
             end_time = time.time()
-            
+
             # 统计结果
             total_users = len(results)
             successful_users = sum(1 for success, _ in results.values() if success)
             failed_users = total_users - successful_users
             elapsed_time = end_time - start_time
-            
+
             # 发送结果汇总
             result_msg = (
                 f"🚀 并行登录完成\n\n"
@@ -293,25 +293,25 @@ class TelegramBot:
                 f"⏱️ 用时: {elapsed_time:.2f}秒\n\n"
                 f"📊 详细结果:\n"
             )
-            
+
             for user_id, (success, message) in results.items():
                 status_icon = "✅" if success else "❌"
                 result_msg += f"{status_icon} {user_id}: {message[:50]}{'...' if len(message) > 50 else ''}\n"
-            
+
             await update.message.reply_text(result_msg)
-            
+
             # 如果有失败的用户，提供详细错误信息
             if failed_users > 0:
                 error_details = "❌ 失败详情:\n"
                 for user_id, (success, message) in results.items():
                     if not success:
                         error_details += f"• {user_id}: {message}\n"
-                
+
                 if len(error_details) > 4000:  # Telegram消息长度限制
                     error_details = error_details[:4000] + "\n..."
-                
+
                 await update.message.reply_text(error_details)
-            
+
             # 性能对比信息
             estimated_sequential_time = len(users_config) * 15  # 假设每个用户串行需要15秒
             performance_msg = (
@@ -321,7 +321,7 @@ class TelegramBot:
                 f"提升倍数: {estimated_sequential_time / elapsed_time:.1f}x"
             )
             await update.message.reply_text(performance_msg)
-            
+
         except Exception as e:
             error_msg = f"执行并行登录时发生错误: {str(e)}"
             logging.error(error_msg, exc_info=True)
@@ -332,31 +332,31 @@ class TelegramBot:
         if str(update.message.chat_id) != self.chat_id:
             await update.message.reply_text("您没有权限使用此机器人")
             return
-            
+
         try:
             # 检查系统是否已初始化
             if not self.attendance_system:
                 await update.message.reply_text("❌ 系统未初始化")
                 return
-            
+
             # 获取当前模式状态
             current_use_selenium = self.attendance_system.use_selenium_login
             current_mode = "Selenium无头模式" if current_use_selenium else "传统图像识别模式"
-            
+
             # 切换模式：USE_SELENIUM_LOGIN 和 SELENIUM_HEADLESS 同时切换
             new_use_selenium = not current_use_selenium
             new_headless = new_use_selenium  # Selenium开启时自动开启无头模式
-            
+
             self.attendance_system.use_selenium_login = new_use_selenium
             self.attendance_system.selenium_headless = new_headless
-            
+
             new_mode = "Selenium无头模式" if new_use_selenium else "传统图像识别模式"
-            
+
             # 保存配置到动态配置文件（永久生效）
             from modules.config import config
             config.set_selenium_config('USE_SELENIUM_LOGIN', new_use_selenium)
             config.set_selenium_config('SELENIUM_HEADLESS', new_headless)
-            
+
             response_msg = (
                 f"🔄 登录模式已切换\n\n"
                 f"🔹 原模式: {current_mode}\n"
@@ -368,9 +368,9 @@ class TelegramBot:
                 f"• 📄 配置保存在 dynamic_config.json 文件中\n\n"
                 f"🚀 现在可以使用新的登录模式进行打卡了！"
             )
-            
+
             await update.message.reply_text(response_msg)
-            
+
         except Exception as e:
             error_msg = f"切换登录模式时发生错误: {str(e)}"
             logging.error(error_msg, exc_info=True)
@@ -424,7 +424,7 @@ class TelegramBot:
                     elapsed_minutes = int(elapsed.total_seconds() / 60)
                     elapsed_seconds = int(elapsed.total_seconds() % 60)
                     elapsed_time = f"（已运行 {elapsed_minutes}分{elapsed_seconds}秒）"
-                
+
                 status_text += (
                     "🔄 当前操作状态\n"
                     f"正在执行：{operation_display} {elapsed_time}\n"
@@ -501,18 +501,18 @@ class TelegramBot:
 
             operation_type = self.attendance_system.current_operation
             operation_display = "上班打卡" if operation_type == "punch_in" else "下班打卡"
-            
+
             # 通知用户正在终止操作
             await update.message.reply_text(f"正在终止{operation_display}操作...")
-            
+
             # 调用取消操作方法
             success, message = await self.attendance_system.cancel_current_operation()
-            
+
             if success:
                 await update.message.reply_text(f"✅ {message}")
             else:
                 await update.message.reply_text(f"❌ {message}")
-                
+
         except Exception as e:
             error_msg = f"处理/stop命令时发生错误: {str(e)}"
             logging.error(error_msg)
@@ -972,13 +972,13 @@ class TelegramBot:
     def _save_screenshot_with_rotation(self, screen, username, punch_type, success=True):
         """
         使用滚动保存机制保存截图，确保每个用户每种类型最多保留3张图片
-        
+
         Args:
             screen: cv2截图数据
             username: 用户名
             punch_type: 'punch_in' 或 'punch_out'
             success: 是否成功打卡，用于文件名标识
-        
+
         Returns:
             str: 保存的文件路径，如果失败返回None
         """
@@ -986,27 +986,27 @@ class TelegramBot:
             if not username:
                 logging.warning("用户名为空，跳过滚动保存")
                 return None
-            
+
             # 确定目录和文件名
             # 清理用户名，移除可能导致文件系统问题的字符
             safe_username = "".join(c for c in username if c.isalnum() or c in (' ', '-', '_')).strip()
             if not safe_username:
                 safe_username = "unknown_user"
-            
+
             user_screenshot_dir = os.path.join('screenshots', safe_username, punch_type)
             os.makedirs(user_screenshot_dir, exist_ok=True)
-            
+
             # 生成带时间戳和状态标识的文件名
             timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
             status_suffix = "success" if success else "fail"
             filename = f'{punch_type}_{timestamp}_{status_suffix}.png'
             filepath = os.path.join(user_screenshot_dir, filename)
-            
+
             # 保存新截图
             # 尝试使用绝对路径来解决WSL路径问题
             abs_filepath = os.path.abspath(filepath)
             logging.debug(f"尝试使用绝对路径保存: {repr(abs_filepath)}")
-            
+
             save_result = cv2.imwrite(abs_filepath, screen)
             if save_result:
                 logging.info(f"已保存用户 {username} 的{punch_type}打卡截图到: {abs_filepath}")
@@ -1022,7 +1022,7 @@ class TelegramBot:
                 if screen is not None:
                     logging.error(f"截图数据形状: {screen.shape}")
                 return None
-            
+
             # 获取目录中所有图片文件并按修改时间排序
             image_files = []
             for file in os.listdir(user_screenshot_dir):
@@ -1034,10 +1034,10 @@ class TelegramBot:
                     except Exception as e:
                         logging.warning(f"获取文件 {file_path} 修改时间失败: {e}")
                         continue
-            
+
             # 按修改时间排序，最新的在前
             image_files.sort(key=lambda x: x[1], reverse=True)
-            
+
             # 如果超过3张，删除最旧的图片
             if len(image_files) > 3:
                 files_to_remove = image_files[3:]  # 保留前3张，删除其余的
@@ -1047,9 +1047,9 @@ class TelegramBot:
                         logging.info(f"已删除旧截图文件: {file_path}")
                     except Exception as e:
                         logging.error(f"删除旧截图文件 {file_path} 失败: {e}")
-            
+
             return abs_filepath
-            
+
         except Exception as e:
             logging.error(f"滚动保存截图失败 (用户: {username}, 类型: {punch_type}): {e}")
             return None
@@ -1267,28 +1267,28 @@ class TelegramBot:
             elif query.data.startswith('auto_byebye_confirm_'):
                 # 提取下班时间
                 punch_out_time = query.data.replace('auto_byebye_confirm_', '')
-                
+
                 try:
                     # 验证时间格式
                     datetime.strptime(punch_out_time, '%H:%M:%S')
-                    
+
                     # 设置定时任务
                     await query.message.edit_text("⏳ 正在设置定时任务...")
-                    
+
                     # 计算延迟时间（分钟）
                     current_time = datetime.now()
                     punch_out_datetime = datetime.strptime(punch_out_time, '%H:%M:%S').time()
                     today_punch_out = datetime.combine(current_time.date(), punch_out_datetime)
-                    
+
                     # 如果设定时间已过，则设置为明天
                     if today_punch_out <= current_time:
                         today_punch_out = today_punch_out + timedelta(days=1)
-                    
+
                     delay_minutes = int((today_punch_out - current_time).total_seconds() / 60)
-                    
+
                     # 设置定时任务
                     retry_time = await self.attendance_system.schedule_retry_punch_out(delay_minutes, clear_existing=False)
-                    
+
                     if retry_time:
                         success_message = (
                             f"✅ 自动下班打卡设置成功！\n\n"
@@ -1300,7 +1300,7 @@ class TelegramBot:
                         await query.message.edit_text(success_message)
                     else:
                         await query.message.edit_text("❌ 设置定时任务失败，请稍后重试")
-                        
+
                 except ValueError:
                     await query.message.edit_text("❌ 时间格式错误，操作已取消")
                 except Exception as e:
@@ -1310,34 +1310,34 @@ class TelegramBot:
 
             elif query.data == 'auto_byebye_cancel':
                 await query.message.edit_text("❌ 自动下班打卡设置已取消")
-            
+
             # 处理Selenium完整下班流程的确认按钮
             elif query.data.startswith('confirm_auto_punch_out:'):
                 # 提取下班时间
                 estimated_time = query.data.replace('confirm_auto_punch_out:', '')
-                
+
                 try:
                     # 验证时间格式 (HH:MM)
                     time_obj = datetime.strptime(estimated_time, '%H:%M')
-                    
+
                     # 设置定时任务
                     await query.message.edit_text("⏳ 正在设置自动下班任务...")
-                    
+
                     # 计算目标时间
                     current_time = datetime.now()
                     target_time = datetime.combine(current_time.date(), time_obj.time())
-                    
+
                     # 如果设定时间已过，则设置为明天
                     if target_time <= current_time:
                         target_time = target_time + timedelta(days=1)
-                    
+
                     # 使用专用的Selenium自动下班任务设置方法
                     await self._schedule_selenium_punch_out(
-                        target_time.hour, 
+                        target_time.hour,
                         target_time.minute,
                         estimated_time
                     )
-                    
+
                     success_message = (
                         f"✅ Selenium自动下班打卡设置成功！\n\n"
                         f"🕐 预计下班时间：{estimated_time}\n"
@@ -1347,14 +1347,14 @@ class TelegramBot:
                         f"💡 您可以使用 /kill 查看和管理任务"
                     )
                     await query.message.edit_text(success_message)
-                    
+
                 except ValueError:
                     await query.message.edit_text("❌ 时间格式错误，操作已取消")
                 except Exception as e:
                     error_msg = f"设置自动下班任务时发生错误: {str(e)}"
                     logging.error(error_msg)
                     await query.message.edit_text(f"❌ {error_msg}")
-            
+
             elif query.data == 'cancel_auto_punch_out':
                 await query.message.edit_text("❌ 自动下班打卡设置已取消")
 
@@ -1659,13 +1659,13 @@ class TelegramBot:
         async def selenium_punch_out_job():
             try:
                 await self.send_message(
-                    "⏰ Selenium自动下班", 
+                    "⏰ Selenium自动下班",
                     f"开始执行Selenium自动下班打卡（预计时间：{estimated_time}）"
                 )
-                
+
                 # 使用现有的Selenium下班命令逻辑
                 await self.selenium_complete_punch_out_command(None)
-                
+
             except Exception as e:
                 error_msg = f"Selenium自动下班执行失败: {str(e)}"
                 logging.error(error_msg)
@@ -1676,7 +1676,7 @@ class TelegramBot:
 
         # 使用schedule库设置定时任务
         schedule.every().day.at(time_str).do(lambda: asyncio.create_task(selenium_punch_out_job()))
-        
+
         logging.info(f"已设置Selenium自动下班任务: {target_time.strftime('%Y-%m-%d %H:%M')}")
 
     async def _schedule_punch(self, punch_type, hour, minute):
@@ -1819,16 +1819,16 @@ class TelegramBot:
     async def _execute_selenium_complete_flow(self, update, flow_type: str, special_handler=None):
         """执行Selenium完整打卡流程的通用方法"""
         flow_name = "上班" if flow_type == "punch_in" else "下班"
-        
+
         # 发送初始消息
         status_message = await update.message.reply_text(f"🔧 Selenium完整{flow_name}打卡流程开始...")
         message_content = f"🔧 Selenium完整{flow_name}打卡流程开始...\n"
-        
+
         try:
             # 更新状态：创建控制器
             message_content += "📋 正在创建Selenium控制器...\n"
             await status_message.edit_text(message_content)
-            
+
             # 创建通知回调，用于更新消息
             async def notification_callback(context: str, msg: str):
                 nonlocal message_content
@@ -1837,17 +1837,17 @@ class TelegramBot:
                     await status_message.edit_text(message_content)
                 except:
                     pass  # 忽略编辑失败
-            
+
             selenium_controller = SeleniumLoginController(
                 login_url=config.LOGIN_URL,
                 headless=config.get_selenium_headless(),
                 notification_callback=notification_callback
             )
-            
+
             # 执行完整打卡流程
             message_content += f"🚀 开始执行完整{flow_name}打卡流程...\n"
             await status_message.edit_text(message_content)
-            
+
             # 根据流程类型选择对应的方法
             if flow_type == "punch_in":
                 success, message_result, flow_data = await selenium_controller.complete_punch_in_flow(
@@ -1859,11 +1859,11 @@ class TelegramBot:
                     username=config.LOGIN_USERNAME,
                     password=config.LOGIN_PASSWORD
                 )
-            
+
             # 更新状态：流程完成
             if success:
                 message_content += f"✅ 完整{flow_name}流程成功: {message_result}\n"
-                
+
                 # 显示详细结果
                 if flow_data:
                     punch_result = flow_data.get('punch_result', {})
@@ -1871,25 +1871,25 @@ class TelegramBot:
                         message_content += f"✅ {flow_name}打卡已执行\n"
                     elif punch_result.get('already_punched'):
                         message_content += f"ℹ️ 之前已打过{flow_name}卡\n"
-                    
+
                     # 调用特殊处理函数（如下班打卡的时间确认）
                     if special_handler:
                         message_content = await special_handler(update, message_content, flow_data)
-                    
+
                     # 显示考勤状态
                     attendance_status = flow_data.get('attendance_status', {})
                     if attendance_status.get('today'):
                         message_content += f"📅 今日状态: {attendance_status['today']}\n"
             else:
                 message_content += f"❌ 完整{flow_name}流程失败: {message_result}\n"
-            
+
             # 更新状态：获取截图
             message_content += "📸 正在获取页面截图...\n"
             await status_message.edit_text(message_content)
-            
+
             # 截取最终状态截图
             screenshot = selenium_controller.take_screenshot()
-            
+
             if screenshot:
                 message_content += "✅ 截图获取成功\n"
                 await status_message.edit_text(message_content)
@@ -1897,15 +1897,15 @@ class TelegramBot:
             else:
                 message_content += "⚠️ 无法获取截图\n"
                 await status_message.edit_text(message_content)
-            
+
             # 关闭浏览器
             message_content += "🔒 正在关闭浏览器...\n"
             await status_message.edit_text(message_content)
             selenium_controller.close()
-            
+
             message_content += "✅ 完整流程完成！"
             await status_message.edit_text(message_content)
-            
+
         except Exception as e:
             message_content += f"❌ 发生错误: {str(e)}\n"
             try:
@@ -1916,7 +1916,7 @@ class TelegramBot:
                         await update.message.reply_photo(photo=screenshot, caption=f"Selenium完整{flow_name}流程异常截图")
             except:
                 pass
-    
+
     async def _handle_punch_out_time_confirmation(self, update, message_content: str, flow_data: dict) -> str:
         """处理下班打卡的时间确认逻辑"""
         time_calculation = flow_data.get('time_calculation')
@@ -1925,13 +1925,13 @@ class TelegramBot:
             message_content += f"⏰ 预计下班时间: {time_calculation['estimated_off_time']}\n"
             message_content += f"📊 已工作: {time_calculation['worked_minutes']}分钟\n"
             message_content += f"📊 还需: {time_calculation['remaining_minutes']}分钟\n"
-            
+
             # 创建确认按钮
             from telegram import InlineKeyboardButton, InlineKeyboardMarkup
             keyboard = [
                 [
                     InlineKeyboardButton(
-                        f"✅ 确认设置自动下班({time_calculation['estimated_off_time']})", 
+                        f"✅ 确认设置自动下班({time_calculation['estimated_off_time']})",
                         callback_data=f"confirm_auto_punch_out:{time_calculation['estimated_off_time']}"
                     )
                 ],
@@ -1940,7 +1940,7 @@ class TelegramBot:
                 ]
             ]
             reply_markup = InlineKeyboardMarkup(keyboard)
-            
+
             await update.message.reply_text(
                 f"🔔 检测到工作时间不足，是否设置自动下班？\n"
                 f"⏰ 预计下班时间: {time_calculation['estimated_off_time']}\n"
@@ -1955,7 +1955,7 @@ class TelegramBot:
         if str(update.message.chat_id) != self.chat_id:
             await update.message.reply_text("您没有权限使用此机器人")
             return
-        
+
         await self._execute_selenium_complete_flow(
             update,
             flow_type="punch_in"
@@ -1966,7 +1966,7 @@ class TelegramBot:
         if str(update.message.chat_id) != self.chat_id:
             await update.message.reply_text("您没有权限使用此机器人")
             return
-        
+
         await self._execute_selenium_complete_flow(
             update,
             flow_type="punch_out",

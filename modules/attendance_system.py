@@ -48,7 +48,7 @@ class AttendanceSystem:
     def __init__(self):
         # 静默初始化模式，避免启动时输出过多信息
         self._silent_init = True
-        
+
         # 设置pytesseract路径
         pytesseract.pytesseract.tesseract_cmd = os.getenv('TESSERACT_PATH', r'C:\Program Files\Tesseract-OCR\tesseract.exe')
 
@@ -140,14 +140,14 @@ class AttendanceSystem:
 
         # 确保logs目录存在，用于保存截图
         os.makedirs('logs', exist_ok=True)
-        
+
         # 添加操作状态管理变量
         self.current_operation = None  # 当前操作类型 ("punch_in", "punch_out", None)
         self.operation_task = None  # 当前操作的asyncio.Task对象
         self.operation_cancel_event = None  # 用于取消操作的asyncio.Event
         self.operation_lock = asyncio.Lock()  # 确保互斥的锁
         self.operation_start_time = None  # 操作开始时间
-        
+
         # 初始化完成，取消静默模式
         self._silent_init = False
 
@@ -155,25 +155,25 @@ class AttendanceSystem:
         """根据用户名获取姓氏和合适的敬语称谓"""
         if not username:
             return "用户"
-        
+
         # 提取姓氏（通常是第一个字符）
         surname = username[0] if len(username) > 0 else "用户"
-        
+
         # 根据性别和姓氏添加敬语
         # 这里可以根据实际需要调整敬语规则
         common_male_surnames = ['王', '李', '张', '刘', '陈', '杨', '赵', '黄', '周', '吴']
         common_female_surnames = ['王', '李', '张', '刘', '陈', '杨', '赵', '黄', '周', '吴']
-        
+
         # 简单处理，都使用通用敬语
         return f"{surname}先生/女士"
 
     def _save_screenshot_data(self, screen_data, filepath):
         """保存截图数据到文件
-        
+
         Args:
             screen_data: 截图数据，可能是numpy数组(传统方式)或bytes(Selenium)
             filepath: 保存路径
-            
+
         Returns:
             bool: 是否保存成功
         """
@@ -192,13 +192,13 @@ class AttendanceSystem:
         except Exception as e:
             logging.error(f"保存截图失败: {e}")
             return False
-    
+
     def _convert_screen_data_to_numpy(self, screen_data):
         """将截图数据转换为numpy数组格式
-        
+
         Args:
             screen_data: 截图数据
-            
+
         Returns:
             numpy.ndarray or None: numpy格式的截图数据
         """
@@ -220,13 +220,13 @@ class AttendanceSystem:
     def save_user_screenshot(self, screen, username, punch_type, success=True):
         """
         统一的用户截图保存方法，确保每个用户每种类型最多保留3张图片
-        
+
         Args:
             screen: 截图数据，可能是cv2截图数据(numpy数组)或Selenium截图数据(bytes)
             username: 用户名
             punch_type: 打卡类型 "上班" 或 "下班"
             success: 是否成功打卡，用于文件名标识
-        
+
         Returns:
             str: 保存的文件路径，如果失败返回None
         """
@@ -234,10 +234,10 @@ class AttendanceSystem:
             if not username or screen is None:
                 logging.warning(f"用户名为空或截图数据为空，跳过保存 (username: {username}, screen: {screen is not None})")
                 return None
-            
+
             # 转换打卡类型为目录名
             punch_dir = "punch_in" if punch_type == "上班" else "punch_out"
-            
+
             # 处理用户名，支持中文字符但移除文件系统不安全的字符
             # 移除可能导致文件系统问题的字符，但保留中文字符
             unsafe_chars = ['/', '\\', ':', '*', '?', '"', '<', '>', '|']
@@ -247,27 +247,27 @@ class AttendanceSystem:
             safe_username = safe_username.strip()
             if not safe_username:
                 safe_username = "unknown_user"
-            
+
             # 创建用户截图目录
             user_screenshot_dir = os.path.join('screenshots', safe_username, punch_dir)
             os.makedirs(user_screenshot_dir, exist_ok=True)
-            
+
             # 生成带时间戳和状态标识的文件名
             timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
             status_suffix = "success" if success else "fail"
             filename = f'{punch_dir}_{timestamp}_{status_suffix}.png'
             filepath = os.path.join(user_screenshot_dir, filename)
-            
+
             # 保存新截图，使用支持中文路径的方法
             abs_filepath = os.path.abspath(filepath)
             logging.debug(f"尝试保存用户截图到: {abs_filepath}")
-            
+
             # 使用统一的截图保存方法
             save_result = self._save_screenshot_data(screen, abs_filepath)
-            
+
             if save_result:
                 logging.info(f"已保存用户 {username} 的{punch_type}打卡截图到: {abs_filepath}")
-                
+
                 # 验证文件是否存在
                 if os.path.exists(abs_filepath):
                     file_size = os.path.getsize(abs_filepath)
@@ -284,16 +284,16 @@ class AttendanceSystem:
                     logging.error(f"截图数据形状: {screen.shape}")
                     logging.error(f"截图数据类型: {screen.dtype}")
                 return None
-            
+
             # 清理旧截图，只保留最新3张
             try:
                 import glob
                 pattern = os.path.join(user_screenshot_dir, '*.png')
                 files = glob.glob(pattern)
-                
+
                 # 按修改时间排序，最新的在前
                 files.sort(key=os.path.getmtime, reverse=True)
-                
+
                 # 如果超过3张，删除最旧的图片
                 if len(files) > 3:
                     files_to_remove = files[3:]  # 保留前3张，删除其余的
@@ -305,9 +305,9 @@ class AttendanceSystem:
                             logging.error(f"删除旧截图文件 {old_file} 失败: {e}")
             except Exception as e:
                 logging.warning(f"清理旧截图文件时发生错误: {e}")
-            
+
             return abs_filepath
-            
+
         except Exception as e:
             logging.error(f"保存用户截图失败 (用户: {username}, 类型: {punch_type}): {e}")
             return None
@@ -523,7 +523,7 @@ class AttendanceSystem:
             thresholds = [0.7, 0.6, 0.5, 0.4]
         else:
             thresholds = [threshold]
-        
+
         for attempt in range(self.max_retries):
             screen = self.take_screenshot()
             if screen is None:
@@ -551,11 +551,11 @@ class AttendanceSystem:
                         # 返回相对于屏幕的绝对坐标
                         center_x = window_x + max_loc[0] + template_width // 2
                         center_y = window_y + max_loc[1] + template_height // 2
-                        
+
                         # 记录匹配结果和阈值，便于调试
                         if 'unable_escape.png' in template_path or 'left_time.png' in template_path:
                             logging.info(f"模板匹配成功 {template_path}：置信度={max_val:.3f}, 使用阈值={thresh}")
-                        
+
                         return (center_x, center_y)
 
             if attempt < self.max_retries - 1:
@@ -565,7 +565,7 @@ class AttendanceSystem:
         # 记录最终匹配失败的详细信息
         if 'unable_escape.png' in template_path or 'left_time.png' in template_path:
             logging.warning(f"关键模板匹配失败 {template_path}：最高置信度={max_val:.3f}, 尝试次数={self.max_retries}")
-        
+
         return None
 
     def find_element_with_label(self, template_path, label_template_path, threshold=0.8):
@@ -681,17 +681,17 @@ class AttendanceSystem:
 
     async def _login_to_system(self, username, password, context="打卡流程"):
         """完整的登录流程，包括打开浏览器、处理警告弹窗和登录
-        
+
         Args:
             username: 用户名
             password: 密码
             context: 操作上下文，用于日志记录
-            
+
         Returns:
             tuple: (success: bool, screen: numpy.ndarray or None)
         """
         screen = None
-        
+
         try:
             # 使用 Edge InPrivate 模式打开新窗口
             await self.send_notification(context, "开始打开浏览器...")
@@ -775,12 +775,12 @@ class AttendanceSystem:
 
     async def _unified_login_to_system(self, username, password, context="登录流程"):
         """统一的登录流程，根据配置选择Selenium或传统方式
-        
+
         Args:
             username: 用户名
             password: 密码
             context: 操作上下文，用于日志记录
-            
+
         Returns:
             tuple: (success: bool, screen_data: numpy.ndarray or bytes or None)
         """
@@ -897,7 +897,7 @@ class AttendanceSystem:
                 ]
 
                 # 临时保存用于OCR
-                
+
                 # 增强图像预处理提高OCR准确性
                 # 转换为灰度
                 gray = cv2.cvtColor(time_region, cv2.COLOR_BGR2GRAY)
@@ -905,13 +905,13 @@ class AttendanceSystem:
                 _, binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
                 # 去噪
                 denoised = cv2.medianBlur(binary, 3)
-                
+
                 # 保存临时文件用于OCR
                 temp_path = 'temp_time_region.png'
                 cv2.imwrite(temp_path, denoised)
 
                 await self.send_notification("时间识别", "开始OCR识别...")
-                
+
                 # 尝试多种OCR配置
                 ocr_configs = [
                     r'--oem 3 --psm 6 -c preserve_interword_spaces=1',
@@ -919,7 +919,7 @@ class AttendanceSystem:
                     r'--oem 3 --psm 8',
                     r'--oem 1 --psm 6'
                 ]
-                
+
                 time_text = None
                 for i, config in enumerate(ocr_configs):
                     try:
@@ -929,12 +929,12 @@ class AttendanceSystem:
                             lang='chi_sim',
                             config=config
                         ).strip()
-                        
+
                         if text and any(char in text for char in ['时', '分', '小', '钟']):
                             time_text = text
                             logging.info(f"OCR配置{i+1}识别成功: {text}")
                             break
-                        
+
                         # 如果预处理图像失败，尝试原始图像
                         temp_original_path = 'temp_time_region_original.png'
                         cv2.imwrite(temp_original_path, time_region)
@@ -943,15 +943,15 @@ class AttendanceSystem:
                             lang='chi_sim',
                             config=config
                         ).strip()
-                        
+
                         if text and any(char in text for char in ['时', '分', '小', '钟']):
                             time_text = text
                             logging.info(f"OCR配置{i+1}（原始图像）识别成功: {text}")
                             os.remove(temp_original_path)
                             break
-                        
+
                         os.remove(temp_original_path)
-                            
+
                     except Exception as e:
                         logging.warning(f"OCR配置{i+1}失败: {e}")
                         continue
@@ -975,7 +975,7 @@ class AttendanceSystem:
                     r'(\d+).*?(\d+)\s*分',                       # 简化模式
                     r'(\d+)[时時].*?(\d+)[分鐘]'                  # 更紧凑的模式
                 ]
-                
+
                 time_match = None
                 for pattern in time_patterns:
                     time_match = re.search(pattern, time_text)
@@ -999,7 +999,7 @@ class AttendanceSystem:
                         remaining_hours = remaining_minutes // 60
                         remaining_mins = remaining_minutes % 60
                         result = f"{remaining_hours}小时{remaining_mins}分钟"
-                    
+
                     await self.send_notification("时间识别", f"计算结果 - 还需工作: {result}")
                     return result
                 else:
@@ -1322,9 +1322,9 @@ class AttendanceSystem:
                 else:  # 下班打卡
                     # 检查是否存在unable_escape情况
                     await self.send_notification("打卡流程", "检查是否满足下班条件...")
-                    
+
                     unable_escape_loc = self.find_element_by_image('templates/unable_escape.png')
-                    
+
                     # 获取模板匹配的置信度信息（通过重新匹配）
                     unable_escape_confidence = 0.0
                     try:
@@ -1336,7 +1336,7 @@ class AttendanceSystem:
                             logging.info(f"unable_escape模板匹配置信度: {unable_escape_confidence:.3f}")
                     except Exception as e:
                         logging.warning(f"无法获取unable_escape置信度: {e}")
-                    
+
                     if unable_escape_loc:
                         await self.send_notification("打卡流程", f"检测到下班限制（置信度: {unable_escape_confidence:.3f}）")
                         # 获取剩余工作时间
@@ -1415,19 +1415,19 @@ class AttendanceSystem:
                     else:
                         # 【关键修复】采用保守策略：仅在明确验证可以下班时才认为成功
                         # 如果unable_escape置信度较低，可能是匹配失败，需要进一步验证
-                        
+
                         # 保守策略判断：如果置信度太低，认为状态不确定
                         if unable_escape_confidence > 0.3:  # 存在一定的unable_escape特征
                             error_msg = f"下班状态不确定（unable_escape置信度: {unable_escape_confidence:.3f}），采用保守策略"
                             await self.send_notification("打卡流程", error_msg)
                             logging.warning(f"下班打卡状态不确定，置信度: {unable_escape_confidence:.3f}，采用保守策略拒绝")
-                            
+
                             return (False, f"状态不确定，置信度{unable_escape_confidence:.3f}")
-                        
+
                         # 置信度很低，认为确实没有unable_escape，可以下班
                         await self.send_notification("打卡流程", f"确认可以下班（置信度: {unable_escape_confidence:.3f}）")
                         logging.info(f"确认可以下班，unable_escape置信度很低: {unable_escape_confidence:.3f}")
-                        
+
                         # 进行下班成功的处理
                         if self._is_early_leave(current_time):
                             await self.send_notification(
@@ -1463,12 +1463,12 @@ class AttendanceSystem:
                     # 打卡成功后获取最终截图
                     final_screen = self.take_screenshot()
                     screenshot_data = final_screen if final_screen is not None else screen
-                    
+
                     if screenshot_data is not None:
                         # 生成logs文件夹中的结果图片
                         screenshot_path = f'logs/punch_{"in" if punch_type == "上班" else "out"}_result.png'
                         cv2.imwrite(screenshot_path, screenshot_data)
-                        
+
                         # 保存成功截图到用户目录
                         self.save_user_screenshot(screenshot_data, username, punch_type, success=True)
                     else:
@@ -1697,14 +1697,14 @@ class AttendanceSystem:
     async def _do_selenium_punch(self, punch_type="上班", username=None, password=None, collect_remaining_time=False):
         """使用Selenium模式的打卡方法（增强版，支持完整功能）"""
         from modules.selenium_login import SeleniumLoginController, SeleniumRecordManager
-        
+
         flow_type = "punch_in" if punch_type == "上班" else "punch_out"
         flow_name = punch_type
-        
+
         # 创建消息内容追踪
         message_content = f"🔧 Selenium完整{flow_name}打卡流程开始...\n"
         status_message = None
-        
+
         try:
             # 发送初始消息
             try:
@@ -1717,7 +1717,7 @@ class AttendanceSystem:
             except:
                 # 如果无法发送消息，则使用普通通知
                 await self.send_notification("Selenium打卡", f"开始{flow_name}流程...")
-            
+
             # 创建增强的通知回调，支持实时消息更新
             async def enhanced_notification_callback(context: str, msg: str):
                 nonlocal message_content
@@ -1729,23 +1729,23 @@ class AttendanceSystem:
                         await self.send_notification(context, msg)
                 except:
                     pass  # 忽略编辑失败
-            
+
             # 创建SeleniumLoginController实例
             message_content += "📋 正在创建Selenium控制器...\n"
             if status_message:
                 await status_message.edit_text(message_content)
-            
+
             selenium_controller = SeleniumLoginController(
                 login_url=self.login_url,
                 headless=self.selenium_headless,
                 notification_callback=enhanced_notification_callback
             )
-            
+
             # 执行完整打卡流程
             message_content += f"🚀 开始执行完整{flow_name}打卡流程...\n"
             if status_message:
                 await status_message.edit_text(message_content)
-            
+
             # 根据流程类型选择对应的方法
             if flow_type == "punch_in":
                 success, message_result, flow_data = await selenium_controller.complete_punch_in_flow(
@@ -1757,11 +1757,11 @@ class AttendanceSystem:
                     username=username or self.login_username,
                     password=password or self.login_password
                 )
-            
+
             # 处理流程结果（增强版）
             if success:
                 message_content += f"✅ 完整{flow_name}流程成功: {message_result}\n"
-                
+
                 # 显示详细结果
                 if flow_data:
                     punch_result = flow_data.get('punch_result', {})
@@ -1769,48 +1769,48 @@ class AttendanceSystem:
                         message_content += f"✅ {flow_name}打卡已执行\n"
                     elif punch_result.get('already_punched'):
                         message_content += f"ℹ️ 之前已打过{flow_name}卡\n"
-                    
+
                     # 显示下班时间确认信息（如果有）
                     if flow_type == "punch_out":
                         message_content = await self._display_punch_out_time_info(
                             message_content, flow_data
                         )
-                    
+
                     # 显示考勤状态
                     attendance_status = flow_data.get('attendance_status', {})
                     if attendance_status.get('today'):
                         message_content += f"📅 今日状态: {attendance_status['today']}\n"
-                
+
                 # 使用SeleniumRecordManager更新记录
                 record_manager = SeleniumRecordManager(username or "default")
                 current_time = datetime.now()
                 time_str = current_time.strftime('%H:%M:%S')
-                
+
                 # 更新打卡记录
                 additional_info = {}
                 if flow_data:
                     additional_info.update(flow_data)
-                    
+
                 record_manager.update_punch_record(
                     punch_type=flow_type,
                     time_str=time_str,
                     status_data={"success": True, "message": message_result},
                     additional_info=additional_info
                 )
-                
+
                 message_content += f"📝 {flow_name}记录已保存\n"
             else:
                 message_content += f"❌ 完整{flow_name}流程失败: {message_result}\n"
-            
+
             # 更新状态：获取截图
             message_content += "📸 正在获取页面截图...\n"
             if status_message:
                 await status_message.edit_text(message_content)
-            
+
             # 截取最终状态截图
             screenshot = selenium_controller.take_screenshot()
             screenshot_data = None
-            
+
             if screenshot:
                 message_content += "✅ 截图获取成功\n"
                 if status_message:
@@ -1826,24 +1826,24 @@ class AttendanceSystem:
                     message_content += f"⚠️ 截图发送失败: {str(e)}\n"
             else:
                 message_content += "⚠️ 无法获取截图\n"
-            
+
             # 关闭浏览器
             message_content += "🔒 正在关闭浏览器...\n"
             if status_message:
                 await status_message.edit_text(message_content)
             selenium_controller.close()
-            
+
             message_content += "✅ 完整流程完成！"
             if status_message:
                 await status_message.edit_text(message_content)
-            
+
             return (success, screenshot_data)
-            
+
         except Exception as e:
             error_msg = f"Selenium{flow_name}打卡流程异常: {str(e)}"
             logging.error(error_msg)
             message_content += f"❌ 发生错误: {str(e)}\n"
-            
+
             # 尝试获取异常截图
             try:
                 if status_message:
@@ -1859,9 +1859,9 @@ class AttendanceSystem:
                     selenium_controller.close()
             except Exception as cleanup_error:
                 logging.error(f"清理Selenium资源时发生错误: {str(cleanup_error)}")
-            
+
             return (False, None)
-    
+
     async def _display_punch_out_time_info(self, message_content: str, flow_data: dict) -> str:
         """显示下班打卡的时间信息（基于selenium_login的计算结果）"""
         time_calculation = flow_data.get('time_calculation')
@@ -1873,10 +1873,10 @@ class AttendanceSystem:
                 message_content += f"⏰ 预计下班时间: {time_calculation['estimated_off_time']}\n"
                 message_content += f"📊 已工作: {time_calculation['worked_minutes']}分钟\n"
                 message_content += f"📊 还需: {time_calculation['remaining_minutes']}分钟\n"
-                
+
                 # 注意：时间确认逻辑已在selenium_login中处理，这里只显示信息
                 message_content += "ℹ️ 时间确认已在打卡流程中处理\n"
-        
+
         return message_content
 
     async def start_punch_operation(self, operation_type):
@@ -1884,12 +1884,12 @@ class AttendanceSystem:
         async with self.operation_lock:
             if self.current_operation is not None:
                 return False, f"当前已有{self.current_operation}操作正在进行中，请等待完成或使用/stop命令取消"
-            
+
             # 设置操作状态
             self.current_operation = operation_type
             self.operation_start_time = datetime.now()
             self.operation_cancel_event = asyncio.Event()
-            
+
             # 启动后台任务
             if operation_type == "punch_in":
                 self.operation_task = asyncio.create_task(self.punch_in_internal(self.operation_cancel_event))
@@ -1900,10 +1900,10 @@ class AttendanceSystem:
                 self.operation_start_time = None
                 self.operation_cancel_event = None
                 return False, "无效的操作类型"
-            
+
             # 添加任务完成回调
             self.operation_task.add_done_callback(self._operation_completed_callback)
-            
+
             return True, f"{operation_type}操作已启动"
 
     def _operation_completed_callback(self, task):
@@ -1921,13 +1921,13 @@ class AttendanceSystem:
         """取消当前操作"""
         if self.current_operation is None:
             return False, "当前没有进行中的操作"
-        
+
         operation_type = self.current_operation
-        
+
         # 设置取消事件
         if self.operation_cancel_event:
             self.operation_cancel_event.set()
-        
+
         # 等待任务完成（取消）
         if self.operation_task and not self.operation_task.done():
             try:
@@ -1940,27 +1940,27 @@ class AttendanceSystem:
                         await self.operation_task
                     except asyncio.CancelledError:
                         pass
-        
+
         # 确保浏览器被关闭
         await self.cleanup_browser()
-        
+
         # 清理状态
         await self._cleanup_operation_state()
-        
+
         return True, f"{operation_type}操作已取消"
 
     async def cleanup_browser(self):
         """清理浏览器资源"""
         try:
             await self.send_notification("系统清理", "正在关闭浏览器...")
-            
+
             # 关闭浏览器（新的Selenium实现在各自的方法中管理，无需统一清理）
             browser_closed = self.bot.close_browser()
             if browser_closed:
                 await self.send_notification("系统清理", "传统浏览器已关闭")
             else:
                 await self.send_notification("系统清理", "传统浏览器关闭失败，可能需要手动关闭")
-                
+
         except Exception as e:
             logging.error(f"清理浏览器时发生错误: {e}")
 
@@ -2479,7 +2479,7 @@ class AttendanceSystem:
             # 根据打卡结果决定是否发送给所有用户
             # 如果是失败、错误相关的打卡，发送给所有用户
             send_to_all = any(keyword in punch_type for keyword in ["失败", "错误", "异常"])
-            
+
             # 异步发送邮件
             self.email_service.send_email_async(
                 subject=subject,
@@ -2500,7 +2500,7 @@ class AttendanceSystem:
 
     async def get_today_punch_in_time(self):
         """获取当日上班打卡时间，支持从记录和页面识别两种方式
-        
+
         Returns:
             tuple: (success: bool, punch_in_time: str or None, message: str)
         """
@@ -2510,24 +2510,24 @@ class AttendanceSystem:
             if today_record and today_record.get('punch_in_time'):
                 punch_in_time = today_record['punch_in_time']
                 return (True, punch_in_time, f"从本地记录获取到上班时间: {punch_in_time}")
-            
+
             # 方法2：如果本地没有记录，登录系统页面识别
             logging.info("本地没有上班打卡记录，尝试从系统页面识别")
             await self.send_notification("时间识别", "本地没有上班打卡记录，正在登录系统页面识别...")
-            
+
             # 使用第一个用户的凭据登录
             if not self.users or len(self.users) == 0:
                 return (False, None, "未配置用户信息，无法登录系统")
-            
+
             user = self.users[0]  # 使用第一个用户
             username = user.get('username')
             password = user.get('password')
-            
+
             # 执行登录流程
             login_success, screen = await self._login_to_system(username, password, "时间识别")
             if not login_success:
                 return (False, None, "登录系统失败，无法识别页面打卡记录")
-            
+
             # 从页面识别打卡记录
             records_found = await self.get_punch_records_from_page()
             if records_found:
@@ -2535,19 +2535,19 @@ class AttendanceSystem:
                 updated_record = self.punch_record_manager.get_today_record()
                 if updated_record and updated_record.get('punch_in_time'):
                     punch_in_time = updated_record['punch_in_time']
-                    
+
                     # 关闭浏览器
                     if self.bot.close_browser():
                         await self.send_notification("时间识别", "页面识别完成，浏览器已关闭")
-                    
+
                     return (True, punch_in_time, f"从系统页面识别到上班时间: {punch_in_time}")
-            
+
             # 关闭浏览器
             if self.bot.close_browser():
                 await self.send_notification("时间识别", "页面识别未成功，浏览器已关闭")
-            
+
             return (False, None, "系统页面未找到今日上班打卡记录")
-            
+
         except Exception as e:
             error_msg = f"获取上班打卡时间时发生错误: {str(e)}"
             logging.error(error_msg)
@@ -2555,11 +2555,11 @@ class AttendanceSystem:
             return (False, None, error_msg)
 
     def calculate_punch_out_time(self, punch_in_time_str):
-        """根据上班时间计算下班时间（8小时16分钟后）
-        
+        """根据上班时间计算下班时间（8小时20分钟后）
+
         Args:
             punch_in_time_str: 上班时间字符串，格式如 "08:30:00" 或 "08:30"
-            
+
         Returns:
             tuple: (success: bool, punch_out_time_str: str, message: str)
         """
@@ -2567,22 +2567,22 @@ class AttendanceSystem:
             # 处理时间格式
             if len(punch_in_time_str.split(':')) == 2:
                 punch_in_time_str += ':00'  # 补充秒数
-            
+
             # 解析上班时间
             punch_in_time = datetime.strptime(punch_in_time_str, '%H:%M:%S').time()
-            
+
             # 计算下班时间（8小时16分钟后）
             today = datetime.now().date()
             punch_in_datetime = datetime.combine(today, punch_in_time)
-            punch_out_datetime = punch_in_datetime + timedelta(hours=8, minutes=16)
-            
+            punch_out_datetime = punch_in_datetime + timedelta(hours=8, minutes=20)
+
             punch_out_time_str = punch_out_datetime.strftime('%H:%M:%S')
-            
+
             message = f"根据上班时间 {punch_in_time_str} 计算得出下班时间: {punch_out_time_str}"
             logging.info(message)
-            
+
             return (True, punch_out_time_str, message)
-            
+
         except Exception as e:
             error_msg = f"计算下班时间时发生错误: {str(e)}"
             logging.error(error_msg)
@@ -2623,17 +2623,17 @@ class AttendanceSystem:
     async def parallel_punch_login(self, users_config: List[Dict[str, str]], max_concurrent: int = 3) -> Dict[str, Tuple[bool, str]]:
         """
         并行执行多用户登录
-        
+
         Args:
             users_config: 用户配置列表，格式: [{'user_id': '', 'username': '', 'password': ''}, ...]
             max_concurrent: 最大并发数，默认3个
-            
+
         Returns:
             Dict[str, Tuple[bool, str]]: 每个用户的登录结果
         """
         try:
             await self.send_notification("并行登录", f"开始并行登录 {len(users_config)} 个用户")
-            
+
             # 创建并行登录管理器
             parallel_login = ParallelSeleniumLogin(
                 login_url=self.login_url,
@@ -2641,50 +2641,50 @@ class AttendanceSystem:
                 notification_callback=self.send_notification,
                 browser_type="edge"
             )
-            
+
             # 执行并行登录
             results = await parallel_login.parallel_login(
                 users=users_config,
                 max_concurrent=max_concurrent
             )
-            
+
             # 记录结果
             success_users = [user_id for user_id, (success, _) in results.items() if success]
             failed_users = [user_id for user_id, (success, _) in results.items() if not success]
-            
+
             await self.send_notification(
                 "并行登录完成",
                 f"✅ 成功: {len(success_users)} 个\n❌ 失败: {len(failed_users)} 个"
             )
-            
+
             if failed_users:
                 failed_details = []
                 for user_id in failed_users:
                     _, error_msg = results[user_id]
                     failed_details.append(f"• {user_id}: {error_msg}")
-                
+
                 await self.send_notification(
                     "登录失败详情",
                     "\n".join(failed_details[:5])  # 只显示前5个失败详情
                 )
-            
+
             return results
-            
+
         except Exception as e:
             error_msg = f"并行登录异常: {str(e)}"
             logging.error(error_msg, exc_info=True)
             await self.send_notification("并行登录异常", error_msg)
             return {user['user_id']: (False, error_msg) for user in users_config}
-    
+
     def prepare_users_config_from_env(self) -> List[Dict[str, str]]:
         """
         从环境变量中准备用户配置
-        
+
         Returns:
             List[Dict[str, str]]: 用户配置列表
         """
         users = []
-        
+
         # 直接使用现有的用户配置
         for i, user in enumerate(self.users):
             if user.get('username') and user.get('password'):
@@ -2693,5 +2693,5 @@ class AttendanceSystem:
                     'username': user['username'],
                     'password': user['password']
                 })
-        
+
         return users
