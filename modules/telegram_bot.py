@@ -1243,9 +1243,50 @@ class TelegramBot:
                 })
 
                 if mode == 'delay':
-                    await query.message.edit_text("请输入要延迟的分钟数：")
+                    # 创建快速选择按钮
+                    keyboard = [
+                        [
+                            InlineKeyboardButton("1分钟", callback_data=f'delay_quick_1_{punch_type}'),
+                            InlineKeyboardButton("2分钟", callback_data=f'delay_quick_2_{punch_type}'),
+                            InlineKeyboardButton("3分钟", callback_data=f'delay_quick_3_{punch_type}')
+                        ],
+                        [
+                            InlineKeyboardButton("4分钟", callback_data=f'delay_quick_4_{punch_type}'),
+                            InlineKeyboardButton("5分钟", callback_data=f'delay_quick_5_{punch_type}')
+                        ],
+                        [
+                            InlineKeyboardButton("手动输入", callback_data=f'delay_manual_{punch_type}')
+                        ]
+                    ]
+                    reply_markup = InlineKeyboardMarkup(keyboard)
+                    await query.message.edit_text(
+                        "请选择延迟时间：",
+                        reply_markup=reply_markup
+                    )
                 else:
                     await query.message.edit_text("请输入小时数（0-23）：")
+
+            # 处理快速延时选择回调
+            elif query.data.startswith('delay_quick_'):
+                parts = query.data.split('_')
+                delay_minutes = int(parts[2])
+                punch_type = parts[3]
+                
+                # 计算目标时间
+                target_time = datetime.now() + timedelta(minutes=delay_minutes)
+                await self._schedule_punch(punch_type, target_time.hour, target_time.minute)
+                
+                # 清理状态
+                if self.chat_id in self.setting_time_state:
+                    del self.setting_time_state[self.chat_id]
+                    
+                await query.answer(f"已设置{delay_minutes}分钟后执行{punch_type}")
+
+            # 处理手动输入延时回调
+            elif query.data.startswith('delay_manual_'):
+                punch_type = query.data.split('_')[2]
+                self.setting_time_state[self.chat_id]['step'] = 'input_delay'
+                await query.message.edit_text("请输入要延迟的分钟数：")
 
             # 处理查看打卡图片的回调
             elif query.data == 'check_punch_in':
