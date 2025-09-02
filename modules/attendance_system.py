@@ -185,7 +185,25 @@ class AttendanceSystem:
                 return True
             elif isinstance(screen_data, np.ndarray):
                 # OpenCV截图数据 (numpy数组)
-                return cv2.imwrite(filepath, screen_data)
+                # cv2.imwrite在Windows下可能无法处理中文路径，使用imencode+write方式
+                try:
+                    # 先尝试直接使用cv2.imwrite
+                    result = cv2.imwrite(filepath, screen_data)
+                    if result:
+                        return True
+                    else:
+                        # 如果失败，使用备用方法：imencode + write
+                        _, img_encoded = cv2.imencode('.png', screen_data)
+                        with open(filepath, 'wb') as f:
+                            f.write(img_encoded.tobytes())
+                        return True
+                except Exception as e:
+                    # 最后的备用方法：使用numpy和PIL
+                    logging.warning(f"cv2.imwrite失败，尝试备用方法: {e}")
+                    _, img_encoded = cv2.imencode('.png', screen_data)
+                    with open(filepath, 'wb') as f:
+                        f.write(img_encoded.tobytes())
+                    return True
             else:
                 logging.error(f"不支持的截图数据类型: {type(screen_data)}")
                 return False
@@ -272,6 +290,7 @@ class AttendanceSystem:
                 if os.path.exists(abs_filepath):
                     file_size = os.path.getsize(abs_filepath)
                     logging.info(f"截图文件大小: {file_size} bytes")
+                    logging.info(f"截图成功保存到用户目录: screenshots/{safe_username}/{punch_dir}/{filename}")
                 else:
                     logging.error(f"截图文件保存后不存在: {abs_filepath}")
                     return None
@@ -280,7 +299,7 @@ class AttendanceSystem:
                 logging.error(f"原始用户名: {username}")
                 logging.error(f"安全用户名: {safe_username}")
                 logging.error(f"文件路径: {abs_filepath}")
-                if screen is not None:
+                if screen is not None and hasattr(screen, 'shape'):
                     logging.error(f"截图数据形状: {screen.shape}")
                     logging.error(f"截图数据类型: {screen.dtype}")
                 return None
@@ -311,6 +330,62 @@ class AttendanceSystem:
         except Exception as e:
             logging.error(f"保存用户截图失败 (用户: {username}, 类型: {punch_type}): {e}")
             return None
+
+    async def _send_punch_failure_screenshot(self, screen, username, punch_type, error_msg):
+        """发送打卡失败截图的辅助方法
+        
+        Args:
+            screen: 截图数据
+            username: 用户名
+            punch_type: 打卡类型 "上班" 或 "下班"
+            error_msg: 错误消息
+        """
+        try:
+            # 保存并发送当前的浏览器窗口截图
+            screenshot_path = f'punch_{punch_type}_fail_uncertain.png'
+            cv2.imwrite(screenshot_path, screen)
+
+            # 保存失败截图到用户目录
+            self.save_user_screenshot(screen, username, punch_type, success=False)
+
+            # 发送Telegram消息
+            with open(screenshot_path, 'rb') as photo:
+                await self.bot.app.bot.send_photo(
+                    chat_id=self.bot.chat_id,
+                    photo=photo,
+                    caption=f"{punch_type}打卡失败 - {error_msg}"
+                )
+
+            # 发送电子邮件通知
+            surname = self.get_surname_honorific(username)
+            email_subject = f"{punch_type}打卡失败通知 - {surname} - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+            email_body = f"{surname}您好，\n\n您的{punch_type}打卡尝试失败。\n\n原因：{error_msg}\n\n系统会在适当时间自动重试。\n\n此邮件由自动打卡系统发送，请勿回复。"
+
+            # 复制截图用于邮件发送
+            email_screenshot_path = f'logs/punch_{punch_type}_fail_email.png'
+            with open(screenshot_path, 'rb') as f_in:
+                img_data = f_in.read()
+                with open(email_screenshot_path, 'wb') as f_out:
+                    f_out.write(img_data)
+
+            # 发送邮件
+            await self.send_email_with_attachment(email_subject, email_body, email_screenshot_path, f"{punch_type}(失败)")
+
+            # 删除临时文件
+            os.remove(screenshot_path)
+            if os.path.exists(email_screenshot_path):
+                os.remove(email_screenshot_path)
+
+        except Exception as e:
+            error_type = type(e).__name__
+            error_msg_detail = str(e)
+
+            # 检查是否是HTTPXRequest初始化错误
+            if "HTTPXRequest" in error_msg_detail and "not initialized" in error_msg_detail:
+                self.bot._is_initialized = False
+                await self.send_notification("打卡流程", f"通知发送失败 (HTTPXRequest错误): {error_msg_detail}")
+            else:
+                await self.send_notification("打卡流程", f"通知发送失败: {error_msg_detail}")
 
     def setup_logging(self):
         """配置日志记录"""
@@ -1418,30 +1493,67 @@ class AttendanceSystem:
 
                         # 保守策略判断：如果置信度太低，认为状态不确定
                         if unable_escape_confidence > 0.3:  # 存在一定的unable_escape特征
-                            error_msg = f"下班状态不确定（unable_escape置信度: {unable_escape_confidence:.3f}），采用保守策略"
+                            error_msg = f"下班状态不确定（unable_escape置信度: {unable_escape_confidence:.3f}），通过页面记录进一步验证"
                             await self.send_notification("打卡流程", error_msg)
-                            logging.warning(f"下班打卡状态不确定，置信度: {unable_escape_confidence:.3f}，采用保守策略拒绝")
+                            logging.warning(f"下班打卡状态不确定，置信度: {unable_escape_confidence:.3f}，检查页面记录")
+                            
+                            # 尝试从页面获取今日打卡记录来验证下班状态
+                            await self.send_notification("打卡流程", "检查页面上的今日下班打卡记录...")
+                            try:
+                                # 复用现有的get_punch_records_from_page方法
+                                await self.get_punch_records_from_page()
+                                
+                                # 检查今日是否已有下班记录
+                                today_record = self.punch_record_manager.get_today_record()
+                                has_punch_out_today = bool(today_record and today_record.get('punch_out_time'))
+                                
+                                if has_punch_out_today:
+                                    # 今日已有下班记录，说明已经完成下班打卡
+                                    await self.send_notification("打卡流程", f"页面显示今日已完成下班打卡: {today_record.get('punch_out_time')}")
+                                    logging.info("通过页面记录确认今日已下班打卡")
+                                    
+                                    # 更新内存中的记录
+                                    self.today_punch_records['punch_out_time'] = current_time
+                                    punch_success = True
+                                else:
+                                    # 未找到下班记录，确认无法下班
+                                    error_msg = f"页面未显示今日下班记录，确认未满足下班条件（置信度: {unable_escape_confidence:.3f}）"
+                                    await self.send_notification("打卡流程", error_msg)
+                                    logging.warning("通过页面记录确认未满足下班条件")
+                                    
+                                    # 发送截图 - 状态不确定的情况
+                                    await self._send_punch_failure_screenshot(screen, username, punch_type, error_msg)
+                                    
+                                    return (False, f"状态不确定，置信度{unable_escape_confidence:.3f}，页面无下班记录")
+                                    
+                            except Exception as e:
+                                logging.error(f"检查页面打卡记录时出错: {e}")
+                                error_msg = f"页面记录检查失败: {str(e)}，采用保守策略（置信度: {unable_escape_confidence:.3f}）"
+                                await self.send_notification("打卡流程", error_msg)
+                                
+                                # 发送截图 - 记录检查失败的情况
+                                await self._send_punch_failure_screenshot(screen, username, punch_type, error_msg)
+                                
+                                return (False, f"状态不确定，置信度{unable_escape_confidence:.3f}，记录检查失败")
+                        else:
+                            # 置信度很低，认为确实没有unable_escape，可以下班
+                            await self.send_notification("打卡流程", f"确认可以下班（置信度: {unable_escape_confidence:.3f}）")
+                            logging.info(f"确认可以下班，unable_escape置信度很低: {unable_escape_confidence:.3f}")
 
-                            return (False, f"状态不确定，置信度{unable_escape_confidence:.3f}")
-
-                        # 置信度很低，认为确实没有unable_escape，可以下班
-                        await self.send_notification("打卡流程", f"确认可以下班（置信度: {unable_escape_confidence:.3f}）")
-                        logging.info(f"确认可以下班，unable_escape置信度很低: {unable_escape_confidence:.3f}")
-
-                        # 进行下班成功的处理
-                        if self._is_early_leave(current_time):
-                            await self.send_notification(
-                                "打卡异常",
-                                f"⚠️ 检测到早退打卡！打卡时间：{current_time.strftime('%H:%M')}"
+                            # 进行下班成功的处理
+                            if self._is_early_leave(current_time):
+                                await self.send_notification(
+                                    "打卡异常",
+                                    f"⚠️ 检测到早退打卡！打卡时间：{current_time.strftime('%H:%M')}"
+                                )
+                            self.today_punch_records['punch_out_time'] = current_time
+                            # 保存打卡记录
+                            self.punch_record_manager.update_record(
+                                current_time.strftime('%Y-%m-%d'),
+                                "下班",
+                                current_time.strftime('%H:%M:%S')
                             )
-                        self.today_punch_records['punch_out_time'] = current_time
-                        # 保存打卡记录
-                        self.punch_record_manager.update_record(
-                            current_time.strftime('%Y-%m-%d'),
-                            "下班",
-                            current_time.strftime('%H:%M:%S')
-                        )
-                        punch_success = True
+                            punch_success = True
 
                 if punch_success:
                     # 识别并更新打卡记录
@@ -2555,7 +2667,7 @@ class AttendanceSystem:
             return (False, None, error_msg)
 
     def calculate_punch_out_time(self, punch_in_time_str):
-        """根据上班时间计算下班时间（8小时20分钟后）
+        """根据上班时间计算下班时间（8小时15分钟后 + 2-5分钟随机延迟）
 
         Args:
             punch_in_time_str: 上班时间字符串，格式如 "08:30:00" 或 "08:30"
@@ -2564,6 +2676,8 @@ class AttendanceSystem:
             tuple: (success: bool, punch_out_time_str: str, message: str)
         """
         try:
+            import random
+            
             # 处理时间格式
             if len(punch_in_time_str.split(':')) == 2:
                 punch_in_time_str += ':00'  # 补充秒数
@@ -2571,14 +2685,17 @@ class AttendanceSystem:
             # 解析上班时间
             punch_in_time = datetime.strptime(punch_in_time_str, '%H:%M:%S').time()
 
-            # 计算下班时间（8小时16分钟后）
+            # 生成2-5分钟的随机延迟
+            random_delay = random.randint(2, 5)
+            
+            # 计算下班时间（8小时15分钟后 + 随机延迟）
             today = datetime.now().date()
             punch_in_datetime = datetime.combine(today, punch_in_time)
-            punch_out_datetime = punch_in_datetime + timedelta(hours=8, minutes=20)
+            punch_out_datetime = punch_in_datetime + timedelta(hours=8, minutes=15 + random_delay)
 
             punch_out_time_str = punch_out_datetime.strftime('%H:%M:%S')
 
-            message = f"根据上班时间 {punch_in_time_str} 计算得出下班时间: {punch_out_time_str}"
+            message = f"根据上班时间 {punch_in_time_str} 计算得出下班时间: {punch_out_time_str}（已加{random_delay}分钟随机延迟）"
             logging.info(message)
 
             return (True, punch_out_time_str, message)
