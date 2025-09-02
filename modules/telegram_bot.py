@@ -129,7 +129,7 @@ class TelegramBot:
             "支持的命令：\n"
             "/punch_in - 上班打卡\n"
             "/punch_out - 下班打卡\n"
-            "/auto_byebye - 自动下班打卡（根据上班时间计算8小时16分钟后自动下班）\n"
+            "/auto_byebye - 自动下班打卡（根据上班时间计算8小时15分钟 + 2-5分钟随机延迟后自动下班）\n"
             "/stop - 终止当前正在进行的打卡操作\n"
             "/status - 查看状态（包含当前操作状态）\n"
             "/errors - 查看最近错误日志\n"
@@ -234,8 +234,8 @@ class TelegramBot:
             confirm_message = (
                 f"🎯 自动下班打卡设置\n\n"
                 f"📍 上班时间：{punch_in_time}\n"
-                f"🕐 计算下班时间：{punch_out_time}\n"
-                f"⏰ 工作时长：8小时20分钟（为保证正确打卡）\n\n"
+                f"🕐 {calc_message}\n"
+                f"⏰ 工作时长：8小时15分钟 + 2-5分钟随机延迟\n\n"
                 f"💡 确认后将自动设置定时任务，到时间后自动执行下班打卡。\n\n"
                 f"请选择操作："
             )
