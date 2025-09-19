@@ -2667,7 +2667,7 @@ class AttendanceSystem:
             return (False, None, error_msg)
 
     def calculate_punch_out_time(self, punch_in_time_str):
-        """根据上班时间计算下班时间（8小时15分钟后 + 2-5分钟随机延迟）
+        """根据上班时间计算下班时间（8小时15分钟后 + 1-3分钟随机延迟）
 
         Args:
             punch_in_time_str: 上班时间字符串，格式如 "08:30:00" 或 "08:30"
@@ -2685,17 +2685,22 @@ class AttendanceSystem:
             # 解析上班时间
             punch_in_time = datetime.strptime(punch_in_time_str, '%H:%M:%S').time()
 
-            # 生成2-5分钟的随机延迟
-            random_delay = random.randint(2, 5)
+            # 生成1-3分钟的随机延迟（精确到秒）
+            random_delay_seconds = random.randint(60, 180)  # 60-180秒（1-3分钟）
             
             # 计算下班时间（8小时15分钟后 + 随机延迟）
             today = datetime.now().date()
             punch_in_datetime = datetime.combine(today, punch_in_time)
-            punch_out_datetime = punch_in_datetime + timedelta(hours=8, minutes=15 + random_delay)
+            punch_out_datetime = punch_in_datetime + timedelta(hours=8, minutes=15, seconds=random_delay_seconds)
 
             punch_out_time_str = punch_out_datetime.strftime('%H:%M:%S')
 
-            message = f"根据上班时间 {punch_in_time_str} 计算得出下班时间: {punch_out_time_str}（已加{random_delay}分钟随机延迟）"
+            # 将秒数转换为分钟和秒的格式
+            delay_minutes = random_delay_seconds // 60
+            delay_seconds = random_delay_seconds % 60
+            delay_display = f"{delay_minutes}分{delay_seconds}秒" if delay_seconds > 0 else f"{delay_minutes}分钟"
+            
+            message = f"根据上班时间 {punch_in_time_str} 计算得出下班时间: {punch_out_time_str}（已加{delay_display}随机延迟）"
             logging.info(message)
 
             return (True, punch_out_time_str, message)

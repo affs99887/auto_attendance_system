@@ -68,6 +68,11 @@ class TelegramBot:
         # 添加初始化状态跟踪
         self._is_initialized = False
         self._initialization_lock = asyncio.Lock()
+        # settime配置持久化文件路径
+        self.settime_history_file = 'settime_history.json'
+        # 每日8:15提醒任务状态
+        self.daily_reminder_pending = False
+        self.daily_reminder_config = None
 
     async def _ensure_app_initialized(self):
         """确保Application已正确初始化"""
@@ -110,6 +115,9 @@ class TelegramBot:
                         self.connection_error_count = 0  # 重置错误计数
 
                     self.app.add_handler(MessageHandler(filters.ALL, update_handler))
+                    
+                    # 初始化每日提醒任务
+                    self._setup_daily_reminder()
 
                     # 初始化应用
                     await self.app.initialize()
@@ -129,7 +137,7 @@ class TelegramBot:
             "支持的命令：\n"
             "/punch_in - 上班打卡\n"
             "/punch_out - 下班打卡\n"
-            "/auto_byebye - 自动下班打卡（根据上班时间计算8小时15分钟 + 2-5分钟随机延迟后自动下班）\n"
+            "/auto_byebye - 自动下班打卡（根据上班时间计算8小时15分钟 + 1-3分钟随机延迟后自动下班）\n"
             "/stop - 终止当前正在进行的打卡操作\n"
             "/status - 查看状态（包含当前操作状态）\n"
             "/errors - 查看最近错误日志\n"
@@ -235,7 +243,7 @@ class TelegramBot:
                 f"🎯 自动下班打卡设置\n\n"
                 f"📍 上班时间：{punch_in_time}\n"
                 f"🕐 {calc_message}\n"
-                f"⏰ 工作时长：8小时15分钟 + 2-5分钟随机延迟\n\n"
+                f"⏰ 工作时长：8小时15分钟 + 1-3分钟随机延迟\n\n"
                 f"💡 确认后将自动设置定时任务，到时间后自动执行下班打卡。\n\n"
                 f"请选择操作："
             )
@@ -1214,6 +1222,113 @@ class TelegramBot:
                         await query.message.edit_text("所有任务已删除")
                 else:
                     await query.message.reply_text("❌ 删除任务失败")
+            elif query.data.startswith('settime_use_last_'):
+                # 处理使用上次配置的回调
+                punch_type = query.data.split('_')[-1]
+                last_config = self.setting_time_state[self.chat_id].get('last_config')
+                
+                if last_config:
+                    if last_config['mode'] == 'delay':
+                        # 延迟模式：重新计算目标时间
+                        delay_minutes = last_config.get('delay_minutes', 1)
+                        target_time = datetime.now() + timedelta(minutes=delay_minutes)
+                        await self._schedule_punch(punch_type, target_time.hour, target_time.minute)
+                        
+                        # 保存新的配置
+                        config_data = {
+                            'type': punch_type,
+                            'mode': 'delay',
+                            'delay_minutes': delay_minutes
+                        }
+                        self._save_settime_config(config_data)
+                        
+                        await query.message.edit_text(f"✅ 已使用上次配置！\n设置{delay_minutes}分钟后执行{punch_type}打卡")
+                        
+                    else:
+                        # 指定时间模式：使用相同的时间
+                        hour = last_config.get('hour')
+                        minute = last_config.get('minute')
+                        await self._schedule_punch(punch_type, hour, minute)
+                        
+                        # 保存新的配置
+                        config_data = {
+                            'type': punch_type,
+                            'mode': 'specific',
+                            'hour': hour,
+                            'minute': minute
+                        }
+                        self._save_settime_config(config_data)
+                        
+                        await query.message.edit_text(f"✅ 已使用上次配置！\n设置在 {hour:02d}:{minute:02d} 执行{punch_type}打卡")
+                    
+                    # 清理状态
+                    if self.chat_id in self.setting_time_state:
+                        del self.setting_time_state[self.chat_id]
+                    if self.chat_id in self.setting_time_timer and self.setting_time_timer[self.chat_id] is not None:
+                        self.setting_time_timer[self.chat_id].cancel()
+                else:
+                    await query.message.edit_text("❌ 未找到上次配置")
+
+            elif query.data.startswith('daily_reminder_confirm_'):
+                # 处理每日提醒确认
+                punch_type = query.data.split('_')[-1]
+                
+                if self.daily_reminder_pending and self.daily_reminder_config:
+                    config = self.daily_reminder_config
+                    
+                    if config['mode'] == 'delay':
+                        # 延迟模式：基于当前时间重新计算
+                        delay_minutes = config.get('delay_minutes', 1)
+                        target_time = datetime.now() + timedelta(minutes=delay_minutes)
+                        await self._schedule_punch(punch_type, target_time.hour, target_time.minute)
+                        
+                        # 保存新的配置
+                        config_data = {
+                            'type': punch_type,
+                            'mode': 'delay',
+                            'delay_minutes': delay_minutes
+                        }
+                        self._save_settime_config(config_data)
+                        
+                        await query.message.edit_text(
+                            f"✅ 已确认使用昨日配置！\n"
+                            f"⏰ 设置{delay_minutes}分钟后执行{punch_type}打卡\n"
+                            f"📅 执行时间：{target_time.strftime('%H:%M')}"
+                        )
+                        
+                    else:
+                        # 指定时间模式：使用相同的时间
+                        hour = config.get('hour')
+                        minute = config.get('minute')
+                        await self._schedule_punch(punch_type, hour, minute)
+                        
+                        # 保存新的配置
+                        config_data = {
+                            'type': punch_type,
+                            'mode': 'specific',
+                            'hour': hour,
+                            'minute': minute
+                        }
+                        self._save_settime_config(config_data)
+                        
+                        await query.message.edit_text(
+                            f"✅ 已确认使用昨日配置！\n"
+                            f"⏰ 设置在 {hour:02d}:{minute:02d} 执行{punch_type}打卡"
+                        )
+                    
+                    # 清理状态
+                    self.daily_reminder_pending = False
+                    self.daily_reminder_config = None
+                    
+                else:
+                    await query.message.edit_text("❌ 提醒已过期，请使用 /set_time 手动设置")
+
+            elif query.data == 'daily_reminder_cancel':
+                # 取消每日提醒
+                self.daily_reminder_pending = False
+                self.daily_reminder_config = None
+                await query.message.edit_text("👍 已取消，您可以稍后使用 /set_time 手动设置")
+
             elif query.data.startswith('settime_type_'):
                 punch_type = query.data.split('_')[-1]
                 self.setting_time_state[self.chat_id]['type'] = punch_type
@@ -1275,6 +1390,14 @@ class TelegramBot:
                 # 计算目标时间
                 target_time = datetime.now() + timedelta(minutes=delay_minutes)
                 await self._schedule_punch(punch_type, target_time.hour, target_time.minute)
+                
+                # 保存配置到历史记录
+                config_data = {
+                    'type': punch_type,
+                    'mode': 'delay',
+                    'delay_minutes': delay_minutes
+                }
+                self._save_settime_config(config_data)
                 
                 # 清理状态
                 if self.chat_id in self.setting_time_state:
@@ -1577,13 +1700,56 @@ class TelegramBot:
             await update.message.reply_text("您没有权限使用此机器人")
             return
 
-        # 创建打卡类型选择按钮
+        # 获取上次配置
+        last_config = self._get_last_config()
+        
+        # 创建基础按钮
         keyboard = [
             [
                 InlineKeyboardButton("设置上班时间", callback_data='settime_type_in'),
                 InlineKeyboardButton("设置下班时间", callback_data='settime_type_out')
             ]
         ]
+        
+        # 构建消息文本
+        message_text = "请选择要设置的打卡类型："
+        
+        # 如果有上次配置，添加快速设置选项
+        if last_config:
+            config_date = datetime.strptime(last_config['config_date'], '%Y-%m-%d').strftime('%m-%d')
+            config_type_text = "上班打卡" if last_config['type'] == 'in' else "下班打卡"
+            
+            # 构建详细的配置描述
+            if last_config['mode'] == 'delay':
+                delay_minutes = last_config.get('delay_minutes', '?')
+                config_desc = f"延迟{delay_minutes}分钟{config_type_text}"
+                detail_info = (
+                    f"📅 日期：{config_date}\n"
+                    f"📝 类型：{config_type_text}\n" 
+                    f"⏰ 模式：延时执行\n"
+                    f"⏱️ 延迟：{delay_minutes}分钟"
+                )
+            else:
+                hour = last_config.get('hour', '?')
+                minute = last_config.get('minute', '?')
+                config_desc = f"指定时间{hour:02d}:{minute:02d}{config_type_text}"
+                detail_info = (
+                    f"📅 日期：{config_date}\n"
+                    f"📝 类型：{config_type_text}\n"
+                    f"⏰ 模式：指定时间\n"
+                    f"🕐 设定时间：{hour:02d}:{minute:02d}"
+                )
+            
+            # 添加上次配置快速选择按钮
+            keyboard.insert(0, [
+                InlineKeyboardButton(
+                    f"🔄 使用上次配置({config_desc})",
+                    callback_data=f'settime_use_last_{last_config["type"]}'
+                )
+            ])
+            
+            message_text = f"🕐 检测到上次配置:\n{detail_info}\n\n{message_text}"
+        
         reply_markup = InlineKeyboardMarkup(keyboard)
 
         # 初始化状态
@@ -1592,7 +1758,8 @@ class TelegramBot:
             'type': None,
             'mode': None,
             'hour': None,
-            'minute': None
+            'minute': None,
+            'last_config': last_config
         }
 
         # 设置1分钟超时
@@ -1601,7 +1768,7 @@ class TelegramBot:
         self.setting_time_timer[self.chat_id] = asyncio.create_task(self._cancel_settime_timeout(self.chat_id))
 
         await update.message.reply_text(
-            "请选择要设置的打卡类型：",
+            message_text,
             reply_markup=reply_markup
         )
 
@@ -1639,6 +1806,15 @@ class TelegramBot:
                 # 计算目标时间
                 target_time = datetime.now() + timedelta(minutes=delay_minutes)
                 await self._schedule_punch(state['type'], target_time.hour, target_time.minute)
+                
+                # 保存配置到历史记录
+                config_data = {
+                    'type': state['type'],
+                    'mode': 'delay',
+                    'delay_minutes': delay_minutes
+                }
+                self._save_settime_config(config_data)
+                
                 del self.setting_time_state[self.chat_id]
                 if self.chat_id in self.setting_time_timer and self.setting_time_timer[self.chat_id] is not None:
                     self.setting_time_timer[self.chat_id].cancel()
@@ -1663,6 +1839,16 @@ class TelegramBot:
                 minute = int(text)
                 if 0 <= minute <= 59:
                     await self._schedule_punch(state['type'], state['hour'], minute)
+                    
+                    # 保存配置到历史记录
+                    config_data = {
+                        'type': state['type'],
+                        'mode': 'specific',
+                        'hour': state['hour'],
+                        'minute': minute
+                    }
+                    self._save_settime_config(config_data)
+                    
                     del self.setting_time_state[self.chat_id]
                     if self.chat_id in self.setting_time_timer and self.setting_time_timer[self.chat_id] is not None:
                         self.setting_time_timer[self.chat_id].cancel()
@@ -2013,3 +2199,165 @@ class TelegramBot:
             flow_type="punch_out",
             special_handler=self._handle_punch_out_time_confirmation
         )
+
+    def _save_settime_config(self, config_data):
+        """保存settime配置到历史记录"""
+        try:
+            # 读取现有历史记录
+            history = self._load_settime_history()
+            
+            # 添加今日配置
+            today = datetime.now().strftime('%Y-%m-%d')
+            history[today] = {
+                'type': config_data['type'],
+                'mode': config_data['mode'],
+                'timestamp': datetime.now().isoformat(),
+                **config_data
+            }
+            
+            # 只保留最近30天的记录
+            cutoff_date = datetime.now() - timedelta(days=30)
+            history = {
+                date: data for date, data in history.items()
+                if datetime.strptime(date, '%Y-%m-%d') >= cutoff_date
+            }
+            
+            # 保存到文件
+            with open(self.settime_history_file, 'w', encoding='utf-8') as f:
+                json.dump(history, f, ensure_ascii=False, indent=2)
+                
+            logging.info(f"已保存settime配置: {config_data}")
+            
+        except Exception as e:
+            logging.error(f"保存settime配置失败: {e}")
+
+    def _load_settime_history(self):
+        """加载settime历史记录"""
+        try:
+            if os.path.exists(self.settime_history_file):
+                with open(self.settime_history_file, 'r', encoding='utf-8') as f:
+                    return json.load(f)
+            return {}
+        except Exception as e:
+            logging.error(f"加载settime历史记录失败: {e}")
+            return {}
+
+    def _get_last_config(self):
+        """获取上一次的settime配置"""
+        try:
+            history = self._load_settime_history()
+            if not history:
+                return None
+            
+            # 获取最近一次的配置（按日期排序）
+            sorted_dates = sorted(history.keys(), reverse=True)
+            if sorted_dates:
+                last_date = sorted_dates[0]
+                last_config = history[last_date].copy()
+                last_config['config_date'] = last_date  # 添加配置日期信息
+                return last_config
+            return None
+        except Exception as e:
+            logging.error(f"获取上次配置失败: {e}")
+            return None
+
+    def _setup_daily_reminder(self):
+        """设置每日8:15提醒任务"""
+        try:
+            # 检查是否为工作日的函数
+            def is_work_day():
+                return is_workday(datetime.now().date())
+            
+            # 创建提醒任务
+            def daily_reminder_job():
+                if is_work_day():
+                    asyncio.create_task(self._send_daily_reminder())
+            
+            # 每天8:15执行提醒任务
+            schedule.every().day.at("08:15").do(daily_reminder_job)
+            logging.info("已设置每日8:15提醒任务")
+            
+        except Exception as e:
+            logging.error(f"设置每日提醒任务失败: {e}")
+
+    async def _send_daily_reminder(self):
+        """发送每日提醒"""
+        try:
+            last_config = self._get_last_config()
+            
+            if last_config:
+                config_date = datetime.strptime(last_config['config_date'], '%Y-%m-%d').strftime('%m-%d')
+                config_type_text = "上班打卡" if last_config['type'] == 'in' else "下班打卡"
+                
+                # 构建详细的配置描述
+                if last_config['mode'] == 'delay':
+                    delay_minutes = last_config.get('delay_minutes', '?')
+                    config_desc = f"延迟{delay_minutes}分钟{config_type_text}"
+                    detail_info = (
+                        f"📅 日期：{config_date}\n"
+                        f"📝 类型：{config_type_text}\n" 
+                        f"⏰ 模式：延时执行\n"
+                        f"⏱️ 延迟：{delay_minutes}分钟"
+                    )
+                else:
+                    hour = last_config.get('hour', '?')
+                    minute = last_config.get('minute', '?')
+                    config_desc = f"指定时间{hour:02d}:{minute:02d}{config_type_text}"
+                    detail_info = (
+                        f"📅 日期：{config_date}\n"
+                        f"📝 类型：{config_type_text}\n"
+                        f"⏰ 模式：指定时间\n"
+                        f"🕐 设定时间：{hour:02d}:{minute:02d}"
+                    )
+                
+                # 创建确认按钮
+                keyboard = [
+                    [
+                        InlineKeyboardButton(
+                            f"✅ 确认使用上次配置",
+                            callback_data=f'daily_reminder_confirm_{last_config["type"]}'
+                        )
+                    ],
+                    [
+                        InlineKeyboardButton("❌ 稍后手动设置", callback_data="daily_reminder_cancel")
+                    ]
+                ]
+                reply_markup = InlineKeyboardMarkup(keyboard)
+                
+                message_text = (
+                    f"🌅 早上好！今天是工作日\n\n"
+                    f"📋 检测到上次配置详情：\n"
+                    f"{detail_info}\n\n"
+                    f"是否使用上次配置进行定时设置？\n"
+                    f"💡 您可以随时点击确认，系统将根据点击时间重新计算"
+                )
+                
+                # 设置状态，用于后续确认处理
+                self.daily_reminder_config = last_config
+                self.daily_reminder_pending = True
+                
+                await self.send_message_with_reply_markup("每日定时提醒", message_text, reply_markup)
+                
+            else:
+                # 没有上次配置，发送常规提醒
+                await self.send_message(
+                    "每日提醒", 
+                    "🌅 早上好！今天是工作日\n\n请记得设置打卡时间 /set_time"
+                )
+                
+        except Exception as e:
+            logging.error(f"发送每日提醒失败: {e}")
+
+    async def send_message_with_reply_markup(self, title, content, reply_markup):
+        """发送带有回复标记的消息"""
+        try:
+            await self.app.bot.send_message(
+                chat_id=self.chat_id,
+                text=f"**{title}**\n\n{content}",
+                reply_markup=reply_markup,
+                parse_mode='Markdown'
+            )
+        except Exception as e:
+            logging.error(f"发送消息失败: {e}")
+            # 降级为普通消息
+            await self.send_message(title, content)
