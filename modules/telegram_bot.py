@@ -73,6 +73,8 @@ class TelegramBot:
         # 每日8:15提醒任务状态
         self.daily_reminder_pending = False
         self.daily_reminder_config = None
+        self.daily_reminder_task_set = False  # 防止重复设置每日提醒任务
+        self.daily_reminder_sent_date = None  # 记录今日是否已发送提醒
 
     async def _ensure_app_initialized(self):
         """确保Application已正确初始化"""
@@ -2264,6 +2266,21 @@ class TelegramBot:
     def _setup_daily_reminder(self):
         """设置每日8:15提醒任务"""
         try:
+            # 防止重复设置
+            if self.daily_reminder_task_set:
+                logging.debug("每日提醒任务已设置，跳过重复设置")
+                return
+            
+            # 清理所有现有的每日提醒任务（避免累积）
+            jobs_to_remove = []
+            for job in schedule.jobs:
+                if hasattr(job, 'job_func') and job.job_func.__name__ == 'daily_reminder_job':
+                    jobs_to_remove.append(job)
+            
+            for job in jobs_to_remove:
+                schedule.cancel_job(job)
+                logging.debug("清理了重复的每日提醒任务")
+            
             # 检查是否为工作日的函数
             def is_work_day():
                 return is_workday(datetime.now().date())
@@ -2275,6 +2292,7 @@ class TelegramBot:
             
             # 每天8:15执行提醒任务
             schedule.every().day.at("08:15").do(daily_reminder_job)
+            self.daily_reminder_task_set = True
             logging.info("已设置每日8:15提醒任务")
             
         except Exception as e:
@@ -2283,6 +2301,12 @@ class TelegramBot:
     async def _send_daily_reminder(self):
         """发送每日提醒"""
         try:
+            # 防重复发送：检查今日是否已发送过提醒
+            today = datetime.now().strftime('%Y-%m-%d')
+            if self.daily_reminder_sent_date == today:
+                logging.debug(f"今日({today})已发送过每日提醒，跳过重复发送")
+                return
+            
             last_config = self._get_last_config()
             
             if last_config:
@@ -2344,6 +2368,10 @@ class TelegramBot:
                     "每日提醒", 
                     "🌅 早上好！今天是工作日\n\n请记得设置打卡时间 /set_time"
                 )
+            
+            # 标记今日已发送提醒
+            self.daily_reminder_sent_date = today
+            logging.info(f"已发送每日提醒，标记日期: {today}")
                 
         except Exception as e:
             logging.error(f"发送每日提醒失败: {e}")
@@ -2361,3 +2389,49 @@ class TelegramBot:
             logging.error(f"发送消息失败: {e}")
             # 降级为普通消息
             await self.send_message(title, content)
+
+    def clear_duplicate_reminder_tasks(self):
+        """清理重复的每日提醒任务"""
+        try:
+            jobs_to_remove = []
+            reminder_jobs_count = 0
+            
+            for job in schedule.jobs:
+                if hasattr(job, 'job_func') and job.job_func.__name__ == 'daily_reminder_job':
+                    reminder_jobs_count += 1
+                    if reminder_jobs_count > 1:  # 保留第一个，删除其余的
+                        jobs_to_remove.append(job)
+            
+            for job in jobs_to_remove:
+                schedule.cancel_job(job)
+                
+            if jobs_to_remove:
+                logging.warning(f"清理了 {len(jobs_to_remove)} 个重复的每日提醒任务")
+                
+            logging.info(f"当前活跃的每日提醒任务数量: {reminder_jobs_count - len(jobs_to_remove)}")
+            
+        except Exception as e:
+            logging.error(f"清理重复提醒任务失败: {e}")
+
+    def reset_daily_reminder_state(self):
+        """重置每日提醒状态（紧急修复用）"""
+        try:
+            # 清理所有每日提醒任务
+            jobs_to_remove = []
+            for job in schedule.jobs:
+                if hasattr(job, 'job_func') and job.job_func.__name__ == 'daily_reminder_job':
+                    jobs_to_remove.append(job)
+            
+            for job in jobs_to_remove:
+                schedule.cancel_job(job)
+            
+            # 重置状态
+            self.daily_reminder_task_set = False
+            self.daily_reminder_sent_date = None
+            self.daily_reminder_pending = False
+            self.daily_reminder_config = None
+            
+            logging.info(f"已重置每日提醒状态，清理了 {len(jobs_to_remove)} 个任务")
+            
+        except Exception as e:
+            logging.error(f"重置每日提醒状态失败: {e}")
