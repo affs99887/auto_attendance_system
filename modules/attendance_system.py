@@ -1162,6 +1162,66 @@ class AttendanceSystem:
             await self.send_notification("定时设置", f"设置定时任务失败: {str(e)}")
             return None
 
+    async def schedule_punch_out(self, hour, minute):
+        """设置指定时间的下班打卡任务
+        
+        参数:
+            hour: 小时 (0-23)
+            minute: 分钟 (0-59)
+        
+        返回:
+            bool: 设置成功返回True，失败返回False
+        """
+        try:
+            # 验证时间参数
+            if not (0 <= hour <= 23) or not (0 <= minute <= 59):
+                raise ValueError(f"无效的时间参数: {hour:02d}:{minute:02d}")
+            
+            time_str = f"{hour:02d}:{minute:02d}"
+            logging.info(f"开始设置定时下班打卡，时间：{time_str}")
+            
+            # 清除已有的下班打卡任务
+            all_jobs = schedule.get_jobs()
+            punch_out_jobs = [job for job in all_jobs if "punch_out" in str(job.job_func)]
+            for job in punch_out_jobs:
+                schedule.cancel_job(job)
+            logging.info(f"已移除{len(punch_out_jobs)}个已有的下班打卡定时任务")
+            
+            async def punch_out_job():
+                try:
+                    logging.info(f"执行定时下班打卡任务 ({time_str})")
+                    await self.punch_out()
+                    # 打卡完成后发送状态信息
+                    await self.send_daily_status()
+                    logging.info(f"定时下班打卡任务 ({time_str}) 执行完成")
+                except Exception as e:
+                    logging.error(f"执行定时下班打卡任务时发生错误: {str(e)}")
+            
+            # 设置定时任务
+            schedule.every().day.at(time_str).do(lambda: asyncio.create_task(punch_out_job()))
+            logging.info(f"已设置定时任务: 每天{time_str}执行下班打卡")
+            
+            # 删除已有的下班打卡任务记录
+            saved_tasks = self.task_manager.get_tasks()
+            for task in saved_tasks:
+                if task['type'] == 'punch_out':
+                    self.task_manager.remove_task_by_id(task['id'])
+                    logging.info(f"已从任务管理器中移除下班打卡任务 #{task['id']}")
+            
+            # 添加新的定时任务记录
+            task_id = self.task_manager.add_task('punch_out', time_str)
+            logging.info(f"保存定时任务到文件，任务ID: {task_id}")
+            
+            await self.send_notification("定时设置", f"设置下班打卡任务 #{task_id}: {time_str}")
+            
+            return True
+        except Exception as e:
+            error_msg = f"设置定时下班打卡任务失败: {str(e)}"
+            logging.error(error_msg)
+            logging.error(traceback.format_exc())
+            await self.send_notification("定时设置错误", error_msg)
+            return False
+
     def init_schedule_tasks(self):
         """初始化定时任务"""
         # 清除所有现有任务

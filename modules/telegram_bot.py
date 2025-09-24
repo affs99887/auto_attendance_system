@@ -74,7 +74,7 @@ class TelegramBot:
         self.daily_reminder_pending = False
         self.daily_reminder_config = None
         self.daily_reminder_task_set = False  # 防止重复设置每日提醒任务
-        self.daily_reminder_sent_date = None  # 记录今日是否已发送提醒
+        self.daily_reminder_lock = asyncio.Lock()  # 防止并发执行每日提醒
 
     async def _ensure_app_initialized(self):
         """确保Application已正确初始化"""
@@ -1524,6 +1524,97 @@ class TelegramBot:
             elif query.data == 'cancel_auto_punch_out':
                 await query.message.edit_text("❌ 自动下班打卡设置已取消")
 
+            # 处理16:30自动触发autobyebye的回调
+            elif query.data == 'manual_autobyebye_execute':
+                # 一键执行autobyebye（无早上打卡记录时）
+                await query.message.edit_text("🚀 开始执行autobyebye...")
+                
+                try:
+                    # 调用attendance_system的自动下班方法
+                    success, message = await self.attendance_system.auto_byebye()
+                    
+                    if success:
+                        await query.message.edit_text(f"✅ autobyebye执行完成：{message}")
+                    else:
+                        await query.message.edit_text(f"❌ autobyebye执行失败：{message}")
+                        
+                except Exception as e:
+                    error_msg = f"执行autobyebye时发生错误: {str(e)}"
+                    logging.error(error_msg)
+                    await query.message.edit_text(f"❌ {error_msg}")
+
+            elif query.data == 'manual_autobyebye_cancel':
+                await query.message.edit_text("❌ 已取消执行autobyebye")
+
+            elif query.data.startswith('auto_trigger_confirm_'):
+                # 16:30自动触发确认设置任务
+                punch_out_time = query.data.split('_')[-1]
+                
+                try:
+                    # 解析时间，处理可能包含秒数的格式
+                    time_parts = punch_out_time.split(':')
+                    if len(time_parts) >= 2:
+                        hour, minute = int(time_parts[0]), int(time_parts[1])
+                        logging.info(f"解析16:30自动下班时间: {punch_out_time} -> {hour:02d}:{minute:02d}")
+                    else:
+                        raise ValueError(f"时间格式无效: {punch_out_time}")
+                    
+                    # 使用attendance_system设置定时任务
+                    success = await self.attendance_system.schedule_punch_out(hour, minute)
+                    
+                    if success:
+                        # 计算执行时间
+                        now = datetime.now()
+                        today_punch_out = datetime(now.year, now.month, now.day, hour, minute)
+                        
+                        # 如果时间已过，安排到明天
+                        if today_punch_out <= now:
+                            today_punch_out += timedelta(days=1)
+                        
+                        success_message = (
+                            f"✅ 16:30自动下班任务设置成功！\n\n"
+                            f"🎯 下班打卡时间：{punch_out_time}\n"
+                            f"⏰ 执行时间：{today_punch_out.strftime('%Y-%m-%d %H:%M:%S')}\n"
+                            f"📋 任务已添加到定时任务列表\n\n"
+                            f"💡 您可以使用 /status 查看任务状态"
+                        )
+                        await query.message.edit_text(success_message)
+                    else:
+                        await query.message.edit_text("❌ 设置定时任务失败，请稍后重试")
+
+                except ValueError:
+                    await query.message.edit_text("❌ 时间格式错误，操作已取消")
+                except Exception as e:
+                    error_msg = f"设置16:30自动下班任务时发生错误: {str(e)}"
+                    logging.error(error_msg)
+                    await query.message.edit_text(f"❌ {error_msg}")
+
+            elif query.data == 'auto_trigger_cancel':
+                await query.message.edit_text("❌ 已取消16:30自动下班设置")
+
+            elif query.data.startswith('auto_trigger_immediate_'):
+                # 16:30自动触发立即执行
+                punch_out_time = query.data.split('_')[-1]
+                
+                await query.message.edit_text("⏰ 等待10秒后开始执行下班打卡...")
+                
+                # 等待10秒
+                await asyncio.sleep(10)
+                
+                try:
+                    # 直接执行下班打卡
+                    success, message = await self.attendance_system.punch_out()
+                    
+                    if success:
+                        await query.message.edit_text(f"✅ 16:30自动下班打卡执行完成：{message}")
+                    else:
+                        await query.message.edit_text(f"❌ 16:30自动下班打卡执行失败：{message}")
+                        
+                except Exception as e:
+                    error_msg = f"执行16:30自动下班打卡时发生错误: {str(e)}"
+                    logging.error(error_msg)
+                    await query.message.edit_text(f"❌ {error_msg}")
+
         except Exception as e:
             error_msg = f"处理按钮回调时发生错误: {str(e)}"
             logging.error(error_msg)
@@ -2264,7 +2355,7 @@ class TelegramBot:
             return None
 
     def _setup_daily_reminder(self):
-        """设置每日8:15提醒任务"""
+        """设置每日8:15提醒任务和16:30自动下班任务"""
         try:
             # 防止重复设置
             if self.daily_reminder_task_set:
@@ -2274,107 +2365,242 @@ class TelegramBot:
             # 清理所有现有的每日提醒任务（避免累积）
             jobs_to_remove = []
             for job in schedule.jobs:
-                if hasattr(job, 'job_func') and job.job_func.__name__ == 'daily_reminder_job':
+                if hasattr(job, 'job_func') and job.job_func.__name__ in ['daily_reminder_job', 'auto_trigger_autobyebye_job']:
                     jobs_to_remove.append(job)
             
             for job in jobs_to_remove:
                 schedule.cancel_job(job)
-                logging.debug("清理了重复的每日提醒任务")
+                logging.debug("清理了重复的每日提醒/自动下班任务")
             
             # 检查是否为工作日的函数
             def is_work_day():
                 return is_workday(datetime.now().date())
             
-            # 创建提醒任务
+            # 创建8:15提醒任务
             def daily_reminder_job():
+                current_time = datetime.now()
+                logging.info(f"8:15提醒任务触发 - 当前时间: {current_time.strftime('%Y-%m-%d %H:%M:%S')}")
+                logging.info("8:15提醒任务触发 - 检查是否为工作日")
+                work_day_result = is_work_day()
+                logging.info(f"工作日判断结果: {work_day_result}")
+                if work_day_result:
+                    logging.info("确认为工作日，启动每日提醒任务")
+                    try:
+                        task = asyncio.create_task(self._send_daily_reminder())
+                        logging.info("8:15每日提醒任务已创建并启动")
+                        return task
+                    except Exception as e:
+                        logging.error(f"创建8:15每日提醒任务失败: {e}")
+                        raise
+                else:
+                    logging.info("非工作日，跳过每日提醒任务")
+                    return None
+            
+            # 创建16:30自动下班任务
+            def auto_trigger_autobyebye_job():
+                logging.info("16:30自动下班任务触发 - 检查是否为工作日")
                 if is_work_day():
-                    asyncio.create_task(self._send_daily_reminder())
+                    logging.info("确认为工作日，启动16:30自动下班任务")
+                    asyncio.create_task(self._auto_trigger_autobyebye())
+                else:
+                    logging.info("非工作日，跳过16:30自动下班任务")
             
             # 每天8:15执行提醒任务
-            schedule.every().day.at("08:15").do(daily_reminder_job)
+            reminder_job = schedule.every().day.at("08:15").do(daily_reminder_job)
+            # 每天16:30执行自动下班任务
+            autobyebye_job = schedule.every().day.at("16:30").do(auto_trigger_autobyebye_job)
+            
             self.daily_reminder_task_set = True
-            logging.info("已设置每日8:15提醒任务")
+            
+            # 详细日志记录
+            next_reminder_run = reminder_job.next_run
+            next_autobyebye_run = autobyebye_job.next_run
+            
+            logging.info(f"已设置每日8:15提醒任务和16:30自动下班任务")
+            logging.info(f"8:15提醒任务下次执行时间: {next_reminder_run}")
+            logging.info(f"16:30自动下班任务下次执行时间: {next_autobyebye_run}")
+            logging.info(f"当前schedule任务总数: {len(schedule.jobs)}")
             
         except Exception as e:
             logging.error(f"设置每日提醒任务失败: {e}")
 
     async def _send_daily_reminder(self):
         """发送每日提醒"""
-        try:
-            # 防重复发送：检查今日是否已发送过提醒
-            today = datetime.now().strftime('%Y-%m-%d')
-            if self.daily_reminder_sent_date == today:
-                logging.debug(f"今日({today})已发送过每日提醒，跳过重复发送")
-                return
-            
-            last_config = self._get_last_config()
-            
-            if last_config:
-                config_date = datetime.strptime(last_config['config_date'], '%Y-%m-%d').strftime('%m-%d')
-                config_type_text = "上班打卡" if last_config['type'] == 'in' else "下班打卡"
+        async with self.daily_reminder_lock:
+            try:
+                current_time = datetime.now()
+                logging.info(f"开始执行每日提醒任务 - 当前时间: {current_time.strftime('%Y-%m-%d %H:%M:%S')}")
+                last_config = self._get_last_config()
                 
-                # 构建详细的配置描述
-                if last_config['mode'] == 'delay':
-                    delay_minutes = last_config.get('delay_minutes', '?')
-                    config_desc = f"延迟{delay_minutes}分钟{config_type_text}"
-                    detail_info = (
-                        f"📅 日期：{config_date}\n"
-                        f"📝 类型：{config_type_text}\n" 
-                        f"⏰ 模式：延时执行\n"
-                        f"⏱️ 延迟：{delay_minutes}分钟"
+                if last_config:
+                    config_date = datetime.strptime(last_config['config_date'], '%Y-%m-%d').strftime('%m-%d')
+                    config_type_text = "上班打卡" if last_config['type'] == 'in' else "下班打卡"
+                    
+                    # 构建详细的配置描述
+                    if last_config['mode'] == 'delay':
+                        delay_minutes = last_config.get('delay_minutes', '?')
+                        config_desc = f"延迟{delay_minutes}分钟{config_type_text}"
+                        detail_info = (
+                            f"📅 日期：{config_date}\n"
+                            f"📝 类型：{config_type_text}\n" 
+                            f"⏰ 模式：延时执行\n"
+                            f"⏱️ 延迟：{delay_minutes}分钟"
+                        )
+                    else:
+                        hour = last_config.get('hour', '?')
+                        minute = last_config.get('minute', '?')
+                        config_desc = f"指定时间{hour:02d}:{minute:02d}{config_type_text}"
+                        detail_info = (
+                            f"📅 日期：{config_date}\n"
+                            f"📝 类型：{config_type_text}\n"
+                            f"⏰ 模式：指定时间\n"
+                            f"🕐 设定时间：{hour:02d}:{minute:02d}"
+                        )
+                    
+                    # 创建确认按钮
+                    keyboard = [
+                        [
+                            InlineKeyboardButton(
+                                f"✅ 确认使用上次配置",
+                                callback_data=f'daily_reminder_confirm_{last_config["type"]}'
+                            )
+                        ],
+                        [
+                            InlineKeyboardButton("❌ 稍后手动设置", callback_data="daily_reminder_cancel")
+                        ]
+                    ]
+                    reply_markup = InlineKeyboardMarkup(keyboard)
+                    
+                    message_text = (
+                        f"🌅 早上好！今天是工作日\n\n"
+                        f"📋 检测到上次配置详情：\n"
+                        f"{detail_info}\n\n"
+                        f"是否使用上次配置进行定时设置？\n"
+                        f"💡 您可以随时点击确认，系统将根据点击时间重新计算"
                     )
+                    
+                    # 设置状态，用于后续确认处理
+                    self.daily_reminder_config = last_config
+                    self.daily_reminder_pending = True
+                    
+                    await self.send_message_with_reply_markup("每日定时提醒", message_text, reply_markup)
+                    
                 else:
-                    hour = last_config.get('hour', '?')
-                    minute = last_config.get('minute', '?')
-                    config_desc = f"指定时间{hour:02d}:{minute:02d}{config_type_text}"
-                    detail_info = (
-                        f"📅 日期：{config_date}\n"
-                        f"📝 类型：{config_type_text}\n"
-                        f"⏰ 模式：指定时间\n"
-                        f"🕐 设定时间：{hour:02d}:{minute:02d}"
+                    # 没有上次配置，发送常规提醒
+                    await self.send_message(
+                        "每日提醒", 
+                        "🌅 早上好！今天是工作日\n\n请记得设置打卡时间 /set_time"
                     )
                 
-                # 创建确认按钮
+                logging.info("每日提醒发送完成")
+                    
+            except Exception as e:
+                logging.error(f"发送每日提醒失败: {e}")
+
+    async def _auto_trigger_autobyebye(self):
+        """16:30自动触发autobyebye功能"""
+        try:
+            current_time = datetime.now()
+            logging.info(f"开始执行16:30自动下班任务 - 当前时间: {current_time.strftime('%Y-%m-%d %H:%M:%S')}")
+            
+            # 获取当日上班打卡时间，检查是否有早上打卡记录
+            success, punch_in_time, message = await self.attendance_system.get_today_punch_in_time()
+            
+            if not success:
+                # 没有早上打卡记录，发送提示消息并提供一键执行按钮
                 keyboard = [
                     [
-                        InlineKeyboardButton(
-                            f"✅ 确认使用上次配置",
-                            callback_data=f'daily_reminder_confirm_{last_config["type"]}'
-                        )
-                    ],
-                    [
-                        InlineKeyboardButton("❌ 稍后手动设置", callback_data="daily_reminder_cancel")
+                        InlineKeyboardButton("🚀 一键执行autobyebye", callback_data='manual_autobyebye_execute'),
+                        InlineKeyboardButton("❌ 暂不执行", callback_data='manual_autobyebye_cancel')
                     ]
                 ]
                 reply_markup = InlineKeyboardMarkup(keyboard)
                 
                 message_text = (
-                    f"🌅 早上好！今天是工作日\n\n"
-                    f"📋 检测到上次配置详情：\n"
-                    f"{detail_info}\n\n"
-                    f"是否使用上次配置进行定时设置？\n"
-                    f"💡 您可以随时点击确认，系统将根据点击时间重新计算"
+                    f"🕐 16:30自动下班检测\n\n"
+                    f"❌ 因早上无打卡记录，为避免打断电脑操作，暂不执行autobyebye\n\n"
+                    f"💡 如果您需要执行autobyebye，可点击下方按钮"
                 )
                 
-                # 设置状态，用于后续确认处理
-                self.daily_reminder_config = last_config
-                self.daily_reminder_pending = True
+                await self.send_message_with_reply_markup("自动下班检测", message_text, reply_markup)
+                logging.info("发送无早上打卡记录提示完成")
+                return
+            
+            # 有早上打卡记录，计算下班时间并发送确认消息
+            calc_success, punch_out_time, calc_message = self.attendance_system.calculate_punch_out_time(punch_in_time)
+            
+            if not calc_success:
+                await self.send_message("自动下班检测", f"❌ 计算下班时间失败：{calc_message}")
+                return
+            
+            # 检查当前时间与计算的下班时间的关系，实现动态确认逻辑
+            current_time = datetime.now()
+            
+            # 处理不同的时间格式（可能包含秒数）
+            try:
+                if ':' in punch_out_time and len(punch_out_time.split(':')) == 3:
+                    # 格式：HH:MM:SS
+                    punch_out_datetime = datetime.strptime(f"{current_time.strftime('%Y-%m-%d')} {punch_out_time}", '%Y-%m-%d %H:%M:%S')
+                else:
+                    # 格式：HH:MM
+                    punch_out_datetime = datetime.strptime(f"{current_time.strftime('%Y-%m-%d')} {punch_out_time}", '%Y-%m-%d %H:%M')
                 
-                await self.send_message_with_reply_markup("每日定时提醒", message_text, reply_markup)
+                logging.info(f"解析下班时间成功: {punch_out_time} -> {punch_out_datetime}")
+                
+            except ValueError as e:
+                logging.error(f"解析下班时间失败: {punch_out_time}, 错误: {e}")
+                await self.send_message("自动下班检测", f"❌ 下班时间格式解析失败：{punch_out_time}")
+                return
+            
+            if current_time < punch_out_datetime:
+                # 当前时间早于下班时间，显示确认按钮（任务安排模式）
+                keyboard = [
+                    [
+                        InlineKeyboardButton("✅ 确认设置自动下班", callback_data=f'auto_trigger_confirm_{punch_out_time}'),
+                        InlineKeyboardButton("❌ 取消", callback_data='auto_trigger_cancel')
+                    ]
+                ]
+                reply_markup = InlineKeyboardMarkup(keyboard)
+                
+                confirm_message = (
+                    f"🎯 16:30自动下班检测\n\n"
+                    f"✅ 检测到今日早上打卡时间：{punch_in_time}\n"
+                    f"🕐 {calc_message}\n"
+                    f"⏰ 工作时长：8小时15分钟 + 1-3分钟随机延迟\n\n"
+                    f"💡 确认后将自动设置定时任务，到时间后自动执行下班打卡。\n\n"
+                    f"请选择操作："
+                )
+                
+                await self.send_message_with_reply_markup("自动下班检测", confirm_message, reply_markup)
                 
             else:
-                # 没有上次配置，发送常规提醒
-                await self.send_message(
-                    "每日提醒", 
-                    "🌅 早上好！今天是工作日\n\n请记得设置打卡时间 /set_time"
-                )
-            
-            # 标记今日已发送提醒
-            self.daily_reminder_sent_date = today
-            logging.info(f"已发送每日提醒，标记日期: {today}")
+                # 当前时间已超过下班时间，显示倒计时并立即执行
+                keyboard = [
+                    [
+                        InlineKeyboardButton("✅ 立即执行下班打卡", callback_data=f'auto_trigger_immediate_{punch_out_time}'),
+                        InlineKeyboardButton("❌ 取消", callback_data='auto_trigger_cancel')
+                    ]
+                ]
+                reply_markup = InlineKeyboardMarkup(keyboard)
                 
+                overtime_message = (
+                    f"🎯 16:30自动下班检测\n\n"
+                    f"✅ 检测到今日早上打卡时间：{punch_in_time}\n"
+                    f"🕐 计算下班时间：{punch_out_time}\n"
+                    f"⚠️ 当前已超过计算的下班时间\n\n"
+                    f"💡 确认后将等待10秒开始执行下班打卡\n\n"
+                    f"请选择操作："
+                )
+                
+                await self.send_message_with_reply_markup("自动下班检测", overtime_message, reply_markup)
+            
+            end_time = datetime.now()
+            logging.info(f"16:30自动下班任务执行完成 - 结束时间: {end_time.strftime('%Y-%m-%d %H:%M:%S')}")
+            
         except Exception as e:
-            logging.error(f"发送每日提醒失败: {e}")
+            error_time = datetime.now()
+            logging.error(f"执行16:30自动下班任务失败 - 错误时间: {error_time.strftime('%Y-%m-%d %H:%M:%S')}, 错误: {e}")
+            await self.send_message("自动下班检测", f"❌ 16:30自动下班检测失败：{str(e)}")
 
     async def send_message_with_reply_markup(self, title, content, reply_markup):
         """发送带有回复标记的消息"""
