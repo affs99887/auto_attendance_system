@@ -43,17 +43,28 @@ class TaskManager:
         except Exception as e:
             print(f"保存定时任务失败: {str(e)}")
 
-    def add_task(self, task_type, scheduled_time):
-        """添加定时任务"""
+    def add_task(self, task_type, scheduled_time, username=None):
+        """添加定时任务
+
+        Args:
+            task_type: 任务类型 (punch_in, punch_out, selenium_punch_out等)
+            scheduled_time: 计划执行时间
+            username: 关联的用户名（可选，用于多用户场景）
+        """
         # 获取新任务的ID
         new_id = max([task.get('id', 0) for task in self.tasks], default=0) + 1
-        
+
         task = {
             'id': new_id,
             'type': task_type,
             'scheduled_time': scheduled_time,
             'created_at': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
         }
+
+        # 如果指定了用户名，添加到任务中
+        if username:
+            task['username'] = username
+
         self.tasks.append(task)
         self.save_tasks()
         return new_id
