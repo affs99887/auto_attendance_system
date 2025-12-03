@@ -221,6 +221,15 @@ async def main():
         # 设置全局变量，供调度器使用
         attendance_system_global = attendance_system
         
+        # 等待5秒后验证8:15提醒任务设置
+        await asyncio.sleep(5)
+        logging.info("验证8:15提醒任务设置...")
+        reminder_status = attendance_system.bot.verify_daily_reminder_setup()
+        if reminder_status:
+            logging.info("✅ 8:15提醒任务验证成功")
+        else:
+            logging.warning("⚠️ 8:15提醒任务验证失败，可能需要手动检查")
+        
         logging.info("所有服务已启动，系统运行中...")
 
         try:

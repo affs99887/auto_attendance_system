@@ -105,6 +105,7 @@ class TelegramBot:
                     self.app.add_handler(CommandHandler('auto_byebye', self.auto_byebye_command))
                     self.app.add_handler(CommandHandler('parallel', self.parallel_login_command))
                     self.app.add_handler(CommandHandler('mode', self.mode_command))
+                    self.app.add_handler(CommandHandler('test_reminder', self.test_reminder_command))
                     # Selenium完整流程命令
                     self.app.add_handler(CommandHandler('selenium_complete_punch_in', self.selenium_complete_punch_in_command))
                     self.app.add_handler(CommandHandler('selenium_complete_punch_out', self.selenium_complete_punch_out_command))
@@ -148,7 +149,8 @@ class TelegramBot:
             "/check - 查看最新打卡图片\n"
             "/check <用户名> - 查看指定用户的打卡图片\n"
             "/parallel - 并行登录多个用户\n"
-            "/mode - 切换登录模式（Selenium无头/传统图像识别）\n\n"
+            "/mode - 切换登录模式（Selenium无头/传统图像识别）\n"
+            "/test_reminder - 测试8:15每日提醒功能\n\n"
             "🛡️ 看门狗功能已内置启用\n"
             "🔄 打卡操作现在支持后台运行，可随时使用 /stop 终止"
         )
@@ -1228,41 +1230,46 @@ class TelegramBot:
                 # 处理使用上次配置的回调
                 punch_type = query.data.split('_')[-1]
                 last_config = self.setting_time_state[self.chat_id].get('last_config')
-                
+
                 if last_config:
+                    # 获取上次配置的用户名
+                    username = last_config.get('username', 'all')
+
                     if last_config['mode'] == 'delay':
                         # 延迟模式：重新计算目标时间
                         delay_minutes = last_config.get('delay_minutes', 1)
                         target_time = datetime.now() + timedelta(minutes=delay_minutes)
-                        await self._schedule_punch(punch_type, target_time.hour, target_time.minute)
-                        
+                        await self._schedule_punch(punch_type, target_time.hour, target_time.minute, username)
+
                         # 保存新的配置
                         config_data = {
                             'type': punch_type,
                             'mode': 'delay',
-                            'delay_minutes': delay_minutes
+                            'delay_minutes': delay_minutes,
+                            'username': username
                         }
                         self._save_settime_config(config_data)
-                        
+
                         await query.message.edit_text(f"✅ 已使用上次配置！\n设置{delay_minutes}分钟后执行{punch_type}打卡")
-                        
+
                     else:
                         # 指定时间模式：使用相同的时间
                         hour = last_config.get('hour')
                         minute = last_config.get('minute')
-                        await self._schedule_punch(punch_type, hour, minute)
-                        
+                        await self._schedule_punch(punch_type, hour, minute, username)
+
                         # 保存新的配置
                         config_data = {
                             'type': punch_type,
                             'mode': 'specific',
                             'hour': hour,
-                            'minute': minute
+                            'minute': minute,
+                            'username': username
                         }
                         self._save_settime_config(config_data)
-                        
+
                         await query.message.edit_text(f"✅ 已使用上次配置！\n设置在 {hour:02d}:{minute:02d} 执行{punch_type}打卡")
-                    
+
                     # 清理状态
                     if self.chat_id in self.setting_time_state:
                         del self.setting_time_state[self.chat_id]
@@ -1274,54 +1281,102 @@ class TelegramBot:
             elif query.data.startswith('daily_reminder_confirm_'):
                 # 处理每日提醒确认
                 punch_type = query.data.split('_')[-1]
-                
+
                 if self.daily_reminder_pending and self.daily_reminder_config:
                     config = self.daily_reminder_config
-                    
+
+                    # 获取配置中的用户名
+                    username = config.get('username', 'all')
+
                     if config['mode'] == 'delay':
                         # 延迟模式：基于当前时间重新计算
                         delay_minutes = config.get('delay_minutes', 1)
                         target_time = datetime.now() + timedelta(minutes=delay_minutes)
-                        await self._schedule_punch(punch_type, target_time.hour, target_time.minute)
-                        
+                        await self._schedule_punch(punch_type, target_time.hour, target_time.minute, username)
+
                         # 保存新的配置
                         config_data = {
                             'type': punch_type,
                             'mode': 'delay',
-                            'delay_minutes': delay_minutes
+                            'delay_minutes': delay_minutes,
+                            'username': username
                         }
                         self._save_settime_config(config_data)
-                        
+
                         await query.message.edit_text(
                             f"✅ 已确认使用昨日配置！\n"
                             f"⏰ 设置{delay_minutes}分钟后执行{punch_type}打卡\n"
                             f"📅 执行时间：{target_time.strftime('%H:%M')}"
                         )
-                        
+
                     else:
                         # 指定时间模式：使用相同的时间
                         hour = config.get('hour')
                         minute = config.get('minute')
-                        await self._schedule_punch(punch_type, hour, minute)
-                        
-                        # 保存新的配置
-                        config_data = {
-                            'type': punch_type,
-                            'mode': 'specific',
-                            'hour': hour,
-                            'minute': minute
-                        }
-                        self._save_settime_config(config_data)
-                        
-                        await query.message.edit_text(
-                            f"✅ 已确认使用昨日配置！\n"
-                            f"⏰ 设置在 {hour:02d}:{minute:02d} 执行{punch_type}打卡"
-                        )
-                    
+
+                        # 判断当前时间是否已超过预计打卡时间
+                        now = datetime.now()
+                        target_time = datetime(now.year, now.month, now.day, hour, minute)
+
+                        if now >= target_time:
+                            # 当前时间已超过预计打卡时间，立即执行打卡
+                            await query.message.edit_text(
+                                f"⚠️ 当前时间已超过预计打卡时间 {hour:02d}:{minute:02d}\n"
+                                f"⏰ 等待10秒后立即执行{punch_type}打卡..."
+                            )
+
+                            # 等待10秒
+                            await asyncio.sleep(10)
+
+                            try:
+                                # 根据打卡类型执行相应的操作
+                                if punch_type == 'in':
+                                    success, message = await self.attendance_system.punch_in()
+                                else:
+                                    success, message = await self.attendance_system.punch_out()
+
+                                if success:
+                                    await query.message.edit_text(f"✅ {punch_type}打卡执行完成：{message}")
+                                else:
+                                    await query.message.edit_text(f"❌ {punch_type}打卡执行失败：{message}")
+
+                                # 保存配置
+                                config_data = {
+                                    'type': punch_type,
+                                    'mode': 'specific',
+                                    'hour': hour,
+                                    'minute': minute,
+                                    'username': username
+                                }
+                                self._save_settime_config(config_data)
+
+                            except Exception as e:
+                                error_msg = f"执行{punch_type}打卡时发生错误: {str(e)}"
+                                logging.error(error_msg)
+                                await query.message.edit_text(f"❌ {error_msg}")
+                        else:
+                            # 当前时间早于预计打卡时间，正常设置定时任务
+                            await self._schedule_punch(punch_type, hour, minute, username)
+
+                            # 保存新的配置
+                            config_data = {
+                                'type': punch_type,
+                                'mode': 'specific',
+                                'hour': hour,
+                                'minute': minute,
+                                'username': username
+                            }
+                            self._save_settime_config(config_data)
+
+                            await query.message.edit_text(
+                                f"✅ 已确认使用昨日配置！\n"
+                                f"⏰ 设置在 {hour:02d}:{minute:02d} 执行{punch_type}打卡"
+                            )
+
                     # 清理状态
                     self.daily_reminder_pending = False
                     self.daily_reminder_config = None
-                    
+
                 else:
                     await query.message.edit_text("❌ 提醒已过期，请使用 /set_time 手动设置")
 
@@ -1383,29 +1438,105 @@ class TelegramBot:
                 else:
                     await query.message.edit_text("请输入小时数（0-23）：")
 
+            # 处理用户选择回调
+            elif query.data.startswith('settime_user_'):
+                parts = query.data.split('_')
+                # settime_user_{username} 或 settime_user_all
+                if parts[2] == 'all':
+                    username = 'all'
+                else:
+                    username = parts[2]
+
+                # 从状态中获取配置信息
+                state = self.setting_time_state[self.chat_id]
+                punch_type = state['type']
+                mode = state['mode']
+                hour = state['hour']
+                minute = state['minute']
+
+                # 执行调度
+                await self._schedule_punch(punch_type, hour, minute, username)
+
+                # 保存配置到历史记录
+                config_data = {
+                    'type': punch_type,
+                    'mode': mode,
+                    'hour': hour,
+                    'minute': minute,
+                    'username': username
+                }
+
+                # 如果是延时模式，添加延迟分钟数
+                if mode == 'delay':
+                    config_data['delay_minutes'] = state.get('delay_minutes', 0)
+
+                self._save_settime_config(config_data)
+
+                # 清理状态
+                if self.chat_id in self.setting_time_state:
+                    del self.setting_time_state[self.chat_id]
+                if self.chat_id in self.setting_time_timer and self.setting_time_timer[self.chat_id] is not None:
+                    self.setting_time_timer[self.chat_id].cancel()
+
+                # 显示确认消息
+                user_text = "全部用户" if username == 'all' else username
+                await query.message.edit_text(f"✅ 已为{user_text}设置{punch_type}打卡任务！")
+
             # 处理快速延时选择回调
             elif query.data.startswith('delay_quick_'):
                 parts = query.data.split('_')
                 delay_minutes = int(parts[2])
                 punch_type = parts[3]
-                
-                # 计算目标时间
+
+                # 计算目标时间并保存到状态
                 target_time = datetime.now() + timedelta(minutes=delay_minutes)
-                await self._schedule_punch(punch_type, target_time.hour, target_time.minute)
-                
-                # 保存配置到历史记录
-                config_data = {
-                    'type': punch_type,
-                    'mode': 'delay',
-                    'delay_minutes': delay_minutes
-                }
-                self._save_settime_config(config_data)
-                
-                # 清理状态
-                if self.chat_id in self.setting_time_state:
-                    del self.setting_time_state[self.chat_id]
-                    
-                await query.answer(f"已设置{delay_minutes}分钟后执行{punch_type}")
+                self.setting_time_state[self.chat_id].update({
+                    'delay_minutes': delay_minutes,
+                    'hour': target_time.hour,
+                    'minute': target_time.minute,
+                    'step': 'select_user'
+                })
+
+                # 显示用户选择界面
+                from modules.config import Config
+                user_configs = Config.get_user_configs()
+
+                # 创建用户选择按钮
+                keyboard = []
+
+                # 添加单个用户按钮（两个一行）
+                user_row = []
+                for user_config in user_configs:
+                    username = user_config['username']
+                    if username:  # 确保用户名存在
+                        user_row.append(
+                            InlineKeyboardButton(
+                                username,
+                                callback_data=f'settime_user_{username}'
+                            )
+                        )
+                        # 每两个用户一行
+                        if len(user_row) == 2:
+                            keyboard.append(user_row)
+                            user_row = []
+
+                # 添加剩余的用户按钮
+                if user_row:
+                    keyboard.append(user_row)
+
+                # 添加"全部一起"按钮
+                keyboard.append([
+                    InlineKeyboardButton(
+                        "👥 全部一起",
+                        callback_data=f'settime_user_all'
+                    )
+                ])
+
+                reply_markup = InlineKeyboardMarkup(keyboard)
+                await query.message.edit_text(
+                    f"⏰ 将在{delay_minutes}分钟后（{target_time.strftime('%H:%M')}）执行{punch_type}打卡\n\n请选择要为哪个用户设置：",
+                    reply_markup=reply_markup
+                )
 
             # 处理手动输入延时回调
             elif query.data.startswith('delay_manual_'):
@@ -1438,34 +1569,49 @@ class TelegramBot:
                     # 验证时间格式
                     datetime.strptime(punch_out_time, '%H:%M:%S')
 
-                    # 设置定时任务
-                    await query.message.edit_text("⏳ 正在设置定时任务...")
-
-                    # 计算延迟时间（分钟）
+                    # 计算时间差
                     current_time = datetime.now()
                     punch_out_datetime = datetime.strptime(punch_out_time, '%H:%M:%S').time()
                     today_punch_out = datetime.combine(current_time.date(), punch_out_datetime)
 
-                    # 如果设定时间已过，则设置为明天
-                    if today_punch_out <= current_time:
-                        today_punch_out = today_punch_out + timedelta(days=1)
+                    # 判断是立即执行还是设置定时任务
+                    if current_time >= today_punch_out:
+                        # 情况2：用户点击时间已晚于预计打卡时间，立即执行
+                        await query.message.edit_text("🚀 检测到当前时间已到达或超过预计打卡时间，正在立即执行下班打卡...")
 
-                    delay_minutes = int((today_punch_out - current_time).total_seconds() / 60)
+                        # 立即执行下班打卡
+                        success, message = await self.attendance_system.start_punch_operation("punch_out")
 
-                    # 设置定时任务
-                    retry_time = await self.attendance_system.schedule_retry_punch_out(delay_minutes, clear_existing=False)
-
-                    if retry_time:
-                        success_message = (
-                            f"✅ 自动下班打卡设置成功！\n\n"
-                            f"🕐 下班时间：{punch_out_time}\n"
-                            f"⏰ 执行时间：{today_punch_out.strftime('%Y-%m-%d %H:%M:%S')}\n"
-                            f"📋 任务已添加到定时任务列表\n\n"
-                            f"💡 您可以使用 /status 查看任务状态"
-                        )
-                        await query.message.edit_text(success_message)
+                        if success:
+                            await query.message.edit_text(
+                                f"✅ 下班打卡操作已启动\n\n"
+                                f"🕐 预计下班时间：{punch_out_time}\n"
+                                f"⏰ 执行时间：{current_time.strftime('%Y-%m-%d %H:%M:%S')}\n"
+                                f"📍 您可以使用 /status 查看进度"
+                            )
+                        else:
+                            await query.message.edit_text(f"❌ {message}")
                     else:
-                        await query.message.edit_text("❌ 设置定时任务失败，请稍后重试")
+                        # 情况1：用户点击时间早于预计打卡时间，设置定时任务
+                        await query.message.edit_text("⏳ 正在设置定时任务...")
+
+                        delay_minutes = int((today_punch_out - current_time).total_seconds() / 60)
+
+                        # 设置定时任务
+                        retry_time = await self.attendance_system.schedule_retry_punch_out(delay_minutes, clear_existing=False)
+
+                        if retry_time:
+                            success_message = (
+                                f"✅ 自动下班打卡设置成功！\n\n"
+                                f"🕐 下班时间：{punch_out_time}\n"
+                                f"⏰ 执行时间：{today_punch_out.strftime('%Y-%m-%d %H:%M:%S')}\n"
+                                f"⏱️ 距离执行还有：{delay_minutes}分钟\n"
+                                f"📋 任务已添加到定时任务列表\n\n"
+                                f"💡 您可以使用 /status 查看任务状态"
+                            )
+                            await query.message.edit_text(success_message)
+                        else:
+                            await query.message.edit_text("❌ 设置定时任务失败，请稍后重试")
 
                 except ValueError:
                     await query.message.edit_text("❌ 时间格式错误，操作已取消")
@@ -1486,33 +1632,47 @@ class TelegramBot:
                     # 验证时间格式 (HH:MM)
                     time_obj = datetime.strptime(estimated_time, '%H:%M')
 
-                    # 设置定时任务
-                    await query.message.edit_text("⏳ 正在设置自动下班任务...")
-
                     # 计算目标时间
                     current_time = datetime.now()
                     target_time = datetime.combine(current_time.date(), time_obj.time())
 
-                    # 如果设定时间已过，则设置为明天
-                    if target_time <= current_time:
-                        target_time = target_time + timedelta(days=1)
+                    # 判断是立即执行还是设置定时任务
+                    if current_time >= target_time:
+                        # 情况2：用户点击时间已晚于预计打卡时间，立即执行
+                        await query.message.edit_text("🚀 检测到当前时间已到达或超过预计打卡时间，正在立即执行Selenium完整下班流程...")
 
-                    # 使用专用的Selenium自动下班任务设置方法
-                    await self._schedule_selenium_punch_out(
-                        target_time.hour,
-                        target_time.minute,
-                        estimated_time
-                    )
+                        # 创建伪 Update 对象以调用 _execute_selenium_complete_flow
+                        fake_update = Update(update_id=update.callback_query.id, message=query.message)
 
-                    success_message = (
-                        f"✅ Selenium自动下班打卡设置成功！\n\n"
-                        f"🕐 预计下班时间：{estimated_time}\n"
-                        f"⏰ 执行时间：{target_time.strftime('%Y-%m-%d %H:%M')}\n"
-                        f"🔧 任务类型：Selenium完整下班流程\n"
-                        f"📋 任务已添加到定时任务列表\n\n"
-                        f"💡 您可以使用 /kill 查看和管理任务"
-                    )
-                    await query.message.edit_text(success_message)
+                        # 立即执行Selenium完整下班流程
+                        await self._execute_selenium_complete_flow(
+                            fake_update,
+                            flow_type="punch_out",
+                            special_handler=self._handle_punch_out_time_confirmation
+                        )
+
+                    else:
+                        # 情况1：用户点击时间早于预计打卡时间，设置定时任务
+                        await query.message.edit_text("⏳ 正在设置自动下班任务...")
+
+                        # 使用专用的Selenium自动下班任务设置方法
+                        await self._schedule_selenium_punch_out(
+                            target_time.hour,
+                            target_time.minute,
+                            estimated_time
+                        )
+
+                        delay_minutes = int((target_time - current_time).total_seconds() / 60)
+                        success_message = (
+                            f"✅ Selenium自动下班打卡设置成功！\n\n"
+                            f"🕐 预计下班时间：{estimated_time}\n"
+                            f"⏰ 执行时间：{target_time.strftime('%Y-%m-%d %H:%M')}\n"
+                            f"⏱️ 距离执行还有：{delay_minutes}分钟\n"
+                            f"🔧 任务类型：Selenium完整下班流程\n"
+                            f"📋 任务已添加到定时任务列表\n\n"
+                            f"💡 您可以使用 /kill 查看和管理任务"
+                        )
+                        await query.message.edit_text(success_message)
 
                 except ValueError:
                     await query.message.edit_text("❌ 时间格式错误，操作已取消")
@@ -1524,76 +1684,112 @@ class TelegramBot:
             elif query.data == 'cancel_auto_punch_out':
                 await query.message.edit_text("❌ 自动下班打卡设置已取消")
 
-            # 处理16:30自动触发autobyebye的回调
-            elif query.data == 'manual_autobyebye_execute':
-                # 一键执行autobyebye（无早上打卡记录时）
-                await query.message.edit_text("🚀 开始执行autobyebye...")
-                
+            # 处理获取上班时间的回调（打开浏览器）
+            elif query.data == 'fetch_punch_in_time':
+                await query.message.edit_text("🕐 正在通过浏览器获取当日上班打卡时间...")
+
                 try:
-                    # 调用attendance_system的自动下班方法
-                    success, message = await self.attendance_system.auto_byebye()
-                    
-                    if success:
-                        await query.message.edit_text(f"✅ autobyebye执行完成：{message}")
-                    else:
-                        await query.message.edit_text(f"❌ autobyebye执行失败：{message}")
-                        
+                    # 通过浏览器获取当日上班打卡时间
+                    success, punch_in_time, message = await self.attendance_system.get_today_punch_in_time()
+
+                    if not success:
+                        await query.message.edit_text(f"❌ 获取上班时间失败：{message}")
+                        return
+
+                    # 使用辅助方法处理上班时间并显示确认
+                    await self._process_punch_in_time_and_confirm(query, punch_in_time)
+
                 except Exception as e:
-                    error_msg = f"执行autobyebye时发生错误: {str(e)}"
+                    error_msg = f"获取上班时间时发生错误: {str(e)}"
                     logging.error(error_msg)
                     await query.message.edit_text(f"❌ {error_msg}")
 
-            elif query.data == 'manual_autobyebye_cancel':
-                await query.message.edit_text("❌ 已取消执行autobyebye")
+            # 处理手动输入上班时间的回调
+            elif query.data == 'manual_input_punch_in_time':
+                # 设置状态为等待输入上班时间
+                self.setting_time_state[self.chat_id] = {
+                    'step': 'input_punch_in_time',
+                    'source': 'auto_trigger'  # 标记来源是自动触发
+                }
+
+                # 设置超时
+                if self.chat_id in self.setting_time_timer and self.setting_time_timer[self.chat_id] is not None:
+                    self.setting_time_timer[self.chat_id].cancel()
+                self.setting_time_timer[self.chat_id] = asyncio.create_task(self._cancel_settime_timeout(self.chat_id))
+
+                await query.message.edit_text(
+                    "⏰ 请输入上班打卡时间\n\n"
+                    "格式：HH:MM（如 08:30 或 08：30）\n"
+                    "支持中英文冒号"
+                )
 
             elif query.data.startswith('auto_trigger_confirm_'):
-                # 16:30自动触发确认设置任务
+                # 16:35自动触发确认设置任务
                 punch_out_time = query.data.split('_')[-1]
-                
+
                 try:
                     # 解析时间，处理可能包含秒数的格式
                     time_parts = punch_out_time.split(':')
                     if len(time_parts) >= 2:
                         hour, minute = int(time_parts[0]), int(time_parts[1])
-                        logging.info(f"解析16:30自动下班时间: {punch_out_time} -> {hour:02d}:{minute:02d}")
+                        logging.info(f"解析16:35自动下班时间: {punch_out_time} -> {hour:02d}:{minute:02d}")
                     else:
                         raise ValueError(f"时间格式无效: {punch_out_time}")
-                    
-                    # 使用attendance_system设置定时任务
-                    success = await self.attendance_system.schedule_punch_out(hour, minute)
-                    
-                    if success:
-                        # 计算执行时间
-                        now = datetime.now()
-                        today_punch_out = datetime(now.year, now.month, now.day, hour, minute)
-                        
-                        # 如果时间已过，安排到明天
-                        if today_punch_out <= now:
-                            today_punch_out += timedelta(days=1)
-                        
-                        success_message = (
-                            f"✅ 16:30自动下班任务设置成功！\n\n"
-                            f"🎯 下班打卡时间：{punch_out_time}\n"
-                            f"⏰ 执行时间：{today_punch_out.strftime('%Y-%m-%d %H:%M:%S')}\n"
-                            f"📋 任务已添加到定时任务列表\n\n"
-                            f"💡 您可以使用 /status 查看任务状态"
-                        )
-                        await query.message.edit_text(success_message)
+
+                    # 计算时间差，判断是立即执行还是设置定时任务
+                    current_time = datetime.now()
+                    today_punch_out = datetime(current_time.year, current_time.month, current_time.day, hour, minute)
+
+                    # 判断是立即执行还是设置定时任务
+                    if current_time >= today_punch_out:
+                        # 情况2：用户点击时间已晚于或等于预计打卡时间，立即执行
+                        await query.message.edit_text("🚀 检测到当前时间已到达或超过预计打卡时间，正在立即执行下班打卡...")
+
+                        # 立即执行下班打卡
+                        success, message = await self.attendance_system.start_punch_operation("punch_out")
+
+                        if success:
+                            await query.message.edit_text(
+                                f"✅ 下班打卡操作已启动\n\n"
+                                f"🕐 预计下班时间：{punch_out_time}\n"
+                                f"⏰ 执行时间：{current_time.strftime('%Y-%m-%d %H:%M:%S')}\n"
+                                f"📍 您可以使用 /status 查看进度"
+                            )
+                        else:
+                            await query.message.edit_text(f"❌ {message}")
                     else:
-                        await query.message.edit_text("❌ 设置定时任务失败，请稍后重试")
+                        # 情况1：用户点击时间早于预计打卡时间，设置定时任务
+                        await query.message.edit_text("⏳ 正在设置定时任务...")
+
+                        # 使用attendance_system设置定时任务
+                        success = await self.attendance_system.schedule_punch_out(hour, minute)
+
+                        if success:
+                            delay_minutes = int((today_punch_out - current_time).total_seconds() / 60)
+                            success_message = (
+                                f"✅ 16:35自动下班任务设置成功！\n\n"
+                                f"🎯 下班打卡时间：{punch_out_time}\n"
+                                f"⏰ 执行时间：{today_punch_out.strftime('%Y-%m-%d %H:%M:%S')}\n"
+                                f"⏱️ 距离执行还有：{delay_minutes}分钟\n"
+                                f"📋 任务已添加到定时任务列表\n\n"
+                                f"💡 您可以使用 /status 查看任务状态"
+                            )
+                            await query.message.edit_text(success_message)
+                        else:
+                            await query.message.edit_text("❌ 设置定时任务失败，请稍后重试")
 
                 except ValueError:
                     await query.message.edit_text("❌ 时间格式错误，操作已取消")
                 except Exception as e:
-                    error_msg = f"设置16:30自动下班任务时发生错误: {str(e)}"
+                    error_msg = f"设置16:35自动下班任务时发生错误: {str(e)}"
                     logging.error(error_msg)
                     await query.message.edit_text(f"❌ {error_msg}")
 
             elif query.data == 'auto_trigger_cancel':
-                await query.message.edit_text("❌ 已取消16:30自动下班设置")
+                await query.message.edit_text("❌ 已取消16:35自动下班设置")
 
             elif query.data.startswith('auto_trigger_immediate_'):
-                # 16:30自动触发立即执行
+                # 16:35自动触发立即执行
                 punch_out_time = query.data.split('_')[-1]
                 
                 await query.message.edit_text("⏰ 等待10秒后开始执行下班打卡...")
@@ -1604,14 +1800,14 @@ class TelegramBot:
                 try:
                     # 直接执行下班打卡
                     success, message = await self.attendance_system.punch_out()
-                    
+
                     if success:
-                        await query.message.edit_text(f"✅ 16:30自动下班打卡执行完成：{message}")
+                        await query.message.edit_text(f"✅ 16:35自动下班打卡执行完成：{message}")
                     else:
-                        await query.message.edit_text(f"❌ 16:30自动下班打卡执行失败：{message}")
-                        
+                        await query.message.edit_text(f"❌ 16:35自动下班打卡执行失败：{message}")
+
                 except Exception as e:
-                    error_msg = f"执行16:30自动下班打卡时发生错误: {str(e)}"
+                    error_msg = f"执行16:35自动下班打卡时发生错误: {str(e)}"
                     logging.error(error_msg)
                     await query.message.edit_text(f"❌ {error_msg}")
 
@@ -1697,6 +1893,8 @@ class TelegramBot:
         # 标记需要重新初始化
         self._is_initialized = False
         self.app = None
+        # 重置每日提醒任务标志，确保重新初始化时会重新设置任务
+        self.daily_reminder_task_set = False
 
         await asyncio.sleep(5)  # 等待5秒后重启
 
@@ -1786,6 +1984,47 @@ class TelegramBot:
             pool_timeout=self.pool_timeout
         )
 
+    async def test_reminder_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """处理/test_reminder命令 - 测试8:15每日提醒功能"""
+        if str(update.message.chat_id) != self.chat_id:
+            await update.message.reply_text("您没有权限使用此机器人")
+            return
+        
+        try:
+            await update.message.reply_text("🧪 开始测试8:15每日提醒功能...")
+            
+            # 1. 验证任务设置
+            reminder_status = self.verify_daily_reminder_setup()
+            status_text = "✅ 任务设置正确" if reminder_status else "❌ 任务设置异常"
+            await update.message.reply_text(f"📋 任务设置检查: {status_text}")
+            
+            # 2. 显示当前任务信息
+            all_jobs = schedule.get_jobs()
+            reminder_jobs = [job for job in all_jobs if "daily_reminder_job" in str(job.job_func)]
+            
+            if reminder_jobs:
+                for i, job in enumerate(reminder_jobs):
+                    next_run = job.next_run.strftime('%Y-%m-%d %H:%M:%S') if job.next_run else "未知"
+                    await update.message.reply_text(f"📅 提醒任务 #{i+1}: 下次执行时间: {next_run}")
+            else:
+                await update.message.reply_text("⚠️ 未找到8:15提醒任务")
+            
+            # 3. 测试提醒功能
+            await update.message.reply_text("🔄 正在测试提醒功能...")
+            
+            try:
+                await self._send_daily_reminder_with_retry(max_retries=1)
+                await update.message.reply_text("✅ 提醒功能测试成功！")
+            except Exception as e:
+                await update.message.reply_text(f"❌ 提醒功能测试失败: {str(e)}")
+            
+            # 4. 显示系统状态
+            total_jobs = len(all_jobs)
+            await update.message.reply_text(f"📊 系统状态:\n- 总定时任务数: {total_jobs}\n- 8:15提醒任务: {'正常' if reminder_status else '异常'}")
+            
+        except Exception as e:
+            logging.error(f"测试8:15提醒功能时发生错误: {e}")
+            await update.message.reply_text(f"❌ 测试过程中发生错误: {str(e)}")
 
     async def settime_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """处理/settime命令"""
@@ -1811,28 +2050,39 @@ class TelegramBot:
         if last_config:
             config_date = datetime.strptime(last_config['config_date'], '%Y-%m-%d').strftime('%m-%d')
             config_type_text = "上班打卡" if last_config['type'] == 'in' else "下班打卡"
-            
+
+            # 获取用户信息
+            username = last_config.get('username', 'all')  # 默认为 'all' 以兼容旧配置
+            if username == 'all':
+                user_text = "全部一起打卡"
+                user_detail = "👥 用户：全部一起"
+            else:
+                user_text = f"仅{username}"
+                user_detail = f"👤 用户：{username}"
+
             # 构建详细的配置描述
             if last_config['mode'] == 'delay':
                 delay_minutes = last_config.get('delay_minutes', '?')
-                config_desc = f"延迟{delay_minutes}分钟{config_type_text}"
+                config_desc = f"延迟{delay_minutes}分钟{config_type_text}，{user_text}"
                 detail_info = (
                     f"📅 日期：{config_date}\n"
-                    f"📝 类型：{config_type_text}\n" 
+                    f"📝 类型：{config_type_text}\n"
                     f"⏰ 模式：延时执行\n"
-                    f"⏱️ 延迟：{delay_minutes}分钟"
+                    f"⏱️ 延迟：{delay_minutes}分钟\n"
+                    f"{user_detail}"
                 )
             else:
                 hour = last_config.get('hour', '?')
                 minute = last_config.get('minute', '?')
-                config_desc = f"指定时间{hour:02d}:{minute:02d}{config_type_text}"
+                config_desc = f"指定时间{hour:02d}:{minute:02d}{config_type_text}，{user_text}"
                 detail_info = (
                     f"📅 日期：{config_date}\n"
                     f"📝 类型：{config_type_text}\n"
                     f"⏰ 模式：指定时间\n"
-                    f"🕐 设定时间：{hour:02d}:{minute:02d}"
+                    f"🕐 设定时间：{hour:02d}:{minute:02d}\n"
+                    f"{user_detail}"
                 )
-            
+
             # 添加上次配置快速选择按钮
             keyboard.insert(0, [
                 InlineKeyboardButton(
@@ -1840,7 +2090,7 @@ class TelegramBot:
                     callback_data=f'settime_use_last_{last_config["type"]}'
                 )
             ])
-            
+
             message_text = f"🕐 检测到上次配置:\n{detail_info}\n\n{message_text}"
         
         reply_markup = InlineKeyboardMarkup(keyboard)
@@ -1896,21 +2146,55 @@ class TelegramBot:
                     await update.message.reply_text("请输入大于0的数字")
                     return
 
-                # 计算目标时间
+                # 计算目标时间并保存到状态
                 target_time = datetime.now() + timedelta(minutes=delay_minutes)
-                await self._schedule_punch(state['type'], target_time.hour, target_time.minute)
-                
-                # 保存配置到历史记录
-                config_data = {
-                    'type': state['type'],
-                    'mode': 'delay',
-                    'delay_minutes': delay_minutes
-                }
-                self._save_settime_config(config_data)
-                
-                del self.setting_time_state[self.chat_id]
-                if self.chat_id in self.setting_time_timer and self.setting_time_timer[self.chat_id] is not None:
-                    self.setting_time_timer[self.chat_id].cancel()
+                state.update({
+                    'delay_minutes': delay_minutes,
+                    'hour': target_time.hour,
+                    'minute': target_time.minute,
+                    'step': 'select_user'
+                })
+
+                # 显示用户选择界面
+                from modules.config import Config
+                user_configs = Config.get_user_configs()
+
+                # 创建用户选择按钮
+                keyboard = []
+
+                # 添加单个用户按钮（两个一行）
+                user_row = []
+                for user_config in user_configs:
+                    username = user_config['username']
+                    if username:  # 确保用户名存在
+                        user_row.append(
+                            InlineKeyboardButton(
+                                username,
+                                callback_data=f'settime_user_{username}'
+                            )
+                        )
+                        # 每两个用户一行
+                        if len(user_row) == 2:
+                            keyboard.append(user_row)
+                            user_row = []
+
+                # 添加剩余的用户按钮
+                if user_row:
+                    keyboard.append(user_row)
+
+                # 添加"全部一起"按钮
+                keyboard.append([
+                    InlineKeyboardButton(
+                        "👥 全部一起",
+                        callback_data=f'settime_user_all'
+                    )
+                ])
+
+                reply_markup = InlineKeyboardMarkup(keyboard)
+                await update.message.reply_text(
+                    f"⏰ 将在{delay_minutes}分钟后（{target_time.strftime('%H:%M')}）执行{state['type']}打卡\n\n请选择要为哪个用户设置：",
+                    reply_markup=reply_markup
+                )
 
             except ValueError:
                 await update.message.reply_text("请输入有效的数字")
@@ -1931,24 +2215,100 @@ class TelegramBot:
             try:
                 minute = int(text)
                 if 0 <= minute <= 59:
-                    await self._schedule_punch(state['type'], state['hour'], minute)
-                    
-                    # 保存配置到历史记录
-                    config_data = {
-                        'type': state['type'],
-                        'mode': 'specific',
-                        'hour': state['hour'],
-                        'minute': minute
-                    }
-                    self._save_settime_config(config_data)
-                    
-                    del self.setting_time_state[self.chat_id]
-                    if self.chat_id in self.setting_time_timer and self.setting_time_timer[self.chat_id] is not None:
-                        self.setting_time_timer[self.chat_id].cancel()
+                    # 保存分钟数到状态
+                    state.update({
+                        'minute': minute,
+                        'step': 'select_user'
+                    })
+
+                    # 显示用户选择界面
+                    from modules.config import Config
+                    user_configs = Config.get_user_configs()
+
+                    # 创建用户选择按钮
+                    keyboard = []
+
+                    # 添加单个用户按钮（两个一行）
+                    user_row = []
+                    for user_config in user_configs:
+                        username = user_config['username']
+                        if username:  # 确保用户名存在
+                            user_row.append(
+                                InlineKeyboardButton(
+                                    username,
+                                    callback_data=f'settime_user_{username}'
+                                )
+                            )
+                            # 每两个用户一行
+                            if len(user_row) == 2:
+                                keyboard.append(user_row)
+                                user_row = []
+
+                    # 添加剩余的用户按钮
+                    if user_row:
+                        keyboard.append(user_row)
+
+                    # 添加"全部一起"按钮
+                    keyboard.append([
+                        InlineKeyboardButton(
+                            "👥 全部一起",
+                            callback_data=f'settime_user_all'
+                        )
+                    ])
+
+                    reply_markup = InlineKeyboardMarkup(keyboard)
+                    await update.message.reply_text(
+                        f"⏰ 将在{state['hour']:02d}:{minute:02d}执行{state['type']}打卡\n\n请选择要为哪个用户设置：",
+                        reply_markup=reply_markup
+                    )
                 else:
                     await update.message.reply_text("请输入0-59之间的数字")
             except ValueError:
                 await update.message.reply_text("请输入有效的数字")
+
+        elif state['step'] == 'input_punch_in_time':
+            try:
+                # 处理中英文冒号
+                time_text = text.replace('：', ':').strip()
+
+                # 验证时间格式 (HH:MM)
+                try:
+                    time_obj = datetime.strptime(time_text, '%H:%M')
+                    punch_in_time = time_obj.strftime('%H:%M')
+
+                    # 验证时间范围
+                    hour = time_obj.hour
+                    minute = time_obj.minute
+
+                    if not (0 <= hour <= 23 and 0 <= minute <= 59):
+                        await update.message.reply_text("❌ 时间超出有效范围\n请输入有效的时间（00:00-23:59）")
+                        return
+
+                    # 清理状态
+                    del self.setting_time_state[self.chat_id]
+                    if self.chat_id in self.setting_time_timer and self.setting_time_timer[self.chat_id] is not None:
+                        self.setting_time_timer[self.chat_id].cancel()
+
+                    # 使用辅助方法处理上班时间并显示确认
+                    await self._process_punch_in_time_and_confirm(update, punch_in_time)
+
+                except ValueError:
+                    await update.message.reply_text(
+                        "❌ 时间格式错误\n\n"
+                        "请按照以下格式输入：\n"
+                        "HH:MM（如 08:30 或 08：30）"
+                    )
+
+            except Exception as e:
+                error_msg = f"处理上班时间输入时发生错误: {str(e)}"
+                logging.error(error_msg)
+                await update.message.reply_text(f"❌ {error_msg}")
+
+                # 清理状态
+                if self.chat_id in self.setting_time_state:
+                    del self.setting_time_state[self.chat_id]
+                if self.chat_id in self.setting_time_timer and self.setting_time_timer[self.chat_id] is not None:
+                    self.setting_time_timer[self.chat_id].cancel()
 
     async def _schedule_selenium_punch_out(self, hour, minute, estimated_time):
         """设置Selenium自动下班打卡任务"""
@@ -1999,8 +2359,17 @@ class TelegramBot:
 
         logging.info(f"已设置Selenium自动下班任务: {target_time.strftime('%Y-%m-%d %H:%M')}")
 
-    async def _schedule_punch(self, punch_type, hour, minute):
-        """设置定时打卡任务"""
+    async def _schedule_punch(self, punch_type, hour, minute, username=None):
+        """设置定时打卡任务
+
+        Args:
+            punch_type: 打卡类型 ('in', 'out', '上班', '下班')
+            hour: 小时 (0-23)
+            minute: 分钟 (0-59)
+            username: 用户名（可选）。'all' 表示所有用户，具体用户名表示单个用户，None 表示默认用户
+        """
+        from modules.config import Config
+
         time_str = f"{hour:02d}:{minute:02d}"
         target_time = datetime.strptime(time_str, "%H:%M").replace(
             year=datetime.now().year,
@@ -2031,28 +2400,72 @@ class TelegramBot:
         # 清除schedule中的任务并重新加载
         schedule.clear()
 
-        # 添加新任务
-        task_id = self.attendance_system.task_manager.add_task(
-            task_type=task_type,
-            scheduled_time=time_str
-        )
+        # 如果是"全部一起"，为每个用户创建独立任务
+        if username == 'all':
+            user_configs = Config.get_user_configs()
+            task_ids = []
 
-        if task_type == "punch_in":
-            async def punch_in_job():
-                await self.attendance_system.punch_in()
-                # 执行完后删除任务
-                self.attendance_system.task_manager.remove_task_by_id(task_id)
-                schedule.clear()
-            schedule.every().day.at(time_str).do(lambda: asyncio.create_task(punch_in_job()))
-            await self.send_message("设置成功", f"已设置在 {target_time.strftime('%Y-%m-%d %H:%M')} 自动{display_type}打卡")
+            for user_config in user_configs:
+                user_name = user_config['username']
+                if user_name:  # 确保用户名存在
+                    # 为每个用户添加任务
+                    task_id = self.attendance_system.task_manager.add_task(
+                        task_type=task_type,
+                        scheduled_time=time_str,
+                        username=user_name
+                    )
+                    task_ids.append((task_id, user_name))
+
+            # 创建统一的任务执行函数
+            if task_type == "punch_in":
+                async def punch_in_job():
+                    # 调用punch_in()不传username参数，表示为所有用户打卡
+                    await self.attendance_system.punch_in()
+                    # 执行完后删除所有任务
+                    for task_id, _ in task_ids:
+                        self.attendance_system.task_manager.remove_task_by_id(task_id)
+                    schedule.clear()
+                schedule.every().day.at(time_str).do(lambda: asyncio.create_task(punch_in_job()))
+            else:
+                async def punch_out_job():
+                    # 调用punch_out()不传username参数，表示为所有用户打卡
+                    await self.attendance_system.punch_out()
+                    # 执行完后删除所有任务
+                    for task_id, _ in task_ids:
+                        self.attendance_system.task_manager.remove_task_by_id(task_id)
+                    schedule.clear()
+                schedule.every().day.at(time_str).do(lambda: asyncio.create_task(punch_out_job()))
+
+            user_list = "、".join([name for _, name in task_ids])
+            await self.send_message("设置成功", f"已为所有用户（{user_list}）设置在 {target_time.strftime('%Y-%m-%d %H:%M')} 自动{display_type}打卡")
+
         else:
-            async def punch_out_job():
-                await self.attendance_system.punch_out()
-                # 执行完后删除任务
-                self.attendance_system.task_manager.remove_task_by_id(task_id)
-                schedule.clear()
-            schedule.every().day.at(time_str).do(lambda: asyncio.create_task(punch_out_job()))
-            await self.send_message("设置成功", f"已设置在 {target_time.strftime('%Y-%m-%d %H:%M')} 自动{display_type}打卡")
+            # 单个用户或默认用户
+            task_id = self.attendance_system.task_manager.add_task(
+                task_type=task_type,
+                scheduled_time=time_str,
+                username=username
+            )
+
+            if task_type == "punch_in":
+                async def punch_in_job():
+                    # 传递username参数，只为指定用户打卡
+                    await self.attendance_system.punch_in(username)
+                    # 执行完后删除任务
+                    self.attendance_system.task_manager.remove_task_by_id(task_id)
+                    schedule.clear()
+                schedule.every().day.at(time_str).do(lambda: asyncio.create_task(punch_in_job()))
+            else:
+                async def punch_out_job():
+                    # 传递username参数，只为指定用户打卡
+                    await self.attendance_system.punch_out(username)
+                    # 执行完后删除任务
+                    self.attendance_system.task_manager.remove_task_by_id(task_id)
+                    schedule.clear()
+                schedule.every().day.at(time_str).do(lambda: asyncio.create_task(punch_out_job()))
+
+            user_info = f"（{username}）" if username else ""
+            await self.send_message("设置成功", f"已设置在 {target_time.strftime('%Y-%m-%d %H:%M')} 自动{display_type}打卡{user_info}")
 
     def close_browser(self):
         """通过识别关闭按钮关闭浏览器窗口"""
@@ -2355,19 +2768,27 @@ class TelegramBot:
             return None
 
     def _setup_daily_reminder(self):
-        """设置每日8:15提醒任务和16:30自动下班任务"""
+        """设置每日8:15提醒任务和16:35自动下班任务"""
         try:
-            # 防止重复设置
-            if self.daily_reminder_task_set:
-                logging.debug("每日提醒任务已设置，跳过重复设置")
+            # 检查任务是否真实存在（不仅依赖标志）
+            existing_reminder_jobs = [job for job in schedule.jobs if hasattr(job, 'job_func') and job.job_func.__name__ in ['daily_reminder_job', 'auto_trigger_autobyebye_job']]
+
+            # 如果标志为True但任务不存在，说明任务丢失，需要重新设置
+            if self.daily_reminder_task_set and existing_reminder_jobs:
+                logging.debug("每日提醒任务已设置且存在，跳过重复设置")
                 return
-            
+
+            # 如果标志为True但任务不存在，重置标志
+            if self.daily_reminder_task_set and not existing_reminder_jobs:
+                logging.warning("检测到每日提醒任务标志为True但任务不存在，重新设置任务")
+                self.daily_reminder_task_set = False
+
             # 清理所有现有的每日提醒任务（避免累积）
             jobs_to_remove = []
             for job in schedule.jobs:
                 if hasattr(job, 'job_func') and job.job_func.__name__ in ['daily_reminder_job', 'auto_trigger_autobyebye_job']:
                     jobs_to_remove.append(job)
-            
+
             for job in jobs_to_remove:
                 schedule.cancel_job(job)
                 logging.debug("清理了重复的每日提醒/自动下班任务")
@@ -2376,7 +2797,7 @@ class TelegramBot:
             def is_work_day():
                 return is_workday(datetime.now().date())
             
-            # 创建8:15提醒任务
+            # 创建8:15提醒任务（增强版，支持重试）
             def daily_reminder_job():
                 current_time = datetime.now()
                 logging.info(f"8:15提醒任务触发 - 当前时间: {current_time.strftime('%Y-%m-%d %H:%M:%S')}")
@@ -2386,29 +2807,38 @@ class TelegramBot:
                 if work_day_result:
                     logging.info("确认为工作日，启动每日提醒任务")
                     try:
-                        task = asyncio.create_task(self._send_daily_reminder())
-                        logging.info("8:15每日提醒任务已创建并启动")
+                        task = asyncio.create_task(self._send_daily_reminder_with_retry())
+                        logging.info("8:15每日提醒任务已创建并启动（带重试机制）")
                         return task
                     except Exception as e:
                         logging.error(f"创建8:15每日提醒任务失败: {e}")
-                        raise
+                        # 记录失败但不抛出异常，避免影响其他任务
+                        logging.error(f"将在5分钟后重试8:15提醒任务")
+                        # 设置一个5分钟后的重试任务
+                        retry_time = (current_time + timedelta(minutes=5)).strftime("%H:%M")
+                        try:
+                            schedule.every().day.at(retry_time).do(lambda: asyncio.create_task(self._send_daily_reminder_with_retry())).tag('daily_reminder_retry')
+                            logging.info(f"已设置重试任务在 {retry_time} 执行")
+                        except Exception as retry_e:
+                            logging.error(f"设置重试任务失败: {retry_e}")
+                        return None
                 else:
                     logging.info("非工作日，跳过每日提醒任务")
                     return None
             
-            # 创建16:30自动下班任务
+            # 创建16:35自动下班任务
             def auto_trigger_autobyebye_job():
-                logging.info("16:30自动下班任务触发 - 检查是否为工作日")
+                logging.info("16:35自动下班任务触发 - 检查是否为工作日")
                 if is_work_day():
-                    logging.info("确认为工作日，启动16:30自动下班任务")
+                    logging.info("确认为工作日，启动16:35自动下班任务")
                     asyncio.create_task(self._auto_trigger_autobyebye())
                 else:
-                    logging.info("非工作日，跳过16:30自动下班任务")
-            
+                    logging.info("非工作日，跳过16:35自动下班任务")
+
             # 每天8:15执行提醒任务
             reminder_job = schedule.every().day.at("08:15").do(daily_reminder_job)
-            # 每天16:30执行自动下班任务
-            autobyebye_job = schedule.every().day.at("16:30").do(auto_trigger_autobyebye_job)
+            # 每天16:35执行自动下班任务
+            autobyebye_job = schedule.every().day.at("16:35").do(auto_trigger_autobyebye_job)
             
             self.daily_reminder_task_set = True
             
@@ -2416,13 +2846,80 @@ class TelegramBot:
             next_reminder_run = reminder_job.next_run
             next_autobyebye_run = autobyebye_job.next_run
             
-            logging.info(f"已设置每日8:15提醒任务和16:30自动下班任务")
+            logging.info(f"已设置每日8:15提醒任务和16:35自动下班任务")
             logging.info(f"8:15提醒任务下次执行时间: {next_reminder_run}")
-            logging.info(f"16:30自动下班任务下次执行时间: {next_autobyebye_run}")
+            logging.info(f"16:35自动下班任务下次执行时间: {next_autobyebye_run}")
             logging.info(f"当前schedule任务总数: {len(schedule.jobs)}")
             
         except Exception as e:
             logging.error(f"设置每日提醒任务失败: {e}")
+    
+    def verify_daily_reminder_setup(self):
+        """验证每日提醒任务设置是否正确"""
+        try:
+            all_jobs = schedule.get_jobs()
+            reminder_jobs = [job for job in all_jobs if "daily_reminder_job" in str(job.job_func)]
+
+            if not reminder_jobs:
+                logging.warning("未找到8:15每日提醒任务，重置标志并尝试重新设置...")
+                # 重置标志以确保可以重新设置
+                self.daily_reminder_task_set = False
+                self._setup_daily_reminder()
+                # 再次验证
+                all_jobs = schedule.get_jobs()
+                reminder_jobs = [job for job in all_jobs if "daily_reminder_job" in str(job.job_func)]
+                if not reminder_jobs:
+                    logging.error("重新设置后仍未找到8:15每日提醒任务")
+                    return False
+                else:
+                    logging.info("8:15每日提醒任务重新设置成功")
+                    return True
+            
+            # 检查8:15提醒任务的下次执行时间
+            for job in reminder_jobs:
+                next_run = job.next_run
+                if next_run:
+                    next_run_time = next_run.strftime("%H:%M")
+                    if next_run_time == "08:15":
+                        logging.info(f"✅ 8:15每日提醒任务设置正确，下次执行时间: {next_run}")
+                        return True
+                    else:
+                        logging.warning(f"⚠️ 8:15提醒任务时间不正确: {next_run_time}")
+            
+            logging.warning("8:15每日提醒任务可能设置不正确")
+            return False
+            
+        except Exception as e:
+            logging.error(f"验证每日提醒任务设置时发生错误: {e}")
+            return False
+
+    async def _send_daily_reminder_with_retry(self, max_retries=3):
+        """发送每日提醒（带重试机制）"""
+        for attempt in range(max_retries):
+            try:
+                logging.info(f"尝试发送每日提醒 (第{attempt + 1}次尝试)")
+                await self._send_daily_reminder()
+                logging.info("每日提醒发送成功")
+                # 清理可能存在的重试任务
+                self._clear_retry_reminder_tasks()
+                return
+            except Exception as e:
+                logging.error(f"发送每日提醒失败 (第{attempt + 1}次尝试): {e}")
+                if attempt < max_retries - 1:
+                    wait_time = (attempt + 1) * 2  # 递增等待时间：2, 4, 6秒
+                    logging.info(f"等待{wait_time}秒后重试...")
+                    await asyncio.sleep(wait_time)
+                else:
+                    logging.error("所有重试尝试都失败，放弃发送每日提醒")
+    
+    def _clear_retry_reminder_tasks(self):
+        """清理重试提醒任务"""
+        try:
+            # 移除所有带有 'daily_reminder_retry' 标签的任务
+            schedule.clear('daily_reminder_retry')
+            logging.info("已清理重试提醒任务")
+        except Exception as e:
+            logging.error(f"清理重试提醒任务失败: {e}")
 
     async def _send_daily_reminder(self):
         """发送每日提醒"""
@@ -2498,32 +2995,35 @@ class TelegramBot:
                 logging.error(f"发送每日提醒失败: {e}")
 
     async def _auto_trigger_autobyebye(self):
-        """16:30自动触发autobyebye功能"""
+        """16:35自动触发autobyebye功能"""
         try:
             current_time = datetime.now()
-            logging.info(f"开始执行16:30自动下班任务 - 当前时间: {current_time.strftime('%Y-%m-%d %H:%M:%S')}")
+            logging.info(f"开始执行16:35自动下班任务 - 当前时间: {current_time.strftime('%Y-%m-%d %H:%M:%S')}")
             
             # 获取当日上班打卡时间，检查是否有早上打卡记录
             success, punch_in_time, message = await self.attendance_system.get_today_punch_in_time()
             
             if not success:
-                # 没有早上打卡记录，发送提示消息并提供一键执行按钮
+                # 没有早上打卡记录，询问用户如何获取上班时间
                 keyboard = [
                     [
-                        InlineKeyboardButton("🚀 一键执行autobyebye", callback_data='manual_autobyebye_execute'),
-                        InlineKeyboardButton("❌ 暂不执行", callback_data='manual_autobyebye_cancel')
+                        InlineKeyboardButton("✅ 可以，打开浏览器获取", callback_data='fetch_punch_in_time')
+                    ],
+                    [
+                        InlineKeyboardButton("⏰ 不可以，我手动输入时间", callback_data='manual_input_punch_in_time')
                     ]
                 ]
                 reply_markup = InlineKeyboardMarkup(keyboard)
-                
+
                 message_text = (
-                    f"🕐 16:30自动下班检测\n\n"
-                    f"❌ 因早上无打卡记录，为避免打断电脑操作，暂不执行autobyebye\n\n"
-                    f"💡 如果您需要执行autobyebye，可点击下方按钮"
+                    f"🕐 16:35自动下班检测\n\n"
+                    f"❌ 本地无上班打卡记录\n\n"
+                    f"📝 需要获取上班时间以计算下班时间\n\n"
+                    f"💡 是否可以打开浏览器获取上班时间？"
                 )
-                
+
                 await self.send_message_with_reply_markup("自动下班检测", message_text, reply_markup)
-                logging.info("发送无早上打卡记录提示完成")
+                logging.info("发送上班时间获取确认消息完成")
                 return
             
             # 有早上打卡记录，计算下班时间并发送确认消息
@@ -2563,7 +3063,7 @@ class TelegramBot:
                 reply_markup = InlineKeyboardMarkup(keyboard)
                 
                 confirm_message = (
-                    f"🎯 16:30自动下班检测\n\n"
+                    f"🎯 16:35自动下班检测\n\n"
                     f"✅ 检测到今日早上打卡时间：{punch_in_time}\n"
                     f"🕐 {calc_message}\n"
                     f"⏰ 工作时长：8小时15分钟 + 1-3分钟随机延迟\n\n"
@@ -2584,7 +3084,7 @@ class TelegramBot:
                 reply_markup = InlineKeyboardMarkup(keyboard)
                 
                 overtime_message = (
-                    f"🎯 16:30自动下班检测\n\n"
+                    f"🎯 16:35自动下班检测\n\n"
                     f"✅ 检测到今日早上打卡时间：{punch_in_time}\n"
                     f"🕐 计算下班时间：{punch_out_time}\n"
                     f"⚠️ 当前已超过计算的下班时间\n\n"
@@ -2595,12 +3095,69 @@ class TelegramBot:
                 await self.send_message_with_reply_markup("自动下班检测", overtime_message, reply_markup)
             
             end_time = datetime.now()
-            logging.info(f"16:30自动下班任务执行完成 - 结束时间: {end_time.strftime('%Y-%m-%d %H:%M:%S')}")
-            
+            logging.info(f"16:35自动下班任务执行完成 - 结束时间: {end_time.strftime('%Y-%m-%d %H:%M:%S')}")
+
         except Exception as e:
             error_time = datetime.now()
-            logging.error(f"执行16:30自动下班任务失败 - 错误时间: {error_time.strftime('%Y-%m-%d %H:%M:%S')}, 错误: {e}")
-            await self.send_message("自动下班检测", f"❌ 16:30自动下班检测失败：{str(e)}")
+            logging.error(f"执行16:35自动下班任务失败 - 错误时间: {error_time.strftime('%Y-%m-%d %H:%M:%S')}, 错误: {e}")
+            await self.send_message("自动下班检测", f"❌ 16:35自动下班检测失败：{str(e)}")
+
+    async def _process_punch_in_time_and_confirm(self, query_or_update, punch_in_time: str):
+        """
+        处理上班时间并显示下班打卡确认
+
+        Args:
+            query_or_update: CallbackQuery 或 Update 对象
+            punch_in_time: 上班打卡时间字符串 (格式: HH:MM 或 HH:MM:SS)
+        """
+        try:
+            # 计算下班时间
+            calc_success, punch_out_time, calc_message = self.attendance_system.calculate_punch_out_time(punch_in_time)
+
+            if not calc_success:
+                error_msg = f"❌ 计算下班时间失败：{calc_message}"
+                if hasattr(query_or_update, 'message'):
+                    # CallbackQuery
+                    await query_or_update.message.edit_text(error_msg)
+                else:
+                    # Update
+                    await query_or_update.message.reply_text(error_msg)
+                return
+
+            # 创建确认按钮
+            keyboard = [
+                [
+                    InlineKeyboardButton("✅ 确认设置", callback_data=f'auto_byebye_confirm_{punch_out_time}'),
+                    InlineKeyboardButton("❌ 取消", callback_data='auto_byebye_cancel')
+                ]
+            ]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+
+            # 构建确认消息
+            confirm_message = (
+                f"🎯 自动下班打卡设置\n\n"
+                f"📍 上班时间：{punch_in_time}\n"
+                f"🕐 {calc_message}\n"
+                f"⏰ 工作时长：8小时15分钟 + 1-3分钟随机延迟\n\n"
+                f"💡 确认后将自动设置定时任务或立即执行（根据当前时间判断）\n\n"
+                f"请选择操作："
+            )
+
+            # 发送确认消息
+            if hasattr(query_or_update, 'message'):
+                # CallbackQuery
+                await query_or_update.message.edit_text(confirm_message, reply_markup=reply_markup)
+            else:
+                # Update
+                await query_or_update.message.reply_text(confirm_message, reply_markup=reply_markup)
+
+        except Exception as e:
+            error_msg = f"❌ 处理上班时间时发生错误: {str(e)}"
+            logging.error(f"_process_punch_in_time_and_confirm 错误: {e}")
+            if hasattr(query_or_update, 'message'):
+                await query_or_update.message.edit_text(error_msg)
+            else:
+                await query_or_update.message.reply_text(error_msg)
 
     async def send_message_with_reply_markup(self, title, content, reply_markup):
         """发送带有回复标记的消息"""

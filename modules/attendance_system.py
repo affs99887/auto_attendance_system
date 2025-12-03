@@ -1186,33 +1186,61 @@ class AttendanceSystem:
             for job in punch_out_jobs:
                 schedule.cancel_job(job)
             logging.info(f"已移除{len(punch_out_jobs)}个已有的下班打卡定时任务")
-            
-            async def punch_out_job():
-                try:
-                    logging.info(f"执行定时下班打卡任务 ({time_str})")
-                    await self.punch_out()
-                    # 打卡完成后发送状态信息
-                    await self.send_daily_status()
-                    logging.info(f"定时下班打卡任务 ({time_str}) 执行完成")
-                except Exception as e:
-                    logging.error(f"执行定时下班打卡任务时发生错误: {str(e)}")
-            
-            # 设置定时任务
-            schedule.every().day.at(time_str).do(lambda: asyncio.create_task(punch_out_job()))
-            logging.info(f"已设置定时任务: 每天{time_str}执行下班打卡")
-            
+
             # 删除已有的下班打卡任务记录
             saved_tasks = self.task_manager.get_tasks()
             for task in saved_tasks:
                 if task['type'] == 'punch_out':
                     self.task_manager.remove_task_by_id(task['id'])
                     logging.info(f"已从任务管理器中移除下班打卡任务 #{task['id']}")
-            
-            # 添加新的定时任务记录
+
+            # 添加新的定时任务记录（在定义函数之前创建，以便函数可以引用task_id）
             task_id = self.task_manager.add_task('punch_out', time_str)
             logging.info(f"保存定时任务到文件，任务ID: {task_id}")
-            
-            await self.send_notification("定时设置", f"设置下班打卡任务 #{task_id}: {time_str}")
+
+            async def punch_out_job():
+                try:
+                    # 获取任务信息，检查是否应该执行
+                    task_info = self.task_manager.get_task_by_id(task_id)
+                    if not task_info:
+                        logging.warning(f"任务 #{task_id} 不存在，跳过执行")
+                        return schedule.CancelJob
+
+                    # 检查当前日期是否为任务创建日期
+                    created_date = datetime.strptime(task_info['created_at'], '%Y-%m-%d %H:%M:%S').date()
+                    current_date = datetime.now().date()
+
+                    if current_date != created_date:
+                        # 如果不是创建当天，检查是否为工作日
+                        if not is_workday(current_date):
+                            logging.info(f"非创建日期且非工作日（创建于{created_date}），跳过下班打卡任务 #{task_id}")
+                            return
+                        else:
+                            logging.info(f"非创建日期但是工作日（创建于{created_date}），继续执行下班打卡任务 #{task_id}")
+                    else:
+                        logging.info(f"任务创建当天，执行定时下班打卡任务 ({time_str})")
+
+                    # 执行打卡
+                    await self.punch_out()
+                    # 打卡完成后发送状态信息
+                    await self.send_daily_status()
+                    logging.info(f"定时下班打卡任务 ({time_str}) 执行完成")
+
+                    # 执行成功后删除任务
+                    self.task_manager.remove_task_by_id(task_id)
+                    logging.info(f"已删除已执行的下班打卡任务 #{task_id}")
+
+                    # 返回 CancelJob 以从 schedule 中移除该任务
+                    return schedule.CancelJob
+
+                except Exception as e:
+                    logging.error(f"执行定时下班打卡任务时发生错误: {str(e)}")
+
+            # 设置定时任务
+            schedule.every().day.at(time_str).do(lambda: asyncio.create_task(punch_out_job()))
+            logging.info(f"已设置定时任务: 每天{time_str}执行下班打卡（仅在创建当天或工作日执行）")
+
+            await self.send_notification("定时设置", f"设置下班打卡任务 #{task_id}: {time_str}\n任务将在今天执行，次日仅在工作日执行")
             
             return True
         except Exception as e:
@@ -1236,18 +1264,47 @@ class AttendanceSystem:
         saved_tasks = self.task_manager.get_tasks()
         for task in saved_tasks:
             if task['type'] == 'punch_out':
-                async def punch_out_job():
+                task_id = task['id']
+                task_time = task['scheduled_time']
+
+                async def punch_out_job(tid=task_id, ttime=task_time):
                     try:
+                        # 获取任务信息，检查是否应该执行
+                        task_info = self.task_manager.get_task_by_id(tid)
+                        if not task_info:
+                            logging.warning(f"任务 #{tid} 不存在，跳过执行")
+                            return schedule.CancelJob
+
+                        # 检查当前日期是否为任务创建日期
+                        created_date = datetime.strptime(task_info['created_at'], '%Y-%m-%d %H:%M:%S').date()
+                        current_date = datetime.now().date()
+
+                        if current_date != created_date:
+                            # 如果不是创建当天，检查是否为工作日
+                            if not is_workday(current_date):
+                                logging.info(f"非创建日期且非工作日（创建于{created_date}），跳过下班打卡任务 #{tid}")
+                                return
+                            else:
+                                logging.info(f"非创建日期但是工作日（创建于{created_date}），继续执行下班打卡任务 #{tid}")
+                        else:
+                            logging.info(f"任务创建当天，执行定时下班打卡任务 ({ttime})")
+
+                        # 执行打卡
                         await self.punch_out()
                         # 打卡完成后发送状态信息
                         await self.send_daily_status()
-                        # 删除已执行的任务
-                        self.task_manager.clear_tasks()
-                        schedule.clear()
-                        # 重新初始化每日状态推送任务
-                        schedule.every().day.at(self.daily_status_time).do(lambda: asyncio.create_task(daily_status_job()))
+                        logging.info(f"定时下班打卡任务 ({ttime}) 执行完成")
+
+                        # 执行成功后删除任务
+                        self.task_manager.remove_task_by_id(tid)
+                        logging.info(f"已删除已执行的下班打卡任务 #{tid}")
+
+                        # 返回 CancelJob 以从 schedule 中移除该任务
+                        return schedule.CancelJob
+
                     except Exception as e:
                         logging.error(f"执行定时下班打卡任务时发生错误: {str(e)}")
+
                 schedule.every().day.at(task['scheduled_time']).do(lambda: asyncio.create_task(punch_out_job()))
             elif task['type'] == 'punch_in':
                 async def punch_in_job():
@@ -2051,8 +2108,13 @@ class AttendanceSystem:
 
         return message_content
 
-    async def start_punch_operation(self, operation_type):
-        """启动打卡操作（公共接口）"""
+    async def start_punch_operation(self, operation_type, username=None):
+        """启动打卡操作（公共接口）
+
+        Args:
+            operation_type: 操作类型 ('punch_in' 或 'punch_out')
+            username: 可选，指定要打卡的用户名。如果为None，则为所有用户打卡
+        """
         async with self.operation_lock:
             if self.current_operation is not None:
                 return False, f"当前已有{self.current_operation}操作正在进行中，请等待完成或使用/stop命令取消"
@@ -2064,9 +2126,9 @@ class AttendanceSystem:
 
             # 启动后台任务
             if operation_type == "punch_in":
-                self.operation_task = asyncio.create_task(self.punch_in_internal(self.operation_cancel_event))
+                self.operation_task = asyncio.create_task(self.punch_in_internal(self.operation_cancel_event, username))
             elif operation_type == "punch_out":
-                self.operation_task = asyncio.create_task(self.punch_out_internal(self.operation_cancel_event))
+                self.operation_task = asyncio.create_task(self.punch_out_internal(self.operation_cancel_event, username))
             else:
                 self.current_operation = None
                 self.operation_start_time = None
@@ -2136,8 +2198,13 @@ class AttendanceSystem:
         except Exception as e:
             logging.error(f"清理浏览器时发生错误: {e}")
 
-    async def punch_in_internal(self, cancel_event):
-        """执行上班打卡（内部方法，支持取消）"""
+    async def punch_in_internal(self, cancel_event, username=None):
+        """执行上班打卡（内部方法，支持取消）
+
+        Args:
+            cancel_event: 取消事件
+            username: 可选，指定要打卡的用户名。如果为None，则为所有用户打卡
+        """
         try:
             # 检查取消
             if cancel_event.is_set():
@@ -2148,8 +2215,17 @@ class AttendanceSystem:
                 await self.send_notification("打卡错误", "未配置用户信息，无法执行打卡")
                 return False
 
+            # 如果指定了用户名，只为该用户打卡
+            if username:
+                users_to_process = [user for user in self.users if user.get('username') == username]
+                if not users_to_process:
+                    await self.send_notification("打卡错误", f"未找到用户 {username} 的配置信息")
+                    return False
+            else:
+                users_to_process = self.users
+
             success_count = 0
-            for i, user in enumerate(self.users):
+            for i, user in enumerate(users_to_process):
                 # 检查取消
                 if cancel_event.is_set():
                     await self.send_notification("操作取消", f"用户 {user.get('username')} 的上班打卡操作已被取消")
@@ -2160,7 +2236,7 @@ class AttendanceSystem:
                 password = user.get('password')
 
                 # 为每个用户发送单独的开始消息
-                await self.send_notification("多用户打卡", f"开始为用户 {username} 执行上班打卡 ({i+1}/{len(self.users)})")
+                await self.send_notification("多用户打卡", f"开始为用户 {username} 执行上班打卡 ({i+1}/{len(users_to_process)})")
 
                 # 执行打卡
                 result, _ = await self._do_punch("上班", username, password)
@@ -2210,17 +2286,26 @@ class AttendanceSystem:
             await self.handle_error(e, "上班打卡")
             return False
 
-    async def punch_in(self):
-        """执行上班打卡（兼容性方法）"""
-        success, message = await self.start_punch_operation("punch_in")
+    async def punch_in(self, username=None):
+        """执行上班打卡（兼容性方法）
+
+        Args:
+            username: 可选，指定要打卡的用户名。如果为None，则为所有用户打卡
+        """
+        success, message = await self.start_punch_operation("punch_in", username)
         if success:
             # 等待操作完成
             if self.operation_task:
                 return await self.operation_task
         return False
 
-    async def punch_out_internal(self, cancel_event):
-        """执行下班打卡（内部方法，支持取消）"""
+    async def punch_out_internal(self, cancel_event, username=None):
+        """执行下班打卡（内部方法，支持取消）
+
+        Args:
+            cancel_event: 取消事件
+            username: 可选，指定要打卡的用户名。如果为None，则为所有用户打卡
+        """
         try:
             # 检查取消
             if cancel_event.is_set():
@@ -2231,10 +2316,19 @@ class AttendanceSystem:
                 await self.send_notification("打卡错误", "未配置用户信息，无法执行打卡")
                 return False
 
+            # 如果指定了用户名，只为该用户打卡
+            if username:
+                users_to_process = [user for user in self.users if user.get('username') == username]
+                if not users_to_process:
+                    await self.send_notification("打卡错误", f"未找到用户 {username} 的配置信息")
+                    return False
+            else:
+                users_to_process = self.users
+
             success_count = 0
             remaining_times = []  # 用于存储每个用户的剩余工作时间
 
-            for i, user in enumerate(self.users):
+            for i, user in enumerate(users_to_process):
                 # 检查取消
                 if cancel_event.is_set():
                     await self.send_notification("操作取消", f"用户 {user.get('username')} 的下班打卡操作已被取消")
@@ -2245,7 +2339,7 @@ class AttendanceSystem:
                 password = user.get('password')
 
                 # 为每个用户发送单独的开始消息
-                await self.send_notification("多用户打卡", f"开始为用户 {username} 执行下班打卡 ({i+1}/{len(self.users)})")
+                await self.send_notification("多用户打卡", f"开始为用户 {username} 执行下班打卡 ({i+1}/{len(users_to_process)})")
 
                 # 执行打卡，并捕获剩余工作时间
                 result, remaining_time_info = await self._do_punch("下班", username, password, collect_remaining_time=True)
@@ -2284,7 +2378,7 @@ class AttendanceSystem:
                         await self.send_notification("打卡流程", "浏览器关闭失败，可能需要手动关闭")
 
                 # 如果还有下一个用户，等待一段时间再继续
-                if i < len(self.users) - 1:
+                if i < len(users_to_process) - 1:
                     await self.send_notification("打卡流程", f"等待5秒后开始下一个用户的打卡...")
                     # 在等待期间也检查取消
                     for _ in range(5):
@@ -2350,16 +2444,20 @@ class AttendanceSystem:
                     await self.send_notification("定时打卡", "⚠️ 无法确定最长剩余时间，定时打卡设置失败")
 
             # 所有用户打卡完成后发送总结消息
-            await self.send_notification("打卡完成", f"下班打卡完成，成功: {success_count}/{len(self.users)}")
+            await self.send_notification("打卡完成", f"下班打卡完成，成功: {success_count}/{len(users_to_process)}")
             return success_count > 0
         except Exception as e:
             await self.cleanup_browser()
             await self.handle_error(e, "下班打卡")
             return False
 
-    async def punch_out(self):
-        """执行下班打卡（兼容性方法）"""
-        success, message = await self.start_punch_operation("punch_out")
+    async def punch_out(self, username=None):
+        """执行下班打卡（兼容性方法）
+
+        Args:
+            username: 可选，指定要打卡的用户名。如果为None，则为所有用户打卡
+        """
+        success, message = await self.start_punch_operation("punch_out", username)
         if success:
             # 等待操作完成
             if self.operation_task:
