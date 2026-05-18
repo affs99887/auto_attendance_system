@@ -35,6 +35,7 @@ import win32con
 from modules.config import config
 
 from modules.selenium_login import SeleniumLoginController
+from modules.email_service import email_service
 
 
 class TelegramBot:
@@ -1610,6 +1611,13 @@ class TelegramBot:
                                 f"💡 您可以使用 /status 查看任务状态"
                             )
                             await query.message.edit_text(success_message)
+
+                            # 发送邮件通知
+                            self._send_scheduled_task_email_notification(
+                                punch_type="下班",
+                                scheduled_time=today_punch_out.strftime('%Y-%m-%d %H:%M'),
+                                task_type="自动下班"
+                            )
                         else:
                             await query.message.edit_text("❌ 设置定时任务失败，请稍后重试")
 
@@ -1673,6 +1681,13 @@ class TelegramBot:
                             f"💡 您可以使用 /kill 查看和管理任务"
                         )
                         await query.message.edit_text(success_message)
+
+                        # 发送邮件通知
+                        self._send_scheduled_task_email_notification(
+                            punch_type="下班",
+                            scheduled_time=target_time.strftime('%Y-%m-%d %H:%M'),
+                            task_type="Selenium自动下班"
+                        )
 
                 except ValueError:
                     await query.message.edit_text("❌ 时间格式错误，操作已取消")
@@ -1775,6 +1790,13 @@ class TelegramBot:
                                 f"💡 您可以使用 /status 查看任务状态"
                             )
                             await query.message.edit_text(success_message)
+
+                            # 发送邮件通知
+                            self._send_scheduled_task_email_notification(
+                                punch_type="下班",
+                                scheduled_time=today_punch_out.strftime('%Y-%m-%d %H:%M'),
+                                task_type="16:35自动下班"
+                            )
                         else:
                             await query.message.edit_text("❌ 设置定时任务失败，请稍后重试")
 
@@ -2439,6 +2461,14 @@ class TelegramBot:
             user_list = "、".join([name for _, name in task_ids])
             await self.send_message("设置成功", f"已为所有用户（{user_list}）设置在 {target_time.strftime('%Y-%m-%d %H:%M')} 自动{display_type}打卡")
 
+            # 发送邮件通知
+            self._send_scheduled_task_email_notification(
+                punch_type=display_type,
+                scheduled_time=target_time.strftime('%Y-%m-%d %H:%M'),
+                username='all',
+                task_type="定时打卡"
+            )
+
         else:
             # 单个用户或默认用户
             task_id = self.attendance_system.task_manager.add_task(
@@ -2466,6 +2496,14 @@ class TelegramBot:
 
             user_info = f"（{username}）" if username else ""
             await self.send_message("设置成功", f"已设置在 {target_time.strftime('%Y-%m-%d %H:%M')} 自动{display_type}打卡{user_info}")
+
+            # 发送邮件通知
+            self._send_scheduled_task_email_notification(
+                punch_type=display_type,
+                scheduled_time=target_time.strftime('%Y-%m-%d %H:%M'),
+                username=username,
+                task_type="定时打卡"
+            )
 
     def close_browser(self):
         """通过识别关闭按钮关闭浏览器窗口"""
@@ -2767,6 +2805,49 @@ class TelegramBot:
             logging.error(f"获取上次配置失败: {e}")
             return None
 
+    def _send_scheduled_task_email_notification(self, punch_type: str, scheduled_time: str,
+                                                 username: str = None, task_type: str = "定时打卡"):
+        """发送定时任务设置成功的邮件通知
+
+        Args:
+            punch_type: 打卡类型（"上班" 或 "下班"）
+            scheduled_time: 计划执行时间
+            username: 用户名（可选）
+            task_type: 任务类型描述
+        """
+        try:
+            current_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+            user_info = f"用户: {username}" if username else "用户: 默认用户"
+            if username == 'all':
+                user_info = "用户: 所有用户"
+
+            subject = f"【打卡任务设置】{punch_type}打卡任务已设置 - {scheduled_time}"
+
+            body = f"""
+            <html>
+            <body>
+                <h3>✅ 定时打卡任务设置成功</h3>
+                <p><strong>任务类型:</strong> {task_type}</p>
+                <p><strong>打卡类型:</strong> {punch_type}打卡</p>
+                <p><strong>{user_info}</strong></p>
+                <p><strong>计划执行时间:</strong> {scheduled_time}</p>
+                <p><strong>设置时间:</strong> {current_time}</p>
+                <hr>
+                <p><em>此邮件由自动打卡系统发送，任务将在计划时间自动执行。</em></p>
+            </body>
+            </html>
+            """
+
+            email_service.send_email_async(
+                subject, body,
+                recipients=['dududulalala@icloud.com'],
+                is_html=True
+            )
+            logging.info(f"已发送定时任务设置通知邮件: {punch_type}打卡 @ {scheduled_time}")
+
+        except Exception as e:
+            logging.error(f"发送定时任务设置通知邮件失败: {e}")
+
     def _setup_daily_reminder(self):
         """设置每日8:15提醒任务和16:35自动下班任务"""
         try:
@@ -2795,7 +2876,13 @@ class TelegramBot:
             
             # 检查是否为工作日的函数
             def is_work_day():
-                return is_workday(datetime.now().date())
+                try:
+                    return is_workday(datetime.now().date())
+                except NotImplementedError as e:
+                    # 如果年份不支持（chinese_calendar库数据范围外），降级为简单的周末判断
+                    logging.warning(f"chinese_calendar不支持当前年份: {e}, 降级使用周末判断")
+                    weekday = datetime.now().weekday()
+                    return weekday < 5  # 周一到周五(0-4)为工作日
             
             # 创建8:15提醒任务（增强版，支持重试）
             def daily_reminder_job():

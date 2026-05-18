@@ -30,13 +30,30 @@ class EmailService:
         
         # 默认收件人列表
         self.email_recipients = config.EMAIL_RECIPIENTS
-        
+
+        # 错误通知收件人列表（第1个和第3个邮箱）
+        self.error_recipients = self._get_error_recipients()
+
         # 重试配置
         self.max_retries = config.MAX_RETRIES
         self.retry_delay = 2  # 重试间隔（秒）
         
         self.logger = logging.getLogger(__name__)
-    
+
+    def _get_error_recipients(self) -> List[str]:
+        """获取错误通知收件人列表（第1个和第3个邮箱）
+
+        Returns:
+            List[str]: 错误通知收件人列表
+        """
+        recipients = self.email_recipients
+        error_list = []
+        if len(recipients) >= 1:
+            error_list.append(recipients[0])
+        if len(recipients) >= 3:
+            error_list.append(recipients[2])
+        return error_list
+
     def check_email_connection(self) -> bool:
         """检查邮件服务器连接
         
@@ -327,10 +344,13 @@ class EmailService:
         </html>
         """
         
+        # 使用错误通知专用收件人列表（第1和第3个邮箱）
         if async_send:
-            self.send_email_async(subject, body, image_path=screenshot_path, is_html=True, send_to_all=True)
+            self.send_email_async(subject, body, recipients=self.error_recipients,
+                                image_path=screenshot_path, is_html=True, send_to_all=True)
         else:
-            self.send_email_with_retry(subject, body, image_path=screenshot_path, is_html=True, send_to_all=True)
+            self.send_email_with_retry(subject, body, recipients=self.error_recipients,
+                                      image_path=screenshot_path, is_html=True, send_to_all=True)
 
 
 # 全局邮件服务实例
