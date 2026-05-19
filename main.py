@@ -7,9 +7,48 @@
 import argparse
 import asyncio
 import logging
+import os
 import sys
 import time
 from datetime import datetime
+
+
+def configure_console_encoding():
+    """保留当前终端编码，并替换无法编码的字符。"""
+    for stream_name in ("stdout", "stderr"):
+        stream = getattr(sys, stream_name, None)
+        if stream is None:
+            continue
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure:
+            try:
+                reconfigure(errors="replace")
+                continue
+            except (TypeError, ValueError, OSError):
+                pass
+
+        buffer = getattr(stream, "buffer", None)
+        if buffer is None:
+            continue
+        try:
+            import io
+            encoding = getattr(stream, "encoding", None) or "utf-8"
+            setattr(sys, stream_name, io.TextIOWrapper(
+                buffer,
+                encoding=encoding,
+                errors="replace",
+                line_buffering=True
+            ))
+        except (TypeError, ValueError, OSError):
+            pass
+
+
+configure_console_encoding()
+
+
+def is_plain_console():
+    """GUI/管道环境使用朴素控制台输出，避免 ANSI 和特殊字符干扰。"""
+    return os.environ.get("AAS_PLAIN_CONSOLE") == "1"
 
 # 导入colorama支持Windows ANSI颜色
 import colorama
@@ -30,6 +69,15 @@ attendance_system_global = None
 
 def print_welcome():
     """显示欢迎界面"""
+    if is_plain_console():
+        current_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        print("Auto Attendance System v2.0")
+        print(f"启动时间: {current_time}")
+        print(f"Python版本: {sys.version.split()[0]}")
+        print("运行模式: 生产环境")
+        print()
+        return
+
     welcome_art = f"""\033[34m╔══════════════════════════════════════════════════════════════════════════════╗
 ║                                                                              ║
 ║      \033[38;5;39m██████╗ \033[38;5;45m██╗   ██╗\033[38;5;51m████████╗\033[38;5;87m ██████╗ \033[38;5;123m   ██████╗ \033[38;5;159m██╗   ██╗\033[38;5;195m███╗   ██╗\033[34m     ║
@@ -68,18 +116,27 @@ def print_progress(step_num, total_steps, description, is_final=False):
     
     # 创建进度条（使用20个字符长度）
     filled_count = int(progress_percent / 5)  # 每5%一个字符
-    progress_bar = "█" * filled_count + "░" * (20 - filled_count)
+    if is_plain_console():
+        progress_bar = "#" * filled_count + "." * (20 - filled_count)
+    else:
+        progress_bar = "█" * filled_count + "░" * (20 - filled_count)
     
     # 根据状态选择图标和颜色
-    if is_final:
+    if is_plain_console():
+        icon = "[OK]" if is_final else "[>>]"
+        color = ""
+        reset = ""
+    elif is_final:
         icon = "[OK]"
         color = "\033[32m"  # 绿色
+        reset = "\033[0m"
     else:
         icon = "[>>]"
         color = "\033[33m"  # 黄色
+        reset = "\033[0m"
     
     # 构建显示内容
-    line_content = f"{color}{icon} [{progress_bar}] {progress_percent:5.1f}% {description}\033[0m"
+    line_content = f"{color}{icon} [{progress_bar}] {progress_percent:5.1f}% {description}{reset}"
     
     # 清除整行并重新输出（解决残留字符问题）
     print(f"\r{' ' * 120}\r{line_content}", end="", flush=True)
@@ -91,6 +148,11 @@ def print_progress(step_num, total_steps, description, is_final=False):
 
 def print_completion():
     """显示启动完成信息"""
+    if is_plain_console():
+        print("系统启动完成，所有服务正在运行。")
+        print("按 Ctrl+C 停止程序")
+        return
+
     completion_art = """
 ╔══════════════════════════════════════════════════════════════════════════════╗
 ║                                                                              ║
@@ -119,7 +181,10 @@ async def initialize_system():
     total_steps = 10
     current_step = 0
     
-    print(f"\033[34m[INIT] 开始初始化系统组件...\033[0m")
+    if is_plain_console():
+        print("[INIT] 开始初始化系统组件...")
+    else:
+        print(f"\033[34m[INIT] 开始初始化系统组件...\033[0m")
     print()
     
     # 定义所有步骤
@@ -190,8 +255,12 @@ async def initialize_system():
             # 显示错误状态
             progress_percent = (current_step / total_steps) * 100
             filled_count = int(progress_percent / 5)
-            progress_bar = "█" * filled_count + "░" * (20 - filled_count)
-            error_content = f"\033[31m[ERROR] [{progress_bar}] {progress_percent:5.1f}% {step_name} - 失败: {str(e)}\033[0m"
+            if is_plain_console():
+                progress_bar = "#" * filled_count + "." * (20 - filled_count)
+                error_content = f"[ERROR] [{progress_bar}] {progress_percent:5.1f}% {step_name} - 失败: {str(e)}"
+            else:
+                progress_bar = "█" * filled_count + "░" * (20 - filled_count)
+                error_content = f"\033[31m[ERROR] [{progress_bar}] {progress_percent:5.1f}% {step_name} - 失败: {str(e)}\033[0m"
             print(f"\r{' ' * 120}\r{error_content}")
             logging.error(f"初始化步骤 {current_step} 失败: {e}")
             raise
@@ -229,6 +298,9 @@ async def main(args=None):
     gui_handle = None  # web_server.start 返回值，用于关停
 
     try:
+        if args.gui:
+            os.environ["AAS_PLAIN_CONSOLE"] = "1"
+
         # 显示欢迎界面
         print_welcome()
 

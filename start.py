@@ -12,6 +12,55 @@ import time
 import logging
 from datetime import datetime
 
+
+def configure_console_encoding():
+    """保留当前终端编码，并替换无法编码的字符。"""
+    for stream_name in ("stdout", "stderr"):
+        stream = getattr(sys, stream_name, None)
+        if stream is None:
+            continue
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure:
+            try:
+                reconfigure(errors="replace")
+                continue
+            except (TypeError, ValueError, OSError):
+                pass
+
+        buffer = getattr(stream, "buffer", None)
+        if buffer is None:
+            continue
+        try:
+            import io
+            encoding = getattr(stream, "encoding", None) or "utf-8"
+            setattr(sys, stream_name, io.TextIOWrapper(
+                buffer,
+                encoding=encoding,
+                errors="replace",
+                line_buffering=True
+            ))
+        except (TypeError, ValueError, OSError):
+            pass
+
+
+def python_subprocess_env():
+    """子进程继承当前输出编码，并替换无法编码的字符。"""
+    env = os.environ.copy()
+    encoding = getattr(sys.stdout, "encoding", None)
+    if encoding:
+        env['PYTHONIOENCODING'] = f'{encoding}:replace'
+    return env
+
+
+def gui_subprocess_env():
+    """GUI 后端使用朴素输出，避免 Electron 终端出现 ANSI/特殊字符。"""
+    env = python_subprocess_env()
+    env['AAS_PLAIN_CONSOLE'] = '1'
+    return env
+
+
+configure_console_encoding()
+
 def setup_logging():
     """配置日志"""
     logging.basicConfig(
@@ -44,7 +93,7 @@ def start_main():
         print("-" * 50)
         
         # 启动主程序
-        subprocess.run([sys.executable, 'main.py'])
+        subprocess.run([sys.executable, 'main.py'], env=python_subprocess_env())
         
     except KeyboardInterrupt:
         print("\n程序已停止")
@@ -64,7 +113,7 @@ def start_watchdog():
         print("-" * 50)
 
         # 启动看门狗
-        subprocess.run([sys.executable, 'watchdog.py'])
+        subprocess.run([sys.executable, 'watchdog.py'], env=python_subprocess_env())
 
     except KeyboardInterrupt:
         print("\n程序已停止")
@@ -88,7 +137,7 @@ def start_gui():
         print("按 Ctrl+C 可停止程序")
         print("-" * 50)
 
-        subprocess.run([sys.executable, 'main.py', '--gui'])
+        subprocess.run([sys.executable, 'main.py', '--gui'], env=gui_subprocess_env())
 
     except KeyboardInterrupt:
         print("\n程序已停止")
