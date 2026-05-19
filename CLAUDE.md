@@ -4,27 +4,35 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-This is an automated attendance system (自动打卡系统) that uses computer vision and OCR to automatically log into a timecard system and punch in/out. The system integrates with Telegram for remote control and monitoring.
+This is an automated attendance system (自动打卡系统) that supports dual automation modes: traditional computer vision/OCR and modern Selenium WebDriver automation for logging into timecard systems and punch in/out. The system integrates with Telegram for remote control and monitoring.
 
 ## Architecture
 
 The system consists of several key components:
 
 ### Core Python Components
-- **main.py** - Main application with TelegramBot class and AttendanceSystem class
-- **tasks.py** - TaskManager class for scheduling and managing timed tasks
-- **punch_records.py** - PunchRecordManager class for tracking attendance records
+- **main.py** - Main application entry point
+- **start.py** - Unified launcher with mode selection and status monitoring
 - **watchdog.py** - Process monitor that restarts main.py if it crashes
 
-### Refactored Modules (2025-06-24)
-- **email_service.py** - EmailService class for email notifications with retry mechanism
-- **browser_automation.py** - BrowserController class for browser automation and window control
-- **image_recognition.py** - ImageRecognizer class for OCR and template matching
+### Modular Architecture (modules/)
+- **attendance_system.py** - Core AttendanceSystem class orchestrating all operations
+- **telegram_bot.py** - TelegramBot class for remote control interface
+- **selenium_login.py** - SeleniumLoginController for WebDriver-based automation
+- **browser_controller.py** - Traditional browser automation using PyAutoGUI
+- **image_recognizer.py** - OCR and template matching for UI recognition
+- **email_service.py** - EmailService class for notifications with retry logic
+- **record_manager.py** - PunchRecordManager for attendance data persistence
+- **task_manager.py** - TaskManager for scheduling operations
+- **schedule_manager.py** - Schedule management and workday detection
+- **config.py** - Centralized configuration management
 
 ### Key Technologies
-- **Computer Vision**: OpenCV, PyAutoGUI, Tesseract OCR for screen automation
-- **Telegram Bot**: python-telegram-bot for remote control
+- **Browser Automation**: Selenium WebDriver with Edge/Chrome support, automatic driver management
+- **Computer Vision**: OpenCV, PyAutoGUI, Tesseract OCR for traditional screen automation
+- **Telegram Bot**: python-telegram-bot for remote control and monitoring
 - **Scheduling**: schedule library with chinese-calendar for workday detection
+- **Data Persistence**: JSON-based storage with user isolation
 
 ## Common Development Commands
 
@@ -76,6 +84,11 @@ source venv/bin/activate
 - EMAIL_SENDER, EMAIL_PASSWORD - Email notification credentials
 - EMAIL_SMTP_SERVER, EMAIL_SMTP_PORT - SMTP server configuration
 
+### Dynamic Configuration (dynamic_config.json)
+- USE_SELENIUM_LOGIN - Enable/disable Selenium automation mode
+- SELENIUM_HEADLESS - Run Selenium in headless mode
+- Current automation mode settings (excluded from version control)
+
 ### Template Images
 The system uses template matching with images in `templates/` directory:
 - username_field.png, password_field.png - Login form elements
@@ -98,36 +111,44 @@ The system supports multiple users with separate:
 
 ## Key Features
 
-- Image recognition-based UI automation
-- Telegram bot for remote control (/punch_in, /punch_out, /status, /log)
-- Automatic retry mechanisms for network issues
-- Email notifications with screenshots
-- Workday detection using Chinese calendar
-- Task scheduling and management
-- Process monitoring and auto-restart
+- **Dual Automation Modes**: Selenium WebDriver and traditional computer vision
+- **Multi-User Support**: Parallel login and data isolation for multiple users
+- **Parallel Multi-Account Punch**: 当 `USE_SELENIUM_LOGIN=true` 且配置多用户时，`/punch_in` / `/punch_out` 自动以 `asyncio.Semaphore + gather` 并行执行（上限 3 并发）；下班失败的用户会按"最长剩余时间"统一调度一次定时重试。`today_punch_records` / `notification_sent_today` 按用户分桶隔离，`PunchRecordManager.update_record` 加 `threading.Lock` 防 JSON 损坏；`send_daily_status` 有 5 秒去重；schedule 任务用 tag 隔离（`punch_out_retry` / `punch_out_scheduled` / `punch_in_scheduled` / `daily_status`）避免互相误清。PyAutoGUI 模式仍走串行（单焦点限制）。
+- **Intelligent Time Management**: Automatic punch-out scheduling with work time calculation
+- **Telegram Integration**: Comprehensive remote control (/punch_in, /punch_out, /status, /log)
+- **Robust Error Handling**: Automatic retry mechanisms and fallback strategies
+- **Email Notifications**: Screenshots and status reports with SMTP integration
+- **Smart Scheduling**: Workday detection using Chinese calendar integration
+- **Process Monitoring**: Watchdog system with resource monitoring and auto-restart
 
 ## System Operation Modes
 
-### CLI Mode (main.py)
-- Full system with Telegram bot integration
-- Runs in background with console logging
-- Suitable for server deployments
+### Unified Launcher Mode (start.py)
+- **Interactive Mode**: Menu-driven mode selection
+- **Direct Mode**: Specify execution mode via command line arguments
+- **Status Mode**: Monitor running processes and system health
 
-### Watchdog Mode (watchdog.py)
-- Process monitoring and automatic restart
-- Resource usage monitoring with alerts
-- Standalone operation with configurable restart limits
+### Automation Modes
+- **Selenium Mode**: WebDriver-based automation (more reliable)
+- **Traditional Mode**: Computer vision + PyAutoGUI (fallback option)
+- **Hybrid Mode**: Automatic fallback between modes
+
+### Process Modes
+- **Main Process**: Full system with Telegram integration
+- **Watchdog Mode**: Process monitoring with automatic restart and resource alerts
 
 ## Key Integration Points
 
 ### Data Flow Architecture
-1. **Punch Operation**: BrowserController → ImageRecognizer → BrowserController → PunchRecordManager → EmailService → TelegramBot
-2. **Task Scheduling**: TaskManager → AttendanceSystem → (punch operation flow)
+1. **Selenium Mode**: SeleniumLoginController → SeleniumRecordManager → EmailService → TelegramBot
+2. **Traditional Mode**: BrowserController → ImageRecognizer → RecordManager → EmailService → TelegramBot
+3. **Task Scheduling**: TaskManager → AttendanceSystem → (automation flow selection)
 
 ### Module Dependencies
-- **AttendanceSystem**: Core orchestrator using all service modules
-- **TelegramBot**: Remote control interface with comprehensive command handling
-- **Service Modules**: EmailService, BrowserController, ImageRecognizer (loosely coupled)
+- **AttendanceSystem**: Core orchestrator with mode-aware automation routing
+- **TelegramBot**: Remote control with Selenium and traditional command support
+- **Automation Modules**: SeleniumLoginController, BrowserController (mode-specific)
+- **Service Modules**: EmailService, RecordManager, ConfigManager (shared infrastructure)
 
 ### Error Handling Strategy
 - **Network Issues**: Automatic retry with exponential backoff in EmailService and TelegramBot

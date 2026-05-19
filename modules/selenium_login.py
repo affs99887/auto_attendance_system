@@ -1,0 +1,2015 @@
+"""
+Selenium登录控制器
+
+用于替代PyAutoGUI图像识别的登录方式，提供更精确和可靠的浏览器自动化操作
+"""
+
+import asyncio
+import logging
+import time
+import json
+import os
+from datetime import datetime
+from typing import Tuple, Optional, List, Dict
+
+from selenium import webdriver
+from selenium.webdriver.common.by import By
+from selenium.webdriver.edge.service import Service
+from selenium.webdriver.edge.options import Options
+from selenium.webdriver.chrome.service import Service as ChromeService
+from selenium.webdriver.chrome.options import Options as ChromeOptions
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+from selenium.common.exceptions import (
+    TimeoutException, 
+    NoSuchElementException, 
+    WebDriverException,
+    ElementNotInteractableException
+)
+from webdriver_manager.microsoft import EdgeChromiumDriverManager
+from webdriver_manager.chrome import ChromeDriverManager
+
+
+class SeleniumRecordManager:
+    """Selenium打卡记录管理器（使用统一的punch_records存储）"""
+    
+    def __init__(self, username: str = "default"):
+        """
+        初始化记录管理器
+        
+        Args:
+            username: 用户名，用于多用户数据隔离
+        """
+        self.username = username
+        # 使用统一的punch_records存储系统
+        self.base_dir = "punch_records"
+        # 对于多用户支持，使用子目录隔离数据
+        if username and username != "default":
+            self.user_dir = os.path.join(self.base_dir, self.username)
+        else:
+            # 默认用户直接使用punch_records根目录，与传统记录管理器兼容
+            self.user_dir = self.base_dir
+        self._ensure_directories()
+        
+    def _ensure_directories(self):
+        """确保必要的目录存在"""
+        if not os.path.exists(self.base_dir):
+            os.makedirs(self.base_dir)
+        if self.user_dir != self.base_dir and not os.path.exists(self.user_dir):
+            os.makedirs(self.user_dir)
+    
+    def _get_month_file_path(self, year: int = None, month: int = None) -> str:
+        """获取指定月份的数据文件路径"""
+        if year is None or month is None:
+            now = datetime.now()
+            year, month = now.year, now.month
+        return os.path.join(self.user_dir, f"{year}_{month:02d}.json")
+    
+    def load_month_records(self, year: int = None, month: int = None) -> dict:
+        """加载指定月份的记录"""
+        file_path = self._get_month_file_path(year, month)
+        if os.path.exists(file_path):
+            try:
+                with open(file_path, 'r', encoding='utf-8') as f:
+                    return json.load(f)
+            except Exception as e:
+                logging.error(f"加载Selenium打卡记录失败: {str(e)}")
+                return {}
+        return {}
+    
+    def save_month_records(self, records: dict, year: int = None, month: int = None):
+        """保存指定月份的记录"""
+        file_path = self._get_month_file_path(year, month)
+        try:
+            with open(file_path, 'w', encoding='utf-8') as f:
+                json.dump(records, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            logging.error(f"保存Selenium打卡记录失败: {str(e)}")
+    
+    def get_today_record(self) -> dict:
+        """获取今日打卡记录（兼容传统格式）"""
+        today = datetime.now()
+        records = self.load_month_records()
+        date_str = today.strftime('%Y-%m-%d')
+        return records.get(date_str, {
+            'punch_in_time': None,
+            'punch_out_time': None
+        })
+    
+    def update_punch_record(self, punch_type: str, time_str: str = None, 
+                          status_data: dict = None, additional_info: dict = None):
+        """
+        更新打卡记录
+        
+        Args:
+            punch_type: 'punch_in' 或 'punch_out'
+            time_str: 打卡时间字符串，如果为None则使用当前时间
+            status_data: 考勤状态数据
+            additional_info: 额外信息（如工作时间、预计下班时间等）
+        """
+        if time_str is None:
+            time_str = datetime.now().strftime('%H:%M:%S')
+        
+        today = datetime.now()
+        records = self.load_month_records()
+        date_str = today.strftime('%Y-%m-%d')
+        
+        # 初始化当日记录（兼容传统格式）
+        if date_str not in records:
+            records[date_str] = {
+                'punch_in_time': None,
+                'punch_out_time': None
+            }
+        
+        # 更新打卡时间
+        if punch_type == 'punch_in':
+            records[date_str]['punch_in_time'] = time_str
+        elif punch_type == 'punch_out':
+            records[date_str]['punch_out_time'] = time_str
+        
+        # 如果有额外的Selenium特定数据，可以存储但保持兼容性
+        if status_data or additional_info:
+            # 只在需要时添加额外字段，保持与传统格式的兼容性
+            if status_data:
+                records[date_str]['selenium_status'] = status_data
+            if additional_info:
+                records[date_str]['selenium_info'] = additional_info
+        
+        # 保存记录
+        self.save_month_records(records)
+        
+        logging.info(f"统一打卡记录已更新: {punch_type} at {time_str} for {self.username} (存储路径: {self.user_dir})")
+    
+    def get_today_punch_in_time(self) -> Optional[str]:
+        """获取今日上班打卡时间"""
+        today_record = self.get_today_record()
+        return today_record.get('punch_in_time')
+    
+    def calculate_worked_minutes_from_history(self) -> Optional[int]:
+        """
+        从历史记录计算已工作分钟数
+        
+        Returns:
+            int: 已工作的分钟数，如果无法计算则返回None
+        """
+        punch_in_time_str = self.get_today_punch_in_time()
+        logging.info(f"[DEBUG] 查询今日上班时间: {punch_in_time_str} (用户: {self.username}, 存储路径: {self.user_dir})")
+        
+        if not punch_in_time_str:
+            logging.info(f"[DEBUG] 未找到今日打卡记录")
+            return None
+        
+        try:
+            # 解析上班时间
+            punch_in_time = datetime.strptime(punch_in_time_str, '%H:%M:%S').time()
+            
+            # 获取当前时间
+            now = datetime.now()
+            current_time = now.time()
+            
+            # 计算工作时间（分钟）
+            punch_in_datetime = datetime.combine(now.date(), punch_in_time)
+            current_datetime = datetime.combine(now.date(), current_time)
+            
+            worked_duration = current_datetime - punch_in_datetime
+            worked_minutes = int(worked_duration.total_seconds() / 60)
+            
+            logging.info(f"从历史数据计算工作时间: {worked_minutes}分钟 (上班时间: {punch_in_time_str})")
+            return worked_minutes
+            
+        except Exception as e:
+            logging.error(f"从历史数据计算工作时间失败: {str(e)}")
+            return None
+
+
+class SeleniumLoginController:
+    """Selenium登录控制器"""
+    
+    def __init__(self, login_url: str, headless: bool = False, notification_callback=None, browser_type: str = "edge", username: str = "default"):
+        """
+        初始化登录控制器
+        
+        Args:
+            login_url: 登录页面URL
+            headless: 是否使用无头模式
+            notification_callback: 通知回调函数，用于发送状态消息
+            browser_type: 浏览器类型 ("edge" 或 "chrome")
+            username: 用户名，用于数据管理
+        """
+        self.login_url = login_url
+        self.headless = headless
+        self.notification_callback = notification_callback
+        self.browser_type = browser_type.lower()
+        self.username = username
+        self.logger = logging.getLogger(__name__)
+        self.driver = None
+        self.wait = None
+        self.service = None  # selenium Service 实例，便于 close() 兜底关 msedgedriver 进程
+
+        # 初始化记录管理器
+        self.record_manager = SeleniumRecordManager(username=username)
+        
+        # 配置选项
+        if self.browser_type == "chrome":
+            self.browser_options = self._setup_chrome_options()
+        else:
+            self.browser_options = self._setup_edge_options()
+        
+        # 元素定位策略配置
+        self.username_selectors = [
+            (By.NAME, "loginname"),  # 根据实际HTML代码
+            (By.ID, "username"),
+            (By.NAME, "username"),
+            (By.NAME, "user"),
+            (By.CSS_SELECTOR, "input[placeholder*='用户']"),
+            (By.CSS_SELECTOR, "input[placeholder*='账号']"),
+            (By.CSS_SELECTOR, "input[placeholder*='用户名']"),
+            (By.CSS_SELECTOR, "input[type='text'][name*='user']"),
+            (By.XPATH, "//input[@type='text'][1]"),  # 第一个文本输入框
+        ]
+        
+        self.password_selectors = [
+            (By.NAME, "password2"),  # 根据实际HTML代码
+            (By.ID, "password"),
+            (By.NAME, "password"),
+            (By.NAME, "pass"),
+            (By.CSS_SELECTOR, "input[type='password']"),
+            (By.CSS_SELECTOR, "input[placeholder*='密码']"),
+            (By.XPATH, "//input[@type='password'][1]"),  # 第一个密码输入框
+        ]
+        
+        self.login_button_selectors = [
+            (By.XPATH, "//input[@value='登录']"),  # 根据实际HTML代码
+            (By.CSS_SELECTOR, "input[value='登录']"),
+            (By.NAME, "Submit"),  # 根据实际HTML代码
+            (By.ID, "login"),
+            (By.ID, "loginBtn"),
+            (By.NAME, "login"),
+            (By.CSS_SELECTOR, "button[type='submit']"),
+            (By.CSS_SELECTOR, "input[type='submit']"),
+            (By.XPATH, "//button[contains(text(),'登录')]"),
+            (By.XPATH, "//button[contains(text(),'登陆')]"),
+            (By.XPATH, "//input[contains(@value,'登录')]"),
+            (By.XPATH, "//input[contains(@value,'登陆')]"),
+            (By.CSS_SELECTOR, ".login-btn"),
+            (By.CSS_SELECTOR, ".btn-login"),
+        ]
+    
+    def _setup_edge_options(self) -> Options:
+        """设置Edge浏览器选项"""
+        options = Options()
+        
+        if self.headless:
+            options.add_argument("--headless")
+        
+        # 最小化配置，只保留必要选项
+        options.add_argument("--no-sandbox")
+        options.add_argument("--disable-dev-shm-usage")
+        
+        # 窗口配置
+        options.add_argument("--window-size=1920,1080")
+        
+        # 增强SSL和安全配置
+        options.add_argument("--ignore-certificate-errors")
+        options.add_argument("--ignore-ssl-errors")
+        options.add_argument("--ignore-certificate-errors-spki-list")
+        options.add_argument("--ignore-certificate-errors-sp-list")
+        options.add_argument("--allow-running-insecure-content")
+        options.add_argument("--disable-web-security")
+        options.add_argument("--allow-running-insecure-content")
+        options.add_argument("--disable-features=VizDisplayCompositor")
+        options.add_argument("--accept-insecure-certs")
+        options.add_argument("--test-type")
+        
+        return options
+    
+    def _setup_chrome_options(self) -> ChromeOptions:
+        """设置Chrome浏览器选项"""
+        options = ChromeOptions()
+        
+        if self.headless:
+            options.add_argument("--headless")
+        
+        # 基础配置
+        options.add_argument("--no-sandbox")
+        options.add_argument("--disable-dev-shm-usage")
+        
+        # 窗口配置
+        options.add_argument("--window-size=1920,1080")
+        
+        # 增强SSL和安全配置
+        options.add_argument("--ignore-certificate-errors")
+        options.add_argument("--ignore-ssl-errors")
+        options.add_argument("--ignore-certificate-errors-spki-list")
+        options.add_argument("--allow-running-insecure-content")
+        options.add_argument("--disable-web-security")
+        options.add_argument("--accept-insecure-certs")
+        options.add_argument("--test-type")
+        
+        return options
+    
+    async def send_notification(self, context: str, message: str):
+        """发送通知消息"""
+        if self.notification_callback:
+            await self.notification_callback(context, message)
+        self.logger.info(f"[{context}] {message}")
+    
+    async def start_browser(self) -> bool:
+        """启动浏览器并导航到登录页面"""
+        browsers_to_try = ["edge", "chrome"] if self.browser_type == "edge" else ["chrome", "edge"]
+        
+        for browser in browsers_to_try:
+            try:
+                browser_name = "Chrome" if browser == "chrome" else "Edge"
+                await self.send_notification("Selenium登录", f"正在尝试启动{browser_name}浏览器...")
+                
+                # 创建WebDriver实例（保存 service 到 self.service，便于 close() 兜底清理 service 进程）
+                if browser == "chrome":
+                    chrome_options = self._setup_chrome_options()
+                    try:
+                        # 优先用 webdriver-manager 自动下载匹配本地 Chrome 版本的 driver
+                        driver_path = ChromeDriverManager().install()
+                        await self.send_notification("Selenium登录", f"使用 webdriver-manager 管理的Chrome驱动: {driver_path}")
+                        self.service = ChromeService(driver_path)
+                        self.driver = webdriver.Chrome(service=self.service, options=chrome_options)
+                    except Exception as wdm_err:
+                        # 兜底：回退到系统 PATH 中的 chromedriver
+                        await self.send_notification("Selenium登录", f"webdriver-manager 获取 Chrome 驱动失败({str(wdm_err)[:80]})，回退到系统PATH")
+                        self.service = None  # 走 PATH 自动模式时 selenium 内部管理 service，无需保存
+                        self.driver = webdriver.Chrome(options=chrome_options)
+                else:
+                    edge_options = self._setup_edge_options()
+                    import os
+                    project_driver_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'msedgedriver.exe')
+                    try:
+                        # 优先用 webdriver-manager 自动下载匹配本地 Edge 版本的 driver
+                        driver_path = EdgeChromiumDriverManager().install()
+                        await self.send_notification("Selenium登录", f"使用 webdriver-manager 管理的Edge驱动: {driver_path}")
+                        self.service = Service(driver_path)
+                        self.driver = webdriver.Edge(service=self.service, options=edge_options)
+                    except Exception as wdm_err:
+                        # 兜底：回退到项目目录中的 msedgedriver.exe（offline 场景）
+                        await self.send_notification(
+                            "Selenium登录",
+                            f"webdriver-manager 获取 Edge 驱动失败({str(wdm_err)[:80]})，回退到项目目录WebDriver: {project_driver_path}"
+                        )
+                        self.service = Service(project_driver_path)
+                        self.driver = webdriver.Edge(service=self.service, options=edge_options)
+                
+                await self.send_notification("Selenium登录", f"{browser_name} WebDriver实例创建成功")
+                self.wait = WebDriverWait(self.driver, 10)
+                
+                await self.send_notification("Selenium登录", f"正在访问登录页面: {self.login_url}")
+                
+                # 导航到登录页面
+                self.driver.get(self.login_url)
+                await self.send_notification("Selenium登录", "页面导航请求已发送")
+                
+                # 等待页面加载完成
+                await self.send_notification("Selenium登录", "等待页面加载...")
+                try:
+                    # 使用5秒超时时间
+                    wait_short = WebDriverWait(self.driver, 5)
+                    wait_short.until(EC.presence_of_element_located((By.TAG_NAME, "body")))
+                    await self.send_notification("Selenium登录", "页面body元素已加载")
+                except TimeoutException:
+                    # 如果body加载失败，尝试检查是否有任何元素
+                    await self.send_notification("Selenium登录", "body加载超时，检查页面状态...")
+                    current_url = self.driver.current_url
+                    page_title = self.driver.title
+                    await self.send_notification("Selenium登录", f"当前URL: {current_url}, 页面标题: {page_title}")
+                    
+                    # 尝试查找任何元素来确认页面是否加载
+                    try:
+                        self.driver.find_element(By.TAG_NAME, "html")
+                        await self.send_notification("Selenium登录", "页面HTML已加载，继续处理...")
+                    except:
+                        raise TimeoutException("页面完全无法加载")
+                
+                await self.send_notification("Selenium登录", f"{browser_name}浏览器启动成功，页面已加载")
+                self.browser_type = browser  # 更新成功的浏览器类型
+                return True
+                
+            except Exception as e:
+                await self.send_notification("Selenium登录", f"{browser_name}失败: {str(e)[:100]}")
+                # 尝试清理资源
+                if hasattr(self, 'driver') and self.driver:
+                    try:
+                        self.driver.quit()
+                    except:
+                        pass
+                    self.driver = None
+                
+                # 如果不是最后一个浏览器，继续尝试下一个
+                if browser != browsers_to_try[-1]:
+                    await self.send_notification("Selenium登录", f"尝试下一个浏览器...")
+                    continue
+        
+        await self.send_notification("Selenium登录", "所有浏览器都无法启动")
+        return False
+    
+    async def handle_security_warnings(self) -> bool:
+        """处理安全警告弹窗"""
+        try:
+            await self.send_notification("安全警告", "检查是否存在安全警告弹窗...")
+            
+            # 处理SSL证书警告
+            try:
+                # Chrome/Edge的高级选项按钮
+                advanced_button = WebDriverWait(self.driver, 3).until(
+                    EC.element_to_be_clickable((By.ID, "details-button"))
+                )
+                await self.send_notification("安全警告", "发现SSL证书警告，点击高级选项...")
+                advanced_button.click()
+                await asyncio.sleep(1)
+                
+                # 点击继续访问链接
+                proceed_link = self.driver.find_element(By.ID, "proceed-link")
+                await self.send_notification("安全警告", "点击继续访问链接...")
+                proceed_link.click()
+                await asyncio.sleep(2)
+                
+                await self.send_notification("安全警告", "SSL证书警告已处理")
+                return True
+                
+            except TimeoutException:
+                # 没有SSL警告，继续检查其他类型的警告
+                pass
+            
+            # 处理其他可能的安全警告（根据实际页面调整）
+            warning_selectors = [
+                (By.XPATH, "//button[contains(text(),'更多')]"),
+                (By.XPATH, "//button[contains(text(),'继续')]"),
+                (By.XPATH, "//a[contains(text(),'继续')]"),
+                (By.CSS_SELECTOR, ".warning-proceed"),
+            ]
+            
+            for by, selector in warning_selectors:
+                try:
+                    element = WebDriverWait(self.driver, 2).until(
+                        EC.element_to_be_clickable((by, selector))
+                    )
+                    await self.send_notification("安全警告", f"发现警告元素，点击处理: {selector}")
+                    element.click()
+                    await asyncio.sleep(1)
+                    return True
+                except TimeoutException:
+                    continue
+            
+            await self.send_notification("安全警告", "未发现需要处理的安全警告")
+            return True
+            
+        except Exception as e:
+            await self.send_notification("安全警告", f"处理安全警告时发生错误: {str(e)}")
+            return True  # 即使处理失败也继续，可能页面本身没有警告
+    
+    def _find_element_by_multiple_selectors(self, selectors: list, element_name: str) -> Optional[object]:
+        """使用多种选择器策略查找元素"""
+        for by, selector in selectors:
+            try:
+                element = self.wait.until(EC.presence_of_element_located((by, selector)))
+                self.logger.info(f"成功找到{element_name}元素: {by}='{selector}'")
+                return element
+            except TimeoutException:
+                continue
+        
+        self.logger.warning(f"所有策略都无法找到{element_name}元素")
+        return None
+    
+    async def _perform_login_in_current_frame(self, username: str, password: str) -> Tuple[bool, str]:
+        """在当前frame中执行登录操作"""
+        try:
+            await self.send_notification("登录流程", "在iframe中执行登录...")
+            
+            # 查找用户名输入框
+            username_element = self._find_element_by_multiple_selectors(
+                self.username_selectors, "用户名"
+            )
+            if not username_element:
+                return False, "在iframe中无法找到用户名输入框"
+            
+            # 填写用户名
+            await self.send_notification("登录流程", f"在iframe中输入用户名: {username}")
+            username_element.clear()
+            username_element.send_keys(username)
+            
+            # 查找密码输入框
+            password_element = self._find_element_by_multiple_selectors(
+                self.password_selectors, "密码"
+            )
+            if not password_element:
+                return False, "在iframe中无法找到密码输入框"
+            
+            # 填写密码
+            await self.send_notification("登录流程", "在iframe中输入密码")
+            password_element.clear()
+            password_element.send_keys(password)
+            
+            # 查找登录按钮
+            login_button = self._find_element_by_multiple_selectors(
+                self.login_button_selectors, "登录按钮"
+            )
+            if not login_button:
+                return False, "在iframe中无法找到登录按钮"
+            
+            # 点击登录
+            await self.send_notification("登录流程", "在iframe中点击登录按钮")
+            login_button.click()
+            
+            # 等待登录结果
+            await asyncio.sleep(3)
+            await self.send_notification("登录流程", "iframe登录操作完成")
+            return True, "iframe登录成功"
+            
+        except Exception as e:
+            return False, f"iframe登录失败: {str(e)}"
+    
+    def _validate_input_element(self, element, element_type: str) -> bool:
+        """验证输入元素是否正确"""
+        try:
+            # 检查元素是否可见和可交互
+            if not element.is_displayed() or not element.is_enabled():
+                return False
+            
+            # 检查元素属性
+            tag_name = element.tag_name.lower()
+            input_type = element.get_attribute('type') or ''
+            placeholder = (element.get_attribute('placeholder') or '').lower()
+            name = (element.get_attribute('name') or '').lower()
+            element_id = (element.get_attribute('id') or '').lower()
+            
+            if element_type == "username":
+                # 用户名相关关键词
+                keywords = ['username', 'user', '用户', '账号', 'account']
+                if tag_name == 'input' and input_type in ['text', '']:
+                    for keyword in keywords:
+                        if keyword in placeholder or keyword in name or keyword in element_id:
+                            return True
+            
+            elif element_type == "password":
+                # 密码相关验证
+                if tag_name == 'input' and input_type == 'password':
+                    return True
+                keywords = ['password', 'pass', '密码']
+                for keyword in keywords:
+                    if keyword in placeholder or keyword in name or keyword in element_id:
+                        return True
+            
+            return False
+            
+        except Exception:
+            return False
+    
+    async def login(self, username: str, password: str) -> Tuple[bool, str]:
+        """
+        执行登录操作
+        
+        Args:
+            username: 用户名
+            password: 密码
+            
+        Returns:
+            Tuple[bool, str]: (是否成功, 消息)
+        """
+        try:
+            # 1. 启动浏览器
+            if not await self.start_browser():
+                return False, "浏览器启动失败"
+            
+            # 2. 处理安全警告
+            if not await self.handle_security_warnings():
+                return False, "处理安全警告失败"
+            
+            # 3. 处理传统frameset结构
+            await self.send_notification("登录流程", "检测到frameset页面，切换到登录frame...")
+            try:
+                # 切换到 mainFrame (包含login.jsp)
+                await self.send_notification("登录流程", "切换到mainFrame...")
+                self.driver.switch_to.frame("mainFrame")
+                
+                # 等待login.jsp页面加载
+                await asyncio.sleep(2)
+                
+                # 验证是否成功切换到登录页面
+                await self.send_notification("登录流程", "检查登录frame内容...")
+                try:
+                    # 查找登录表单元素
+                    login_inputs = self.driver.find_elements(By.TAG_NAME, "input")
+                    await self.send_notification("登录流程", f"在登录frame中发现{len(login_inputs)}个input元素")
+                    
+                    # 检查是否有预期的登录字段
+                    found_loginname = False
+                    found_password2 = False
+                    for input_elem in login_inputs:
+                        input_name = input_elem.get_attribute('name') or ''
+                        if input_name == 'loginname':
+                            found_loginname = True
+                            await self.send_notification("登录流程", "找到loginname输入框")
+                        elif input_name == 'password2':
+                            found_password2 = True  
+                            await self.send_notification("登录流程", "找到password2输入框")
+                    
+                    if found_loginname and found_password2:
+                        await self.send_notification("登录流程", "成功定位到登录表单，开始登录...")
+                        # 现在在正确的frame中，继续执行登录
+                    else:
+                        await self.send_notification("登录流程", f"未找到预期的登录字段 - loginname: {found_loginname}, password2: {found_password2}")
+                        return False, "未在登录frame中找到预期的登录字段"
+                        
+                except Exception as frame_error:
+                    await self.send_notification("登录流程", f"检查登录frame失败: {str(frame_error)}")
+                    return False, "无法访问登录frame内容"
+                    
+            except Exception as e:
+                await self.send_notification("登录流程", f"切换到登录frame失败: {str(e)}")
+                return False, "无法切换到登录frame"
+            
+            # 4. 查找并填写用户名
+            await self.send_notification("登录流程", "正在定位用户名输入框...")
+            username_element = self._find_element_by_multiple_selectors(
+                self.username_selectors, "用户名"
+            )
+            
+            if not username_element:
+                return False, "无法找到用户名输入框"
+            
+            if not self._validate_input_element(username_element, "username"):
+                await self.send_notification("登录流程", "用户名输入框验证失败，尝试继续...")
+            
+            await self.send_notification("登录流程", f"开始输入用户名: {username}")
+            username_element.clear()
+            username_element.send_keys(username)
+            
+            # 验证输入是否成功
+            input_value = username_element.get_attribute('value')
+            if input_value != username:
+                return False, f"用户名输入验证失败，期望: {username}, 实际: {input_value}"
+            
+            await self.send_notification("登录流程", "用户名输入完成")
+            await asyncio.sleep(0.5)
+            
+            # 4. 查找并填写密码
+            await self.send_notification("登录流程", "正在定位密码输入框...")
+            password_element = self._find_element_by_multiple_selectors(
+                self.password_selectors, "密码"
+            )
+            
+            if not password_element:
+                return False, "无法找到密码输入框"
+            
+            if not self._validate_input_element(password_element, "password"):
+                await self.send_notification("登录流程", "密码输入框验证失败，尝试继续...")
+            
+            await self.send_notification("登录流程", "开始输入密码")
+            password_element.clear()
+            password_element.send_keys(password)
+            
+            await self.send_notification("登录流程", "密码输入完成")
+            await asyncio.sleep(0.5)
+            
+            # 5. 查找并点击登录按钮
+            await self.send_notification("登录流程", "正在定位登录按钮...")
+            login_button = self._find_element_by_multiple_selectors(
+                self.login_button_selectors, "登录按钮"
+            )
+            
+            if not login_button:
+                return False, "无法找到登录按钮"
+            
+            await self.send_notification("登录流程", "点击登录按钮...")
+            current_url = self.driver.current_url
+            login_button.click()
+            
+            # 6. 等待登录结果
+            await self.send_notification("登录流程", "等待登录结果...")
+            await asyncio.sleep(3)
+            
+            # 检查URL是否发生变化（登录成功的常见标志）
+            try:
+                WebDriverWait(self.driver, 7).until(
+                    lambda driver: driver.current_url != current_url
+                )
+                await self.send_notification("登录流程", "检测到页面跳转，登录可能成功")
+            except TimeoutException:
+                await self.send_notification("登录流程", "未检测到页面跳转，检查登录结果...")
+            
+            # 检查是否有错误提示
+            error_selectors = [
+                (By.CSS_SELECTOR, ".error"),
+                (By.CSS_SELECTOR, ".alert-error"),
+                (By.CSS_SELECTOR, ".login-error"),
+                (By.XPATH, "//div[contains(@class,'error')]"),
+                (By.XPATH, "//span[contains(text(),'错误')]"),
+                (By.XPATH, "//div[contains(text(),'失败')]"),
+            ]
+            
+            for by, selector in error_selectors:
+                try:
+                    error_element = self.driver.find_element(by, selector)
+                    if error_element.is_displayed():
+                        error_text = error_element.text
+                        return False, f"登录失败: {error_text}"
+                except NoSuchElementException:
+                    continue
+            
+            await self.send_notification("登录流程", "登录流程完成")
+            return True, "登录成功"
+            
+        except Exception as e:
+            error_msg = f"登录过程发生错误: {str(e)}"
+            await self.send_notification("登录流程", error_msg)
+            self.logger.exception("登录过程异常")
+            return False, error_msg
+    
+    def take_screenshot(self, filepath: str = None) -> bytes:
+        """截取当前页面截图"""
+        if not self.driver:
+            return None
+        
+        try:
+            if filepath:
+                self.driver.save_screenshot(filepath)
+                return True
+            else:
+                return self.driver.get_screenshot_as_png()
+        except Exception as e:
+            self.logger.error(f"截图失败: {e}")
+            return None
+    
+    def close(self):
+        """关闭浏览器 + 兜底清理 Service 进程"""
+        # 正常路径：driver.quit() 会自动停 service
+        if self.driver:
+            try:
+                self.driver.quit()
+                self.logger.info("浏览器已关闭")
+            except Exception as e:
+                self.logger.error(f"关闭浏览器时发生错误: {e}")
+            finally:
+                self.driver = None
+                self.wait = None
+        # 兜底：driver 创建失败但 Service 已启动（msedgedriver.exe 进程仍在），显式 stop
+        service = getattr(self, 'service', None)
+        if service is not None:
+            try:
+                service.stop()
+                self.logger.info("Selenium Service 进程已停止")
+            except Exception as e:
+                self.logger.error(f"停止 Selenium Service 时发生错误: {e}")
+            finally:
+                self.service = None
+    
+    def __enter__(self):
+        """上下文管理器入口"""
+        return self
+    
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        """上下文管理器出口"""
+        self.close()
+    
+    async def _switch_to_main_frame(self) -> bool:
+        """切换到mainFrame进行打卡操作"""
+        try:
+            await self.send_notification("Frame切换", "正在切换到mainFrame...")
+            
+            # 先切换到默认内容（根frame）
+            self.driver.switch_to.default_content()
+            
+            # 切换到mainFrame
+            self.driver.switch_to.frame("mainFrame")
+            
+            await self.send_notification("Frame切换", "成功切换到mainFrame")
+            
+            # 等待页面加载
+            await asyncio.sleep(1)
+            
+            # 验证是否在正确的frame中（检查是否有打卡按钮）
+            try:
+                punch_buttons = self.driver.find_elements(By.NAME, "gotowork")
+                if punch_buttons:
+                    await self.send_notification("Frame切换", "在mainFrame中找到打卡按钮")
+                    return True
+                else:
+                    await self.send_notification("Frame切换", "警告：未在mainFrame中找到打卡按钮")
+                    return True  # 继续尝试，可能页面还在加载
+            except Exception as e:
+                await self.send_notification("Frame切换", f"验证mainFrame内容时出错: {str(e)}")
+                return True  # 继续尝试
+                
+        except Exception as e:
+            await self.send_notification("Frame切换", f"切换到mainFrame失败: {str(e)}")
+            return False
+    
+    async def _check_punch_button_status(self) -> Dict[str, bool]:
+        """检查打卡按钮状态"""
+        try:
+            await self.send_notification("按钮状态检查", "正在检查打卡按钮状态...")
+            
+            button_status = {
+                "gotowork": False,    # 上班按钮是否可用
+                "offwork": False,     # 下班按钮是否可用
+                "goout": False,       # 外出按钮是否可用
+                "comeback": False     # 回来按钮是否可用
+            }
+            
+            # 检查各个打卡按钮的状态
+            button_names = ["gotowork", "offwork", "goout", "comeback"]
+            button_labels = ["上班", "下班", "外出", "回来"]
+            
+            for button_name, label in zip(button_names, button_labels):
+                try:
+                    # 查找按钮元素
+                    button_element = self.driver.find_element(By.NAME, button_name)
+                    
+                    # 检查是否可见和可交互
+                    is_displayed = button_element.is_displayed()
+                    is_enabled = button_element.is_enabled()
+                    
+                    # 检查disabled属性
+                    disabled_attr = button_element.get_attribute("disabled")
+                    is_disabled = disabled_attr is not None
+                    
+                    # 按钮可用条件：显示、启用且未被disabled
+                    button_available = is_displayed and is_enabled and not is_disabled
+                    button_status[button_name] = button_available
+                    
+                    status_text = "可用" if button_available else "不可用"
+                    await self.send_notification(
+                        "按钮状态检查", 
+                        f"{label}按钮: {status_text} (displayed: {is_displayed}, enabled: {is_enabled}, disabled: {is_disabled})"
+                    )
+                    
+                except NoSuchElementException:
+                    await self.send_notification("按钮状态检查", f"未找到{label}按钮")
+                    button_status[button_name] = False
+                except Exception as e:
+                    await self.send_notification("按钮状态检查", f"检查{label}按钮状态时出错: {str(e)}")
+                    button_status[button_name] = False
+            
+            # 汇总状态
+            available_buttons = [label for button_name, label in zip(button_names, button_labels) if button_status[button_name]]
+            if available_buttons:
+                await self.send_notification("按钮状态检查", f"当前可用按钮: {', '.join(available_buttons)}")
+            else:
+                await self.send_notification("按钮状态检查", "当前没有可用的打卡按钮")
+            
+            return button_status
+            
+        except Exception as e:
+            await self.send_notification("按钮状态检查", f"检查按钮状态时发生错误: {str(e)}")
+            return {"gotowork": False, "offwork": False, "goout": False, "comeback": False}
+    
+    async def punch_in(self, skip_frame_switch: bool = False, skip_button_check: bool = False) -> Tuple[bool, str]:
+        """
+        执行上班打卡操作
+        
+        Args:
+            skip_frame_switch: 跳过frame切换（当已经在mainFrame时）
+            skip_button_check: 跳过按钮状态检查（当已经检查过时）
+        """
+        try:
+            await self.send_notification("上班打卡", "开始执行上班打卡...")
+            
+            # 1. 切换到mainFrame（可选）
+            if not skip_frame_switch:
+                if not await self._switch_to_main_frame():
+                    return False, "切换到mainFrame失败"
+            
+            # 2. 检查按钮状态（可选）
+            if not skip_button_check:
+                button_status = await self._check_punch_button_status()
+                if not button_status.get("gotowork", False):
+                    return False, "上班按钮不可用，可能已经打过卡或系统不允许当前操作"
+            
+            # 3. 查找上班按钮
+            try:
+                gotowork_button = self.driver.find_element(By.NAME, "gotowork")
+                await self.send_notification("上班打卡", "找到上班按钮，准备点击...")
+            except NoSuchElementException:
+                return False, "无法找到上班按钮"
+            
+            # 4. 点击上班按钮
+            await self.send_notification("上班打卡", "点击上班按钮...")
+            gotowork_button.click()
+            
+            # 5. 处理确认对话框
+            try:
+                await self.send_notification("上班打卡", "等待确认对话框...")
+                # 等待alert出现
+                alert = WebDriverWait(self.driver, 5).until(EC.alert_is_present())
+                alert_text = alert.text
+                await self.send_notification("上班打卡", f"确认对话框内容: {alert_text}")
+                
+                # 点击确认
+                alert.accept()
+                await self.send_notification("上班打卡", "已确认打卡操作")
+                
+            except TimeoutException:
+                await self.send_notification("上班打卡", "未检测到确认对话框，可能直接提交了")
+            except Exception as e:
+                await self.send_notification("上班打卡", f"处理确认对话框时出错: {str(e)}")
+                return False, f"处理确认对话框失败: {str(e)}"
+            
+            # 6. 等待操作完成
+            await asyncio.sleep(2)
+            
+            # 7. 验证打卡结果
+            await self.send_notification("上班打卡", "验证打卡结果...")
+            try:
+                # 重新检查按钮状态，上班成功后上班按钮应该变为disabled
+                updated_button_status = await self._check_punch_button_status()
+                if not updated_button_status.get("gotowork", False):
+                    await self.send_notification("上班打卡", "上班按钮已变为不可用状态，打卡可能成功")
+                    return True, "上班打卡成功"
+                else:
+                    await self.send_notification("上班打卡", "警告：上班按钮仍可用，打卡可能未成功")
+                    return False, "打卡操作可能未成功，按钮状态未改变"
+                    
+            except Exception as e:
+                await self.send_notification("上班打卡", f"验证打卡结果时出错: {str(e)}")
+                # 即使验证失败，也认为操作可能成功了
+                return True, "上班打卡操作已执行，但无法验证结果"
+            
+        except Exception as e:
+            error_msg = f"上班打卡过程发生错误: {str(e)}"
+            await self.send_notification("上班打卡", error_msg)
+            return False, error_msg
+    
+    async def punch_out(self, skip_frame_switch: bool = False, skip_button_check: bool = False) -> Tuple[bool, str]:
+        """
+        执行下班打卡操作
+        
+        Args:
+            skip_frame_switch: 跳过frame切换（当已经在mainFrame时）
+            skip_button_check: 跳过按钮状态检查（当已经检查过时）
+        """
+        try:
+            await self.send_notification("下班打卡", "开始执行下班打卡...")
+            
+            # 1. 切换到mainFrame（可选）
+            if not skip_frame_switch:
+                if not await self._switch_to_main_frame():
+                    return False, "切换到mainFrame失败"
+            
+            # 2. 检查按钮状态（可选）
+            if not skip_button_check:
+                button_status = await self._check_punch_button_status()
+                if not button_status.get("offwork", False):
+                    return False, "下班按钮不可用，可能还未上班打卡或系统不允许当前操作"
+            
+            # 3. 查找下班按钮
+            try:
+                offwork_button = self.driver.find_element(By.NAME, "offwork")
+                await self.send_notification("下班打卡", "找到下班按钮，准备点击...")
+            except NoSuchElementException:
+                return False, "无法找到下班按钮"
+            
+            # 4. 点击下班按钮
+            await self.send_notification("下班打卡", "点击下班按钮...")
+            offwork_button.click()
+            
+            # 5. 点击后直接等待页面变化，不存在确认对话框
+            await self.send_notification("下班打卡", "打卡操作已提交，等待页面变化...")
+            
+            # 6. 等待操作完成
+            await asyncio.sleep(2)
+            
+            # 7. 验证打卡结果：检查是否出现“返回”按钮
+            await self.send_notification("下班打卡", "验证打卡结果...")
+            try:
+                # 检查是否出现“返回”按钮，如果出现说明未到下班时间
+                try:
+                    return_button = self.driver.find_element(By.NAME, "return")
+                    if return_button.is_displayed():
+                        await self.send_notification("下班打卡", "检测到'返回'按钮，未到下班时间或工作时间不足")
+                        return False, "未到下班时间或工作时间不足"
+                except NoSuchElementException:
+                    # 没有返回按钮，说明正常打卡
+                    pass
+                
+                # 检查下班按钮状态是否变化
+                updated_button_status = await self._check_punch_button_status()
+                if not updated_button_status.get("offwork", False):
+                    await self.send_notification("下班打卡", "下班按钮已变为不可用状态，打卡成功")
+                    return True, "下班打卡成功"
+                else:
+                    await self.send_notification("下班打卡", "警告：下班按钮仍可用，但未检测到返回按钮，打卡状态不明")
+                    # 如果没有返回按钮但下班按钮仍可用，则认为可能成功但状态未及时更新
+                    return True, "打卡操作已执行，但按钮状态未改变"
+                    
+            except Exception as e:
+                await self.send_notification("下班打卡", f"验证打卡结果时出错: {str(e)}")
+                # 即使验证失败，也认为操作可能成功了
+                return True, "下班打卡操作已执行，但无法验证结果"
+            
+        except Exception as e:
+            error_msg = f"下班打卡过程发生错误: {str(e)}"
+            await self.send_notification("下班打卡", error_msg)
+            return False, error_msg
+    
+    async def get_attendance_status(self, skip_frame_switch: bool = False) -> Dict[str, str]:
+        """
+        获取今日和昨日的考勤状态信息
+        
+        Args:
+            skip_frame_switch: 跳过frame切换（当已经在mainFrame时）
+        """
+        try:
+            await self.send_notification("状态解析", "开始获取考勤状态信息...")
+            
+            # 1. 切换到mainFrame（可选）
+            if not skip_frame_switch:
+                if not await self._switch_to_main_frame():
+                    return {"error": "切换到mainFrame失败"}
+            
+            status_info = {
+                "today": "",
+                "yesterday": "",
+                "today_raw": "",
+                "yesterday_raw": ""
+            }
+            
+            # 2. 解析今日状态
+            try:
+                await self.send_notification("状态解析", "解析今日状态...")
+                # 查找今日状态表格
+                today_xpath = "//td[contains(@class,'border1')][contains(text(),'上班') or contains(text(),'下班') or contains(text(),'还未')]"
+                today_elements = self.driver.find_elements(By.XPATH, today_xpath)
+                
+                if today_elements:
+                    # 取第一个匹配的元素（应该是今日状态）
+                    today_element = today_elements[0]
+                    today_text = today_element.get_attribute('innerHTML')
+                    status_info["today_raw"] = today_text
+                    
+                    # 解析HTML内容
+                    import re
+                    # 移除HTML标签，保留文本
+                    clean_text = re.sub(r'<[^>]+>', '', today_text)
+                    status_info["today"] = clean_text.strip()
+                    
+                    await self.send_notification("状态解析", f"今日状态: {status_info['today']}")
+                else:
+                    await self.send_notification("状态解析", "未找到今日状态信息")
+                    status_info["today"] = "未找到今日状态"
+                    
+            except Exception as e:
+                await self.send_notification("状态解析", f"解析今日状态时出错: {str(e)}")
+                status_info["today"] = f"解析错误: {str(e)}"
+            
+            # 3. 解析昨日状态
+            try:
+                await self.send_notification("状态解析", "解析昨日状态...")
+                # 查找昨日状态表格 - 通常是第二个包含时间信息的元素
+                yesterday_xpath = "//td[contains(@class,'border1')][contains(text(),'上班') and contains(text(),'下班')]"
+                yesterday_elements = self.driver.find_elements(By.XPATH, yesterday_xpath)
+                
+                if yesterday_elements:
+                    # 查找包含昨日日期的元素
+                    for element in yesterday_elements:
+                        element_text = element.get_attribute('innerHTML')
+                        # 检查是否包含昨日日期模式
+                        if '2025-07-21' in element_text or len(yesterday_elements) > 1:
+                            status_info["yesterday_raw"] = element_text
+                            
+                            # 解析HTML内容
+                            import re
+                            clean_text = re.sub(r'<[^>]+>', '', element_text)
+                            status_info["yesterday"] = clean_text.strip()
+                            break
+                    
+                    if not status_info["yesterday"]:
+                        # 如果没找到特定昨日信息，使用最后一个元素
+                        last_element = yesterday_elements[-1]
+                        yesterday_text = last_element.get_attribute('innerHTML')
+                        status_info["yesterday_raw"] = yesterday_text
+                        
+                        import re
+                        clean_text = re.sub(r'<[^>]+>', '', yesterday_text)
+                        status_info["yesterday"] = clean_text.strip()
+                    
+                    await self.send_notification("状态解析", f"昨日状态: {status_info['yesterday']}")
+                else:
+                    await self.send_notification("状态解析", "未找到昨日状态信息")
+                    status_info["yesterday"] = "未找到昨日状态"
+                    
+            except Exception as e:
+                await self.send_notification("状态解析", f"解析昨日状态时出错: {str(e)}")
+                status_info["yesterday"] = f"解析错误: {str(e)}"
+            
+            # 4. 尝试更通用的状态信息提取
+            try:
+                await self.send_notification("状态解析", "尝试通用状态信息提取...")
+                # 查找所有包含"今日状态"和"昨日状态"的表格
+                status_tables = self.driver.find_elements(By.XPATH, "//table[.//font[contains(text(),'今日状态') or contains(text(),'昨日状态')]]")
+                
+                for table in status_tables:
+                    table_html = table.get_attribute('outerHTML')
+                    await self.send_notification("状态解析", f"找到状态表格，长度: {len(table_html)}")
+                    
+                    # 查找表格中的具体状态信息
+                    cells = table.find_elements(By.TAG_NAME, "td")
+                    for cell in cells:
+                        cell_text = cell.text
+                        if '上班' in cell_text and '2025-' in cell_text:
+                            if '还未' in cell_text or '未' in cell_text:
+                                if not status_info["today"] or status_info["today"] == "未找到今日状态":
+                                    status_info["today"] = cell_text.strip()
+                                    await self.send_notification("状态解析", f"通用方法找到今日状态: {cell_text}")
+                            else:
+                                if not status_info["yesterday"] or status_info["yesterday"] == "未找到昨日状态":
+                                    status_info["yesterday"] = cell_text.strip()
+                                    await self.send_notification("状态解析", f"通用方法找到昨日状态: {cell_text}")
+                
+            except Exception as e:
+                await self.send_notification("状态解析", f"通用状态解析时出错: {str(e)}")
+            
+            # 5. 汇总结果
+            if status_info["today"] and status_info["yesterday"]:
+                await self.send_notification("状态解析", "状态信息获取完成")
+            else:
+                await self.send_notification("状态解析", "部分状态信息获取失败")
+            
+            return status_info
+            
+        except Exception as e:
+            error_msg = f"获取考勤状态时发生错误: {str(e)}"
+            await self.send_notification("状态解析", error_msg)
+            return {"error": error_msg}
+    
+    async def complete_punch_in_flow(self, username: str, password: str) -> Tuple[bool, str, Dict]:
+        """
+        完整的上班打卡流程
+        
+        包括：登录 -> 检查按钮状态 -> 执行打卡或跳过 -> 记录状态
+        
+        Args:
+            username: 用户名
+            password: 密码
+            
+        Returns:
+            Tuple[bool, str, Dict]: (是否成功, 消息, 状态数据)
+        """
+        try:
+            await self.send_notification("完整上班流程", "开始执行完整上班打卡流程...")
+            
+            # 1. 执行登录（包含启动浏览器、安全警告处理和登录）
+            await self.send_notification("完整上班流程", "步骤1: 执行登录...")
+            login_success, login_message = await self.login(username, password)
+            if not login_success:
+                return False, f"登录失败: {login_message}", {}
+            
+            await self.send_notification("完整上班流程", f"登录成功: {login_message}")
+            
+            # 2. 切换到mainFrame并检查按钮状态
+            await self.send_notification("完整上班流程", "步骤2: 切换到mainFrame...")
+            if not await self._switch_to_main_frame():
+                return False, "切换到mainFrame失败", {}
+            
+            await self.send_notification("完整上班流程", "步骤3: 检查上班按钮状态...")
+            button_status = await self._check_punch_button_status()
+            
+            # 3. 根据按钮状态决定是否打卡
+            punch_result = {"punched": False, "message": "", "already_punched": False}
+            
+            if not button_status.get("gotowork", False):
+                # 上班按钮不可用，说明已经打过卡了
+                await self.send_notification("完整上班流程", "上班按钮不可用，可能已经打过卡")
+                punch_result["already_punched"] = True
+                punch_result["message"] = "上班按钮不可用，可能已经打过卡"
+                
+                # 尝试从页面状态获取已打卡的上班时间并保存
+                try:
+                    # 如果能从 attendance_status 中获取上班时间，则保存
+                    # 这里先等待后面获取 attendance_status 再处理
+                    pass
+                except Exception as e:
+                    await self.send_notification(
+                        "完整上班流程", 
+                        f"处理已打卡状态异常: {str(e)}"
+                    )
+            else:
+                # 上班按钮可用，执行打卡（跳过重复的frame切换和按钮检查）
+                await self.send_notification("完整上班流程", "步骤4: 执行上班打卡...")
+                punch_success, punch_message = await self.punch_in(skip_frame_switch=True, skip_button_check=True)
+                punch_result["punched"] = punch_success
+                punch_result["message"] = punch_message
+                
+                if punch_success:
+                    await self.send_notification("完整上班流程", f"上班打卡成功: {punch_message}")
+                    
+                    # 自动保存上班打卡时间到记录管理器
+                    try:
+                        current_time = datetime.now().strftime('%H:%M:%S')
+                        self.record_manager.update_punch_record(
+                            punch_type="punch_in",
+                            time_str=current_time,
+                            additional_info={
+                                "method": "selenium",
+                                "message": punch_message,
+                                "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                            }
+                        )
+                        await self.send_notification(
+                            "完整上班流程", 
+                            f"上班打卡记录已保存: {current_time}"
+                        )
+                    except Exception as record_error:
+                        await self.send_notification(
+                            "完整上班流程", 
+                            f"保存打卡记录失败: {str(record_error)}"
+                        )
+                        # 不影响主流程，继续执行
+                else:
+                    await self.send_notification("完整上班流程", f"上班打卡失败: {punch_message}")
+            
+            # 4. 检查今日状态，记录打卡数据（跳过重复的frame切换）
+            await self.send_notification("完整上班流程", "步骤5: 获取今日考勤状态...")
+            attendance_status = await self.get_attendance_status(skip_frame_switch=True)
+            
+            # 如果是已打卡情况，尝试从 attendance_status 中获取上班时间并保存
+            if punch_result["already_punched"] and attendance_status:
+                try:
+                    # 尝试从 attendance_status 中提取上班时间
+                    punch_in_time = None
+                    
+                    # 检查不同可能的字段名称
+                    for field in ['punch_in', 'gotowork_time', 'in_time', '上班时间']:
+                        if field in attendance_status and attendance_status[field]:
+                            punch_in_time = attendance_status[field]
+                            break
+                    
+                    if punch_in_time:
+                        # 保存到记录管理器
+                        self.record_manager.update_punch_record(
+                            punch_type="punch_in",
+                            time_str=punch_in_time,
+                            additional_info={
+                                "method": "selenium",
+                                "message": "从页面状态获取的已打卡时间",
+                                "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                                "source": "attendance_status"
+                            }
+                        )
+                        await self.send_notification(
+                            "完整上班流程", 
+                            f"已保存从状态获取的上班时间: {punch_in_time}"
+                        )
+                    else:
+                        await self.send_notification(
+                            "完整上班流程", 
+                            "无法从页面状态中获取上班时间"
+                        )
+                        
+                except Exception as status_error:
+                    await self.send_notification(
+                        "完整上班流程", 
+                        f"处理已打卡状态失败: {str(status_error)}"
+                    )
+            
+            # 5. 汇总结果
+            flow_result = {
+                "login_success": True,
+                "login_message": login_message,
+                "button_status": button_status,
+                "punch_result": punch_result,
+                "attendance_status": attendance_status,
+                "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            }
+            
+            if punch_result["punched"]:
+                overall_message = f"完整上班流程成功完成 - 已执行打卡"
+            elif punch_result["already_punched"]:
+                overall_message = f"完整上班流程成功完成 - 之前已打卡"
+            else:
+                overall_message = f"完整上班流程部分完成 - 打卡未成功: {punch_result['message']}"
+            
+            await self.send_notification("完整上班流程", overall_message)
+            
+            # 根据是否成功打卡或已打卡来确定整体成功状态
+            overall_success = punch_result["punched"] or punch_result["already_punched"]
+            
+            return overall_success, overall_message, flow_result
+            
+        except Exception as e:
+            error_msg = f"完整上班流程执行异常: {str(e)}"
+            await self.send_notification("完整上班流程", error_msg)
+            self.logger.exception("完整上班流程异常")
+            return False, error_msg, {}
+    
+    async def _detect_mainframe_changes(self) -> Dict[str, any]:
+        """
+        检测mainFrame是否出现变化（时间不足提示）
+        
+        Returns:
+            Dict: {
+                "has_time_warning": bool,  # 是否有时间警告
+                "time_text": str,          # 时间相关文本
+                "warning_content": str,    # 完整警告内容
+                "buttons_still_exist": bool # 打卡按钮是否仍然存在
+            }
+        """
+        try:
+            await self.send_notification("Frame变化检测", "开始检测mainFrame变化...")
+            
+            result = {
+                "has_time_warning": False,
+                "time_text": "",
+                "warning_content": "",
+                "buttons_still_exist": True
+            }
+            
+            # 1. 检查是否仍有打卡按钮（判断页面是否发生变化）
+            try:
+                gotowork_button = self.driver.find_element(By.NAME, "gotowork")
+                offwork_button = self.driver.find_element(By.NAME, "offwork") 
+                result["buttons_still_exist"] = True
+                await self.send_notification("Frame变化检测", "检测到打卡按钮仍存在，页面未发生重大变化")
+            except NoSuchElementException:
+                result["buttons_still_exist"] = False
+                await self.send_notification("Frame变化检测", "未检测到打卡按钮，页面可能发生了变化")
+            
+            # 2. 查找时间不足相关的警告文本
+            time_warning_patterns = [
+                r"未到下班时间.*?或您今日的工作时间未满",
+                r"工作时间未满",
+                r"未到下班时间",
+                r"仅仅.*?小时.*?分钟"
+            ]
+            
+            # 获取页面所有文本内容
+            try:
+                page_source = self.driver.page_source
+                body_text = self.driver.find_element(By.TAG_NAME, "body").text
+                
+                import re
+                for pattern in time_warning_patterns:
+                    matches = re.search(pattern, body_text, re.IGNORECASE | re.DOTALL)
+                    if matches:
+                        result["has_time_warning"] = True
+                        result["warning_content"] = matches.group(0)
+                        await self.send_notification("Frame变化检测", f"检测到时间警告: {matches.group(0)[:50]}...")
+                        break
+                
+                # 3. 专门查找"仅仅X小时Y分钟"格式的文本
+                time_text_pattern = r"仅仅\s*(\d+)\s*小时\s*(\d+)\s*分钟"
+                time_matches = re.search(time_text_pattern, body_text)
+                if time_matches:
+                    result["time_text"] = time_matches.group(0)
+                    await self.send_notification("Frame变化检测", f"找到工作时间文本: {result['time_text']}")
+                else:
+                    # 尝试更宽松的匹配
+                    loose_time_pattern = r"(\d+)\s*小时\s*(\d+)\s*分钟"
+                    loose_matches = re.findall(loose_time_pattern, body_text)
+                    if loose_matches:
+                        # 取最后一个匹配（通常是最相关的）
+                        hours, minutes = loose_matches[-1]
+                        result["time_text"] = f"仅仅{hours}小时{minutes}分钟"
+                        await self.send_notification("Frame变化检测", f"使用宽松匹配找到时间文本: {result['time_text']}")
+                
+            except Exception as e:
+                await self.send_notification("Frame变化检测", f"获取页面内容时出错: {str(e)}")
+            
+            # 4. 查找特定的时间警告元素
+            warning_selectors = [
+                (By.XPATH, "//td[contains(text(),'未到下班时间')]"),
+                (By.XPATH, "//td[contains(text(),'工作时间未满')]"),
+                (By.XPATH, "//div[contains(text(),'仅仅')]"),
+                (By.XPATH, "//span[contains(text(),'小时') and contains(text(),'分钟')]"),
+                (By.CSS_SELECTOR, "td.border1")
+            ]
+            
+            for by, selector in warning_selectors:
+                try:
+                    elements = self.driver.find_elements(by, selector)
+                    for element in elements:
+                        element_text = element.text
+                        if any(keyword in element_text for keyword in ["未到下班时间", "工作时间未满", "仅仅", "小时", "分钟"]):
+                            result["has_time_warning"] = True
+                            if not result["warning_content"]:
+                                result["warning_content"] = element_text
+                            
+                            # 尝试从元素中提取时间信息
+                            import re
+                            time_match = re.search(r"仅仅\s*(\d+)\s*小时\s*(\d+)\s*分钟", element_text)
+                            if time_match and not result["time_text"]:
+                                result["time_text"] = time_match.group(0)
+                            
+                            await self.send_notification("Frame变化检测", f"通过元素检测找到警告: {element_text[:30]}...")
+                            break
+                except Exception as e:
+                    continue
+            
+            # 5. 汇总检测结果
+            if result["has_time_warning"]:
+                await self.send_notification(
+                    "Frame变化检测", 
+                    f"检测完成 - 发现时间警告，时间文本: '{result['time_text']}'"
+                )
+            else:
+                await self.send_notification("Frame变化检测", "检测完成 - 未发现时间警告")
+            
+            return result
+            
+        except Exception as e:
+            error_msg = f"Frame变化检测异常: {str(e)}"
+            await self.send_notification("Frame变化检测", error_msg)
+            return {
+                "has_time_warning": False,
+                "time_text": "",
+                "warning_content": "",
+                "buttons_still_exist": True,
+                "error": error_msg
+            }
+    
+    async def _parse_work_time_text(self, time_text: str) -> Dict[str, any]:
+        """
+        解析工作时间文本，提取小时和分钟
+        
+        支持格式：
+        - "仅仅2小时13分钟"
+        - "2小时13分钟"
+        - "仅仅 2 小时 13 分钟"
+        
+        Args:
+            time_text: 包含时间信息的文本
+            
+        Returns:
+            Dict: {
+                "success": bool,
+                "hours": int,
+                "minutes": int,  
+                "total_minutes": int,
+                "original_text": str,
+                "error": str (如果失败)
+            }
+        """
+        try:
+            await self.send_notification("时间解析", f"[DEBUG] 开始解析时间文本: '{time_text}'")
+            
+            import re
+            
+            # 支持多种时间格式的正则表达式
+            patterns = [
+                r"仅仅\s*(\d+)\s*小时\s*(\d+)\s*分钟",      # "仅仅2小时13分钟"
+                r"(\d+)\s*小时\s*(\d+)\s*分钟",            # "2小时13分钟"
+                r"仅仅.*?(\d+).*?小时.*?(\d+).*?分钟",     # 宽松匹配 "仅仅...2...小时...13...分钟"
+                r"工作.*?(\d+).*?小时.*?(\d+).*?分钟"      # "工作2小时13分钟"
+            ]
+            
+            result = {
+                "success": False,
+                "hours": 0,
+                "minutes": 0,
+                "total_minutes": 0,
+                "original_text": time_text,
+                "error": ""
+            }
+            
+            # 尝试各种模式
+            for i, pattern in enumerate(patterns):
+                await self.send_notification("时间解析", f"[DEBUG] 尝试模式{i+1}: {pattern}")
+                match = re.search(pattern, time_text)
+                if match:
+                    try:
+                        hours = int(match.group(1))
+                        minutes = int(match.group(2))
+                        
+                        await self.send_notification("时间解析", f"[DEBUG] 模式{i+1}匹配成功: {hours}小时{minutes}分钟")
+                        
+                        # 验证时间的合理性
+                        if 0 <= hours <= 24 and 0 <= minutes <= 59:
+                            result["success"] = True
+                            result["hours"] = hours
+                            result["minutes"] = minutes
+                            result["total_minutes"] = hours * 60 + minutes
+                            
+                            await self.send_notification(
+                                "时间解析", 
+                                f"[DEBUG] 解析成功 - {hours}小时{minutes}分钟，总计{result['total_minutes']}分钟 (计算: {hours}*60+{minutes}={result['total_minutes']})"
+                            )
+                            return result
+                        else:
+                            await self.send_notification("时间解析", f"[DEBUG] 时间值不合理: {hours}小时{minutes}分钟")
+                            
+                    except ValueError as e:
+                        await self.send_notification("时间解析", f"[DEBUG] 数字转换失败: {str(e)}")
+                        continue
+                else:
+                    await self.send_notification("时间解析", f"[DEBUG] 模式{i+1}未匹配")
+            
+            # 如果所有模式都失败了，尝试更宽松的数字提取
+            await self.send_notification("时间解析", f"[DEBUG] 所有精确模式均失败，尝试宽松数字提取")
+            numbers = re.findall(r'\d+', time_text)
+            await self.send_notification("时间解析", f"[DEBUG] 提取到的数字: {numbers}")
+            if len(numbers) >= 2:
+                try:
+                    # 假设前两个数字分别是小时和分钟
+                    hours = int(numbers[0])
+                    minutes = int(numbers[1])
+                    
+                    await self.send_notification("时间解析", f"[DEBUG] 宽松模式解析: {hours}小时{minutes}分钟")
+                    
+                    if 0 <= hours <= 24 and 0 <= minutes <= 59:
+                        result["success"] = True
+                        result["hours"] = hours
+                        result["minutes"] = minutes
+                        result["total_minutes"] = hours * 60 + minutes
+                        
+                        await self.send_notification(
+                            "时间解析", 
+                            f"[DEBUG] 宽松解析成功 - {hours}小时{minutes}分钟，总计{result['total_minutes']}分钟 (计算: {hours}*60+{minutes}={result['total_minutes']})"
+                        )
+                        return result
+                        
+                except ValueError as e:
+                    await self.send_notification("时间解析", f"[DEBUG] 宽松模式数字转换失败: {str(e)}")
+            
+            # 完全失败
+            result["error"] = f"无法从文本中解析出有效的时间信息: '{time_text}'"
+            await self.send_notification("时间解析", f"[DEBUG] {result['error']}")
+            return result
+            
+        except Exception as e:
+            error_msg = f"时间解析异常: {str(e)}"
+            await self.send_notification("时间解析", f"[DEBUG] {error_msg}")
+            return {
+                "success": False,
+                "hours": 0,
+                "minutes": 0,
+                "total_minutes": 0,
+                "original_text": time_text,
+                "error": error_msg
+            }
+    
+    async def _calculate_remaining_time(self, worked_minutes: int) -> Dict[str, any]:
+        """
+        计算剩余工作时间
+        
+        标准工作时间：8小时16分钟 = 496分钟
+        
+        Args:
+            worked_minutes: 已工作的分钟数
+            
+        Returns:
+            Dict: {
+                "standard_minutes": int,      # 标准工作时间（分钟）
+                "worked_minutes": int,        # 已工作时间（分钟）
+                "remaining_minutes": int,     # 剩余工作时间（分钟）
+                "remaining_hours": int,       # 剩余工作时间（小时部分）
+                "remaining_mins": int,        # 剩余工作时间（分钟部分）
+                "is_overtime": bool,          # 是否已超时
+                "completion_percentage": float # 完成百分比
+            }
+        """
+        try:
+            await self.send_notification("时间计算", f"[DEBUG] 开始计算剩余时间，已工作: {worked_minutes}分钟")
+            
+            # 标准工作时间：8小时16分钟
+            standard_minutes = 8 * 60 + 16  # 496分钟
+            
+            await self.send_notification("时间计算", f"[DEBUG] 标准工作时间: {standard_minutes}分钟 (8*60+16={8*60}+16={standard_minutes})")
+            
+            remaining_minutes = standard_minutes - worked_minutes
+            
+            await self.send_notification("时间计算", f"[DEBUG] 剩余时间计算: {standard_minutes}-{worked_minutes}={remaining_minutes}分钟")
+            is_overtime = remaining_minutes < 0
+            
+            # 如果已经超时，剩余时间为0
+            if is_overtime:
+                remaining_minutes = 0
+            
+            # 计算剩余时间的小时和分钟
+            remaining_hours = remaining_minutes // 60
+            remaining_mins = remaining_minutes % 60
+            
+            # 计算完成百分比
+            completion_percentage = (worked_minutes / standard_minutes) * 100
+            if completion_percentage > 100:
+                completion_percentage = 100
+            
+            result = {
+                "standard_minutes": standard_minutes,
+                "worked_minutes": worked_minutes,
+                "remaining_minutes": remaining_minutes,
+                "remaining_hours": remaining_hours,
+                "remaining_mins": remaining_mins,
+                "is_overtime": is_overtime,
+                "completion_percentage": round(completion_percentage, 2)
+            }
+            
+            if is_overtime:
+                await self.send_notification(
+                    "时间计算", 
+                    f"[DEBUG] 已超时工作，完成度: {completion_percentage:.1f}%"
+                )
+            else:
+                await self.send_notification(
+                    "时间计算", 
+                    f"[DEBUG] 还需工作: {remaining_hours}小时{remaining_mins}分钟，完成度: {completion_percentage:.1f}% (分解: {remaining_minutes}//{60}={remaining_hours}, {remaining_minutes}%60={remaining_mins})"
+                )
+            
+            return result
+            
+        except Exception as e:
+            error_msg = f"时间计算异常: {str(e)}"
+            await self.send_notification("时间计算", f"[DEBUG] {error_msg}")
+            return {
+                "standard_minutes": 496,
+                "worked_minutes": worked_minutes,
+                "remaining_minutes": 0,
+                "remaining_hours": 0,
+                "remaining_mins": 0,
+                "is_overtime": False,
+                "completion_percentage": 0,
+                "error": error_msg
+            }
+    
+    async def _estimate_off_work_time(self, remaining_minutes: int) -> str:
+        """
+        推算预计下班时间
+        
+        Args:
+            remaining_minutes: 剩余工作时间（分钟）
+            
+        Returns:
+            str: 预计下班时间 (格式: "HH:MM")
+        """
+        try:
+            await self.send_notification("时间推算", f"[DEBUG] 开始推算下班时间，剩余: {remaining_minutes}分钟")
+            
+            from datetime import datetime, timedelta
+            
+            # 获取当前时间
+            current_time = datetime.now()
+            
+            await self.send_notification("时间推算", f"[DEBUG] 当前时间: {current_time.strftime('%Y-%m-%d %H:%M:%S')}")
+            
+            # 计算预计下班时间
+            estimated_off_time = current_time + timedelta(minutes=remaining_minutes)
+            
+            await self.send_notification("时间推算", f"[DEBUG] 时间加法: {current_time.strftime('%H:%M')} + {remaining_minutes}分钟 = {estimated_off_time.strftime('%H:%M')}")
+            
+            # 格式化为HH:MM字符串
+            estimated_time_str = estimated_off_time.strftime("%H:%M")
+            
+            await self.send_notification(
+                "时间推算", 
+                f"[DEBUG] 最终结果 - 当前时间: {current_time.strftime('%H:%M')}, 预计下班时间: {estimated_time_str}"
+            )
+            
+            return estimated_time_str
+            
+        except Exception as e:
+            error_msg = f"时间推算异常: {str(e)}"
+            await self.send_notification("时间推算", f"[DEBUG] {error_msg}")
+            return "计算失败"
+    
+    async def complete_punch_out_flow(self, username: str, password: str) -> Tuple[bool, str, Dict]:
+        """
+        完整的下班打卡流程
+        
+        包括：登录 -> 检查按钮状态 -> 执行打卡 -> 处理时间不足提示 -> 记录状态
+        
+        Args:
+            username: 用户名
+            password: 密码
+            
+        Returns:
+            Tuple[bool, str, Dict]: (是否成功, 消息, 状态数据)
+        """
+        try:
+            await self.send_notification("完整下班流程", "开始执行完整下班打卡流程...")
+            
+            # 1. 执行登录（包含启动浏览器、安全警告处理和登录）
+            await self.send_notification("完整下班流程", "步骤1: 执行登录...")
+            login_success, login_message = await self.login(username, password)
+            if not login_success:
+                return False, f"登录失败: {login_message}", {}
+            
+            await self.send_notification("完整下班流程", f"登录成功: {login_message}")
+            
+            # 2. 切换到mainFrame并检查按钮状态
+            await self.send_notification("完整下班流程", "步骤2: 切换到mainFrame...")
+            if not await self._switch_to_main_frame():
+                return False, "切换到mainFrame失败", {}
+            
+            await self.send_notification("完整下班流程", "步骤3: 检查下班按钮状态...")
+            button_status = await self._check_punch_button_status()
+            
+            # 3. 根据按钮状态决定是否打卡
+            punch_result = {"punched": False, "message": "", "already_punched": False}
+            
+            if not button_status.get("offwork", False):
+                # 下班按钮不可用，说明已经打过卡了或还未上班打卡
+                await self.send_notification("完整下班流程", "下班按钮不可用，可能已经打过卡或还未上班打卡")
+                punch_result["already_punched"] = True
+                punch_result["message"] = "下班按钮不可用，可能已经打过卡或还未上班打卡"
+            else:
+                # 下班按钮可用，执行打卡（跳过重复的frame切换和按钮检查）
+                await self.send_notification("完整下班流程", "步骤4: 执行下班打卡...")
+                punch_success, punch_message = await self.punch_out(skip_frame_switch=True, skip_button_check=True)
+                punch_result["punched"] = punch_success
+                punch_result["message"] = punch_message
+                
+                if punch_success:
+                    await self.send_notification("完整下班流程", f"下班打卡成功: {punch_message}")
+
+                    # 自动保存下班打卡时间到记录管理器
+                    try:
+                        current_time = datetime.now().strftime('%H:%M:%S')
+                        self.record_manager.update_punch_record(
+                            punch_type="punch_out",
+                            time_str=current_time,
+                            additional_info={
+                                "method": "selenium",
+                                "message": punch_message,
+                                "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                            }
+                        )
+                        await self.send_notification(
+                            "完整下班流程",
+                            f"下班打卡记录已保存: {current_time}"
+                        )
+                    except Exception as record_error:
+                        await self.send_notification(
+                            "完整下班流程",
+                            f"保存打卡记录失败: {str(record_error)}"
+                        )
+                        # 不影响主流程，继续执行
+                else:
+                    await self.send_notification("完整下班流程", f"下班打卡失败: {punch_message}")
+
+            # 4. 检查mainFrame是否出现变化（时间不足提示）
+            await self.send_notification("完整下班流程", "步骤5: 检查mainFrame变化...")
+            frame_changes = await self._detect_mainframe_changes()
+            
+            time_calculation_result = None
+            
+            if frame_changes.get("has_time_warning", False):
+                await self.send_notification("完整下班流程", "[DEBUG] 检测到工作时间不足提示，开始双路径时间计算...")
+                
+                # 实现双路径时间计算逻辑
+                worked_minutes = None
+                calculation_method = None
+                
+                # 路径检测：检查今日是否有上班打卡记录
+                await self.send_notification("完整下班流程", "[DEBUG] 启动双路径计算：检查历史数据")
+                history_worked_minutes = self.record_manager.calculate_worked_minutes_from_history()
+                await self.send_notification("完整下班流程", f"[DEBUG] 历史数据查询结果: {history_worked_minutes}")
+                
+                if history_worked_minutes is not None:
+                    # 路径B：从历史数据计算工作时间
+                    await self.send_notification("完整下班流程", f"[DEBUG] 选择路径B: 从历史数据计算工作时间")
+                    worked_minutes = history_worked_minutes
+                    calculation_method = "history_data"
+                    await self.send_notification(
+                        "完整下班流程", 
+                        f"[DEBUG] 从历史数据计算得出已工作时间: {worked_minutes}分钟"
+                    )
+                else:
+                    # 路径A：从页面文本解析工作时间
+                    await self.send_notification("完整下班流程", f"[DEBUG] 选择路径A: 从页面文本解析工作时间")
+                    work_time_text = frame_changes.get("time_text", "")
+                    await self.send_notification("完整下班流程", f"[DEBUG] 获取到的页面时间文本: '{work_time_text}'")
+                    parsed_time = await self._parse_work_time_text(work_time_text)
+                    
+                    if parsed_time.get("success", False):
+                        worked_minutes = parsed_time["total_minutes"]
+                        calculation_method = "page_parsing"
+                        await self.send_notification(
+                            "完整下班流程", 
+                            f"[DEBUG] 从页面文本解析得出已工作时间: {worked_minutes}分钟 (原文: '{work_time_text}')"
+                        )
+                    else:
+                        await self.send_notification("完整下班流程", f"[DEBUG] 路径A失败: {parsed_time.get('error', '未知错误')}")
+                
+                # 统一时间计算流程
+                if worked_minutes is not None:
+                    await self.send_notification("完整下班流程", f"[DEBUG] 进入统一时间计算流程，已工作: {worked_minutes}分钟")
+
+                    # 计算剩余工作时间
+                    remaining_time = await self._calculate_remaining_time(worked_minutes)
+
+                    # 推算预计下班时间
+                    estimated_time = await self._estimate_off_work_time(remaining_time["remaining_minutes"])
+
+                    remaining_minutes = remaining_time["remaining_minutes"]
+                    remaining_time_str = f"{remaining_minutes // 60}小时{remaining_minutes % 60}分钟"
+
+                    time_calculation_result = {
+                        "worked_minutes": worked_minutes,
+                        "remaining_minutes": remaining_minutes,
+                        "remaining_time_str": remaining_time_str,
+                        "estimated_off_time": estimated_time,
+                        "calculation_method": calculation_method,
+                        "confirmation_needed": True
+                    }
+                    
+                    await self.send_notification(
+                        "完整下班流程", 
+                        f"[DEBUG] 双路径时间计算完成 ({calculation_method}) - 已工作: {worked_minutes}分钟, 剩余: {remaining_time['remaining_minutes']}分钟, 预计下班: {estimated_time}"
+                    )
+                else:
+                    await self.send_notification("完整下班流程", "[DEBUG] 双路径时间计算均失败，无法确定工作时间")
+                    time_calculation_result = {"error": "双路径时间计算均失败"}
+            
+            # 5. 获取考勤状态（如果没有时间警告，或者作为补充信息）（跳过重复的frame切换）
+            if not frame_changes.get("has_time_warning", False):
+                await self.send_notification("完整下班流程", "步骤8: 获取今日考勤状态...")
+                attendance_status = await self.get_attendance_status(skip_frame_switch=True)
+            else:
+                attendance_status = {"note": "因检测到时间警告，跳过状态解析"}
+            
+            # 6. 汇总结果
+            flow_result = {
+                "login_success": True,
+                "login_message": login_message,
+                "button_status": button_status,
+                "punch_result": punch_result,
+                "frame_changes": frame_changes,
+                "time_calculation": time_calculation_result,
+                "attendance_status": attendance_status,
+                "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            }
+            
+            # 确定整体结果消息
+            if punch_result["punched"]:
+                if time_calculation_result and time_calculation_result.get("confirmation_needed"):
+                    overall_message = f"下班打卡执行，但工作时间不足，需用户确认自动下班时间"
+                else:
+                    overall_message = f"完整下班流程成功完成 - 已执行打卡"
+            elif punch_result["already_punched"]:
+                overall_message = f"完整下班流程成功完成 - 之前已打卡"
+            else:
+                overall_message = f"完整下班流程部分完成 - 打卡未成功: {punch_result['message']}"
+            
+            await self.send_notification("完整下班流程", overall_message)
+            
+            # 根据是否成功打卡或已打卡来确定整体成功状态
+            overall_success = punch_result["punched"] or punch_result["already_punched"]
+            
+            return overall_success, overall_message, flow_result
+            
+        except Exception as e:
+            error_msg = f"完整下班流程执行异常: {str(e)}"
+            await self.send_notification("完整下班流程", error_msg)
+            self.logger.exception("完整下班流程异常")
+            return False, error_msg, {}
+
+
+class ParallelSeleniumLogin:
+    """并行Selenium登录管理器"""
+    
+    def __init__(self, login_url: str, headless: bool = False, notification_callback=None, browser_type: str = "edge"):
+        """
+        初始化并行登录管理器
+        
+        Args:
+            login_url: 登录页面URL
+            headless: 是否使用无头模式
+            notification_callback: 通知回调函数
+            browser_type: 浏览器类型
+        """
+        self.login_url = login_url
+        self.headless = headless
+        self.notification_callback = notification_callback
+        self.browser_type = browser_type
+        self.logger = logging.getLogger(__name__)
+        self.active_controllers: Dict[str, SeleniumLoginController] = {}
+    
+    async def parallel_login(self, users: List[Dict[str, str]], max_concurrent: int = 3) -> Dict[str, Tuple[bool, str]]:
+        """
+        并行执行多用户登录
+        
+        Args:
+            users: 用户列表，每个用户包含 {'username': '', 'password': '', 'user_id': ''}
+            max_concurrent: 最大并发数
+            
+        Returns:
+            Dict[str, Tuple[bool, str]]: 每个用户的登录结果 {user_id: (是否成功, 消息)}
+        """
+        if self.notification_callback:
+            await self.notification_callback("并行登录", f"开始并行登录，用户数: {len(users)}, 最大并发: {max_concurrent}")
+        
+        # 使用信号量控制并发数
+        semaphore = asyncio.Semaphore(max_concurrent)
+        results = {}
+        
+        async def login_single_user(user_info: Dict[str, str]) -> Tuple[str, Tuple[bool, str]]:
+            """单个用户登录任务"""
+            user_id = user_info['user_id']
+            username = user_info['username'] 
+            password = user_info['password']
+            
+            async with semaphore:
+                # 为每个用户创建独立的登录控制器
+                controller = SeleniumLoginController(
+                    login_url=self.login_url,
+                    headless=self.headless,
+                    notification_callback=self._create_user_notification_callback(user_id),
+                    browser_type=self.browser_type
+                )
+                
+                self.active_controllers[user_id] = controller
+                
+                try:
+                    result = await controller.login(username, password)
+                    if self.notification_callback:
+                        await self.notification_callback(
+                            f"用户{user_id}登录", 
+                            f"登录{'成功' if result[0] else '失败'}: {result[1]}"
+                        )
+                    return user_id, result
+                    
+                except Exception as e:
+                    error_msg = f"登录异常: {str(e)}"
+                    if self.notification_callback:
+                        await self.notification_callback(f"用户{user_id}登录", f"登录异常: {error_msg}")
+                    return user_id, (False, error_msg)
+                    
+                finally:
+                    # 清理资源
+                    if user_id in self.active_controllers:
+                        try:
+                            controller.close()
+                        except:
+                            pass
+                        del self.active_controllers[user_id]
+        
+        # 创建所有登录任务
+        tasks = [login_single_user(user) for user in users]
+        
+        # 并行执行所有登录任务
+        if self.notification_callback:
+            await self.notification_callback("并行登录", "所有登录任务已创建，开始并行执行...")
+        
+        completed_tasks = await asyncio.gather(*tasks, return_exceptions=True)
+        
+        # 处理结果
+        for task_result in completed_tasks:
+            if isinstance(task_result, Exception):
+                self.logger.error(f"并行登录任务异常: {task_result}")
+                # 为异常任务创建失败结果
+                results["unknown"] = (False, f"任务异常: {str(task_result)}")
+            else:
+                user_id, login_result = task_result
+                results[user_id] = login_result
+        
+        # 汇总结果
+        success_count = sum(1 for success, _ in results.values() if success)
+        total_count = len(results)
+        
+        if self.notification_callback:
+            await self.notification_callback(
+                "并行登录完成", 
+                f"总用户数: {total_count}, 成功: {success_count}, 失败: {total_count - success_count}"
+            )
+        
+        return results
+    
+    def _create_user_notification_callback(self, user_id: str):
+        """为特定用户创建通知回调"""
+        if not self.notification_callback:
+            return None
+            
+        async def user_notification(context: str, message: str):
+            # 在消息前加上用户标识
+            await self.notification_callback(f"[{user_id}]{context}", message)
+            
+        return user_notification
+    
+    async def get_login_status(self) -> Dict[str, str]:
+        """获取当前所有活跃登录会话的状态"""
+        status = {}
+        for user_id, controller in self.active_controllers.items():
+            try:
+                if controller.driver:
+                    current_url = controller.driver.current_url
+                    page_title = controller.driver.title
+                    status[user_id] = f"活跃 - URL: {current_url}, 标题: {page_title}"
+                else:
+                    status[user_id] = "无活跃会话"
+            except Exception as e:
+                status[user_id] = f"状态检查失败: {str(e)}"
+        
+        return status
+    
+    def close_all(self):
+        """关闭所有活跃的登录会话"""
+        for user_id, controller in self.active_controllers.items():
+            try:
+                controller.close()
+                self.logger.info(f"用户{user_id}的登录会话已关闭")
+            except Exception as e:
+                self.logger.error(f"关闭用户{user_id}会话时出错: {e}")
+        
+        self.active_controllers.clear()
+    
+    def __enter__(self):
+        """上下文管理器入口"""
+        return self
+    
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        """上下文管理器出口"""
+        self.close_all()

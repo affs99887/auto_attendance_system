@@ -6,18 +6,21 @@
 
 import json
 import os
+import threading
 from datetime import datetime
 from modules.config import config
 
 
 class PunchRecordManager:
     """打卡记录管理类"""
-    
+
     def __init__(self):
         self.records_dir = config.PUNCH_RECORDS_DIR
         self.ensure_records_dir()
         self.current_month_file = self._get_current_month_file()
         self.records = self.load_records()
+        # 并行打卡场景下，多个用户同时写同一月份 JSON 文件需要互斥
+        self._lock = threading.Lock()
 
     def ensure_records_dir(self):
         """确保记录目录存在"""
@@ -49,19 +52,20 @@ class PunchRecordManager:
             print(f"保存打卡记录失败: {str(e)}")
 
     def update_record(self, date_str, punch_type, time_str):
-        """更新打卡记录"""
-        if date_str not in self.records:
-            self.records[date_str] = {
-                'punch_in_time': None,
-                'punch_out_time': None
-            }
-        
-        if punch_type == "上班":
-            self.records[date_str]['punch_in_time'] = time_str
-        else:  # 下班
-            self.records[date_str]['punch_out_time'] = time_str
-        
-        self.save_records()
+        """更新打卡记录（并行打卡场景下用 _lock 串行化整段 load→modify→save）"""
+        with self._lock:
+            if date_str not in self.records:
+                self.records[date_str] = {
+                    'punch_in_time': None,
+                    'punch_out_time': None
+                }
+
+            if punch_type == "上班":
+                self.records[date_str]['punch_in_time'] = time_str
+            else:  # 下班
+                self.records[date_str]['punch_out_time'] = time_str
+
+            self.save_records()
 
     def get_today_record(self):
         """获取今日打卡记录"""

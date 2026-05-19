@@ -37,20 +37,34 @@ async def run_schedule():
                 last_job_check = current_time
                 last_job_count = len(jobs)
 
-            # 运行待处理的定时任务
+            # 运行待处理的定时任务 - 使用 schedule 模块的标准方法
+            try:
+                # 使用schedule模块的run_pending方法来执行待处理的任务
+                schedule.run_pending()
+            except Exception as e:
+                error_msg = f"执行schedule.run_pending()时发生错误: {str(e)}"
+                print(error_msg)
+                logging.error(error_msg)
+                logging.error(traceback.format_exc())
+            
+            # 手动检查并执行需要运行的任务（作为备用机制）
             for job in jobs:
                 if job.should_run:
                     try:
                         # 只在任务实际执行时记录日志
                         current_time_str = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-                        logging.info(f"[{current_time_str}] 开始执行定时任务")
+                        logging.info(f"[{current_time_str}] 手动执行定时任务: {job.job_func}")
                         # 执行任务并等待其完成
                         result = job.run()
+                        # 处理协程和Task对象
                         if asyncio.iscoroutine(result):
+                            await result
+                        elif isinstance(result, asyncio.Task):
+                            # Task对象也需要等待
                             await result
                         logging.info(f"[{current_time_str}] 定时任务执行完成")
                     except Exception as e:
-                        error_msg = f"执行定时任务时发生错误: {str(e)}"
+                        error_msg = f"手动执行定时任务时发生错误: {str(e)}"
                         print(error_msg)
                         logging.error(error_msg)
                         logging.error(traceback.format_exc())

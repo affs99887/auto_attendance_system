@@ -5,6 +5,7 @@
 """
 
 import os
+import json
 from dotenv import load_dotenv
 
 # 加载环境变量
@@ -81,6 +82,63 @@ class Config:
     # 图像识别配置
     MATCH_THRESHOLD = 0.8
     OCR_CONFIG = '--oem 3 --psm 6 -c tessedit_char_whitelist=0123456789:'
+    
+    # 动态配置文件路径
+    DYNAMIC_CONFIG_FILE = 'dynamic_config.json'
+    
+    # Selenium配置 - 支持动态配置
+    _dynamic_config = None
+    
+    @classmethod
+    def _load_dynamic_config(cls):
+        """加载动态配置"""
+        if cls._dynamic_config is None:
+            if os.path.exists(cls.DYNAMIC_CONFIG_FILE):
+                try:
+                    with open(cls.DYNAMIC_CONFIG_FILE, 'r', encoding='utf-8') as f:
+                        cls._dynamic_config = json.load(f)
+                except Exception as e:
+                    print(f"加载动态配置失败: {e}")
+                    cls._dynamic_config = {}
+            else:
+                cls._dynamic_config = {}
+        return cls._dynamic_config
+    
+    @classmethod
+    def _save_dynamic_config(cls):
+        """保存动态配置"""
+        try:
+            with open(cls.DYNAMIC_CONFIG_FILE, 'w', encoding='utf-8') as f:
+                json.dump(cls._dynamic_config, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            print(f"保存动态配置失败: {e}")
+    
+    @classmethod
+    def get_selenium_config(cls, key, default_value):
+        """获取Selenium配置，优先使用动态配置"""
+        dynamic_config = cls._load_dynamic_config()
+        if key in dynamic_config:
+            return dynamic_config[key]
+        # 回退到环境变量
+        env_value = os.getenv(key, str(default_value)).lower()
+        return env_value == 'true' if isinstance(default_value, bool) else env_value
+    
+    @classmethod
+    def set_selenium_config(cls, key, value):
+        """设置Selenium配置"""
+        dynamic_config = cls._load_dynamic_config()
+        dynamic_config[key] = value
+        cls._save_dynamic_config()
+    
+    @classmethod
+    def get_use_selenium_login(cls):
+        """是否使用Selenium登录"""
+        return cls.get_selenium_config('USE_SELENIUM_LOGIN', False)
+    
+    @classmethod
+    def get_selenium_headless(cls):
+        """是否使用无头模式"""
+        return cls.get_selenium_config('SELENIUM_HEADLESS', False)
 
     @classmethod
     def get_user_configs(cls):
