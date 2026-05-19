@@ -7,6 +7,48 @@ from logging.handlers import RotatingFileHandler
 import subprocess
 from datetime import datetime
 
+
+def configure_console_encoding():
+    """保留当前终端编码，并替换无法编码的字符。"""
+    for stream_name in ("stdout", "stderr"):
+        stream = getattr(sys, stream_name, None)
+        if stream is None:
+            continue
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure:
+            try:
+                reconfigure(errors="replace")
+                continue
+            except (TypeError, ValueError, OSError):
+                pass
+
+        buffer = getattr(stream, "buffer", None)
+        if buffer is None:
+            continue
+        try:
+            import io
+            encoding = getattr(stream, "encoding", None) or "utf-8"
+            setattr(sys, stream_name, io.TextIOWrapper(
+                buffer,
+                encoding=encoding,
+                errors="replace",
+                line_buffering=True
+            ))
+        except (TypeError, ValueError, OSError):
+            pass
+
+
+def python_subprocess_env():
+    """子进程继承当前输出编码，并替换无法编码的字符。"""
+    env = os.environ.copy()
+    encoding = getattr(sys.stdout, "encoding", None)
+    if encoding:
+        env['PYTHONIOENCODING'] = f'{encoding}:replace'
+    return env
+
+
+configure_console_encoding()
+
 def setup_logging():
     """配置日志记录"""
     log_formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
@@ -44,7 +86,7 @@ def start_main_program():
     """启动主程序"""
     try:
         # 使用 Python 解释器启动主程序
-        subprocess.Popen([sys.executable, 'main.py'])
+        subprocess.Popen([sys.executable, 'main.py'], env=python_subprocess_env())
         logging.info("主程序已启动")
         return True
     except Exception as e:
