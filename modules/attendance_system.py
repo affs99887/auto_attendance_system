@@ -176,6 +176,10 @@ class AttendanceSystem:
         # 安装进程退出钩子（atexit + SIGINT/SIGTERM），无论怎样退出都尽力清掉活跃 driver
         self._install_exit_handlers()
 
+        # GUI 后端事件总线占位。仅在 main.py --gui 模式下由 web_server.start() 注入；
+        # 默认 None，对纯 bot 部署 send_notification 等代码无任何影响。
+        self._event_bus = None
+
         # 初始化完成，取消静默模式
         self._silent_init = False
 
@@ -623,6 +627,17 @@ class AttendanceSystem:
     async def send_notification(self, title, content):
         """发送/更新Telegram消息"""
         message = self.update_progress(f"{title}: {content}")
+
+        # 把事件转推到 GUI（如果挂载了 event_bus）。非阻塞，失败不影响后续 bot 流程。
+        if self._event_bus is not None:
+            try:
+                await self._event_bus.publish('punch:progress', {
+                    'title': title,
+                    'content': content,
+                    'message': message,
+                })
+            except Exception:
+                logging.exception("event_bus publish failed for punch:progress")
 
         # 确保bot已初始化
         if not self.bot:
@@ -3548,3 +3563,97 @@ class AttendanceSystem:
                 })
 
         return users
+
+    # ------------------------------------------------------------------
+    # GUI-facing helpers — 只读快照 + 动态配置写入
+    # 这些方法供 modules/web_server.py 的 Flask 路由调用，需保持非阻塞且线程安全。
+    # ------------------------------------------------------------------
+
+    def get_status_snapshot(self) -> Dict:
+        """返回系统当前状态的 JSON 友好快照。"""
+
+        def _fmt_dt(dt):
+            if not dt:
+                return None
+            try:
+                return dt.isoformat()
+            except Exception:
+                return str(dt)
+
+        today_records = {}
+        for username, rec in (self.today_punch_records or {}).items():
+            today_records[username] = {
+                'punch_in_time': _fmt_dt(rec.get('punch_in_time')),
+                'punch_out_time': _fmt_dt(rec.get('punch_out_time')),
+            }
+
+        try:
+            cpu_percent = psutil.cpu_percent(interval=None)
+            mem = psutil.virtual_memory()
+            resources = {
+                'cpu_percent': cpu_percent,
+                'memory_percent': mem.percent,
+            }
+        except Exception:
+            resources = {}
+
+        try:
+            workday = bool(is_workday(datetime.now().date()))
+            holiday = bool(is_holiday(datetime.now().date()))
+        except Exception:
+            workday, holiday = None, None
+
+        return {
+            'current_time': datetime.now().isoformat(),
+            'is_workday': workday,
+            'is_holiday': holiday,
+            'is_work_time': self.is_work_time(),
+            'current_operation': self.current_operation,
+            'operation_started_at': _fmt_dt(self.operation_start_time),
+            'today_records': today_records,
+            'config': {
+                'work_start_time': self.work_start_time,
+                'work_end_time': self.work_end_time,
+                'late_threshold': self.late_threshold,
+                'early_leave_threshold': self.early_leave_threshold,
+                'use_selenium_login': self.use_selenium_login,
+                'selenium_headless': self.selenium_headless,
+                'daily_status_time': self.daily_status_time,
+            },
+            'scheduled_tasks': list(self.task_manager.get_tasks()),
+            'heartbeat': {
+                'last': _fmt_dt(self.last_heartbeat),
+                'miss_count': self.heartbeat_miss_count,
+            },
+            'active_controllers': len(self._active_controllers),
+            'users': [u.get('username') for u in self.users if u.get('username')],
+            'resources': resources,
+        }
+
+    def get_running_operations(self) -> Dict:
+        """返回当前正在进行的操作详情（精简版，不阻塞）。"""
+        return {
+            'current_operation': self.current_operation,
+            'started_at': self.operation_start_time.isoformat() if self.operation_start_time else None,
+            'active_controllers': len(self._active_controllers),
+        }
+
+    def update_dynamic_config(self, patch: Dict) -> Dict:
+        """更新 dynamic_config.json 并同步实例内布尔标志。
+
+        - ``USE_SELENIUM_LOGIN`` 立刻生效（下次打卡走新模式）
+        - ``SELENIUM_HEADLESS`` 写入文件，**仅下次新建 SeleniumLoginController 时生效**
+          （进行中的浏览器实例不会重启，由调用方在 UI 中提示用户）
+        """
+        if 'USE_SELENIUM_LOGIN' in patch:
+            val = bool(patch['USE_SELENIUM_LOGIN'])
+            config.set_selenium_config('USE_SELENIUM_LOGIN', val)
+            self.use_selenium_login = val
+        if 'SELENIUM_HEADLESS' in patch:
+            val = bool(patch['SELENIUM_HEADLESS'])
+            config.set_selenium_config('SELENIUM_HEADLESS', val)
+            self.selenium_headless = val
+        return {
+            'USE_SELENIUM_LOGIN': self.use_selenium_login,
+            'SELENIUM_HEADLESS': self.selenium_headless,
+        }

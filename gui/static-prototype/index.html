@@ -1,0 +1,78 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=1480" />
+<title>自动打卡系统 — GUI</title>
+<link rel="preconnect" href="https://fonts.googleapis.com" />
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Sans+SC:wght@400;500;600&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet" />
+<link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+<div id="root"></div>
+
+<script src="https://unpkg.com/react@18.3.1/umd/react.development.js" integrity="sha384-hD6/rw4ppMLGNu3tX5cjIb+uRZ7UkRJ6BPkLpg4hAu/6onKUg4lLsHAs9EBPT82L" crossorigin="anonymous"></script>
+<script src="https://unpkg.com/react-dom@18.3.1/umd/react-dom.development.js" integrity="sha384-u6aeetuaXnQ38mYT8rp6sbXaQe3NL9t+IBXmnYxwkUI2Hw4bsp2Wvmx4yRQF1uAm" crossorigin="anonymous"></script>
+<script src="https://unpkg.com/@babel/standalone@7.29.0/babel.min.js" integrity="sha384-m08KidiNqLdpJqLq95G/LEi8Qvjl/xUYll3QILypMoQ65QorJ9Lvtp2RXYGBFj1y" crossorigin="anonymous"></script>
+
+<script type="text/babel" src="data.jsx"></script>
+<script type="text/babel" src="icons.jsx"></script>
+<script type="text/babel" src="app.jsx"></script>
+<script type="text/babel" src="screens/dashboard.jsx"></script>
+<script type="text/babel" src="screens/punch.jsx"></script>
+<script type="text/babel" src="screens/records.jsx"></script>
+<script type="text/babel" src="screens/shots.jsx"></script>
+<script type="text/babel" src="screens/tasks.jsx"></script>
+<script type="text/babel" src="screens/logs.jsx"></script>
+<script type="text/babel" src="screens/settings.jsx"></script>
+<script type="text/babel" src="screens/about.jsx"></script>
+
+<script type="text/babel">
+const THEME_DEFAULTS = {
+  accent: localStorage.getItem("aas.accent") || "#3b6fb8",
+  theme: localStorage.getItem("aas.theme") || (window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light"),
+};
+
+function applyTheme(t) {
+  document.documentElement.setAttribute("data-theme", t.theme);
+  document.documentElement.style.setProperty("--accent", t.accent);
+  localStorage.setItem("aas.theme", t.theme);
+  localStorage.setItem("aas.accent", t.accent);
+}
+
+function Root() {
+  const [t, setT] = React.useState(THEME_DEFAULTS);
+  React.useEffect(() => { applyTheme(t); }, [t]);
+
+  // Expose theme control globally so the Settings screen (and any other component) can drive it.
+  React.useEffect(() => {
+    window.AAS_THEME = {
+      get: () => t,
+      setTheme: (theme) => setT(prev => ({ ...prev, theme })),
+      setAccent: (accent) => setT(prev => ({ ...prev, accent })),
+      toggleTheme: () => setT(prev => ({ ...prev, theme: prev.theme === "dark" ? "light" : "dark" })),
+      accents: ["#3b6fb8", "#8b5e3c", "#5b8c4f", "#a04060", "#1f1f24"],
+    };
+  }, [t]);
+
+  // Follow system theme when user hasn't explicitly set one.
+  React.useEffect(() => {
+    if (localStorage.getItem("aas.theme")) return;
+    const mq = window.matchMedia("(prefers-color-scheme: dark)");
+    const onChange = (e) => setT(prev => ({ ...prev, theme: e.matches ? "dark" : "light" }));
+    mq.addEventListener("change", onChange);
+    return () => mq.removeEventListener("change", onChange);
+  }, []);
+
+  const App = window.AAS_APP;
+  return <App />;
+}
+
+// Babel scripts run after the DOM is parsed, so we can render immediately.
+const root = ReactDOM.createRoot(document.getElementById("root"));
+root.render(<Root />);
+</script>
+
+</body>
+</html>

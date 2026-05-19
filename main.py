@@ -4,6 +4,7 @@
 自动打卡系统的主启动文件，负责初始化和协调各个模块
 """
 
+import argparse
 import asyncio
 import logging
 import sys
@@ -204,23 +205,59 @@ async def initialize_system():
     return attendance_system, schedule_task, monitor_task
 
 
-async def main():
+def _parse_args():
+    """解析主程序命令行参数。
+
+    单独抽出便于 start.py / Electron 外壳直接调用 ``main.py --gui``。
+    """
+    parser = argparse.ArgumentParser(description='自动打卡系统主程序')
+    parser.add_argument('--gui', action='store_true',
+                        help='启用 GUI 后端（Flask REST + WebSocket，监听 127.0.0.1）')
+    parser.add_argument('--gui-http-port', type=int, default=8765,
+                        help='GUI HTTP 端口（默认 8765）')
+    parser.add_argument('--gui-ws-port', type=int, default=8766,
+                        help='GUI WebSocket 端口（默认 8766）')
+    return parser.parse_args()
+
+
+async def main(args=None):
     """主函数 - 系统启动入口"""
     global attendance_system_global
-    
+    if args is None:
+        args = argparse.Namespace(gui=False, gui_http_port=8765, gui_ws_port=8766)
+
+    gui_handle = None  # web_server.start 返回值，用于关停
+
     try:
         # 显示欢迎界面
         print_welcome()
-        
+
         # 等待一秒让用户看到欢迎界面
         await asyncio.sleep(1)
-        
+
         # 初始化系统
         attendance_system, schedule_task, monitor_task = await initialize_system()
-        
+
         # 设置全局变量，供调度器使用
         attendance_system_global = attendance_system
-        
+
+        # GUI 后端：仅在 --gui 时启动。失败不阻塞 bot 主流程。
+        if args.gui:
+            try:
+                from modules.web_server import start as start_web_server
+                gui_handle = await start_web_server(
+                    attendance_system,
+                    loop=asyncio.get_running_loop(),
+                    http_port=args.gui_http_port,
+                    ws_port=args.gui_ws_port,
+                )
+                logging.info(
+                    f"GUI 后端已启动 — HTTP 127.0.0.1:{args.gui_http_port} / "
+                    f"WS 127.0.0.1:{args.gui_ws_port}，token 文件 logs/.gui_token"
+                )
+            except Exception as e:
+                logging.error(f"GUI 后端启动失败，bot 主流程不受影响: {e}", exc_info=True)
+
         # 等待5秒后验证8:15提醒任务设置
         await asyncio.sleep(5)
         logging.info("验证8:15提醒任务设置...")
@@ -229,7 +266,7 @@ async def main():
             logging.info("✅ 8:15提醒任务验证成功")
         else:
             logging.warning("⚠️ 8:15提醒任务验证失败，可能需要手动检查")
-        
+
         logging.info("所有服务已启动，系统运行中...")
 
         try:
@@ -243,6 +280,11 @@ async def main():
             # 清理资源
             print("\n[>>] 正在关闭系统...")
             schedule_task.cancel()
+            if gui_handle is not None:
+                try:
+                    gui_handle['stop']()
+                except Exception:
+                    logging.exception("GUI 后端关停失败")
             await attendance_system.bot.stop_polling()
             if attendance_system.bot.app:
                 await attendance_system.bot.app.stop()
@@ -257,8 +299,9 @@ async def main():
 
 
 if __name__ == "__main__":
+    cli_args = _parse_args()
     try:
-        asyncio.run(main())
+        asyncio.run(main(cli_args))
     except KeyboardInterrupt:
         print("\n\n[EXIT] 程序已停止，感谢使用！")
     except Exception as e:

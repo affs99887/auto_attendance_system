@@ -62,16 +62,40 @@ def start_watchdog():
         print("看门狗将监控主程序运行状态并自动重启")
         print("按 Ctrl+C 可停止程序")
         print("-" * 50)
-        
+
         # 启动看门狗
         subprocess.run([sys.executable, 'watchdog.py'])
-        
+
     except KeyboardInterrupt:
         print("\n程序已停止")
     except Exception as e:
         print(f"启动失败: {e}")
         return False
-    
+
+    return True
+
+def start_gui():
+    """启动 GUI 模式（main.py 附带 --gui 标志，无看门狗）。
+
+    Electron 主进程会以同样的方式拉起 Python 后端；watchdog 与 GUI 互斥，
+    崩溃重启由 Electron 接管。
+    """
+    try:
+        print("正在启动自动打卡系统...")
+        print("模式: GUI 后端 + Telegram Bot 共存")
+        print("HTTP 监听 127.0.0.1:8765，WebSocket 监听 127.0.0.1:8766")
+        print("token 文件: logs/.gui_token（仅当前用户可读）")
+        print("按 Ctrl+C 可停止程序")
+        print("-" * 50)
+
+        subprocess.run([sys.executable, 'main.py', '--gui'])
+
+    except KeyboardInterrupt:
+        print("\n程序已停止")
+    except Exception as e:
+        print(f"启动失败: {e}")
+        return False
+
     return True
 
 def show_status():
@@ -113,12 +137,13 @@ def interactive_mode():
     print("1. 直接启动 (main.py)")
     print("2. 看门狗模式 (watchdog.py) [推荐]")
     print("3. 查看运行状态")
-    print("4. 退出")
-    
+    print("4. GUI 模式 (Electron 后端，需另启 GUI)")
+    print("5. 退出")
+
     while True:
         try:
-            choice = input("\n请输入选择 (1-4): ").strip()
-            
+            choice = input("\n请输入选择 (1-5): ").strip()
+
             if choice == '1':
                 return start_main()
             elif choice == '2':
@@ -127,10 +152,12 @@ def interactive_mode():
                 show_status()
                 continue
             elif choice == '4':
+                return start_gui()
+            elif choice == '5':
                 print("退出启动器")
                 return True
             else:
-                print("无效选择，请输入1-4")
+                print("无效选择，请输入1-5")
         except KeyboardInterrupt:
             print("\n退出启动器")
             return True
@@ -138,25 +165,27 @@ def interactive_mode():
 def main():
     """主函数"""
     parser = argparse.ArgumentParser(description='自动打卡系统启动器')
-    parser.add_argument('--mode', choices=['main', 'watchdog', 'status'], 
-                       help='启动模式: main(直接启动), watchdog(看门狗模式), status(查看状态)')
+    parser.add_argument('--mode', choices=['main', 'watchdog', 'status', 'gui'],
+                       help='启动模式: main(直接启动), watchdog(看门狗模式), status(查看状态), gui(后端供 Electron 调用)')
     parser.add_argument('--interactive', action='store_true',
                        help='交互模式选择')
-    
+
     args = parser.parse_args()
-    
+
     # 设置日志
     setup_logging()
-    
+
     # 检查环境
     if not check_environment():
         return 1
-    
+
     # 根据参数选择启动模式
     if args.mode == 'main':
         success = start_main()
     elif args.mode == 'watchdog':
         success = start_watchdog()
+    elif args.mode == 'gui':
+        success = start_gui()
     elif args.mode == 'status':
         show_status()
         return 0
@@ -168,7 +197,7 @@ def main():
         print("使用 --help 查看更多选项")
         time.sleep(1)
         success = start_watchdog()
-    
+
     return 0 if success else 1
 
 if __name__ == "__main__":

@@ -55,4 +55,7 @@ Thumbs.db
 punch_records/
 screenshots/
 scheduled_tasks.json
-dynamic_config.json 
+dynamic_config.json
+
+# ai
+.claude
