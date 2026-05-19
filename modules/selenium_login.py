@@ -27,6 +27,7 @@ from selenium.common.exceptions import (
     ElementNotInteractableException
 )
 from webdriver_manager.microsoft import EdgeChromiumDriverManager
+from webdriver_manager.chrome import ChromeDriverManager
 
 
 class SeleniumRecordManager:
@@ -203,7 +204,8 @@ class SeleniumLoginController:
         self.logger = logging.getLogger(__name__)
         self.driver = None
         self.wait = None
-        
+        self.service = None  # selenium Service 实例，便于 close() 兜底关 msedgedriver 进程
+
         # 初始化记录管理器
         self.record_manager = SeleniumRecordManager(username=username)
         
@@ -321,18 +323,38 @@ class SeleniumLoginController:
                 browser_name = "Chrome" if browser == "chrome" else "Edge"
                 await self.send_notification("Selenium登录", f"正在尝试启动{browser_name}浏览器...")
                 
-                # 创建WebDriver实例
+                # 创建WebDriver实例（保存 service 到 self.service，便于 close() 兜底清理 service 进程）
                 if browser == "chrome":
                     chrome_options = self._setup_chrome_options()
-                    self.driver = webdriver.Chrome(options=chrome_options)
+                    try:
+                        # 优先用 webdriver-manager 自动下载匹配本地 Chrome 版本的 driver
+                        driver_path = ChromeDriverManager().install()
+                        await self.send_notification("Selenium登录", f"使用 webdriver-manager 管理的Chrome驱动: {driver_path}")
+                        self.service = ChromeService(driver_path)
+                        self.driver = webdriver.Chrome(service=self.service, options=chrome_options)
+                    except Exception as wdm_err:
+                        # 兜底：回退到系统 PATH 中的 chromedriver
+                        await self.send_notification("Selenium登录", f"webdriver-manager 获取 Chrome 驱动失败({str(wdm_err)[:80]})，回退到系统PATH")
+                        self.service = None  # 走 PATH 自动模式时 selenium 内部管理 service，无需保存
+                        self.driver = webdriver.Chrome(options=chrome_options)
                 else:
-                    # Edge WebDriver - 直接使用项目目录中的WebDriver
                     edge_options = self._setup_edge_options()
                     import os
                     project_driver_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'msedgedriver.exe')
-                    service = Service(project_driver_path)
-                    await self.send_notification("Selenium登录", f"使用项目目录WebDriver: {project_driver_path}")
-                    self.driver = webdriver.Edge(service=service, options=edge_options)
+                    try:
+                        # 优先用 webdriver-manager 自动下载匹配本地 Edge 版本的 driver
+                        driver_path = EdgeChromiumDriverManager().install()
+                        await self.send_notification("Selenium登录", f"使用 webdriver-manager 管理的Edge驱动: {driver_path}")
+                        self.service = Service(driver_path)
+                        self.driver = webdriver.Edge(service=self.service, options=edge_options)
+                    except Exception as wdm_err:
+                        # 兜底：回退到项目目录中的 msedgedriver.exe（offline 场景）
+                        await self.send_notification(
+                            "Selenium登录",
+                            f"webdriver-manager 获取 Edge 驱动失败({str(wdm_err)[:80]})，回退到项目目录WebDriver: {project_driver_path}"
+                        )
+                        self.service = Service(project_driver_path)
+                        self.driver = webdriver.Edge(service=self.service, options=edge_options)
                 
                 await self.send_notification("Selenium登录", f"{browser_name} WebDriver实例创建成功")
                 self.wait = WebDriverWait(self.driver, 10)
@@ -715,7 +737,8 @@ class SeleniumLoginController:
             return None
     
     def close(self):
-        """关闭浏览器"""
+        """关闭浏览器 + 兜底清理 Service 进程"""
+        # 正常路径：driver.quit() 会自动停 service
         if self.driver:
             try:
                 self.driver.quit()
@@ -725,6 +748,16 @@ class SeleniumLoginController:
             finally:
                 self.driver = None
                 self.wait = None
+        # 兜底：driver 创建失败但 Service 已启动（msedgedriver.exe 进程仍在），显式 stop
+        service = getattr(self, 'service', None)
+        if service is not None:
+            try:
+                service.stop()
+                self.logger.info("Selenium Service 进程已停止")
+            except Exception as e:
+                self.logger.error(f"停止 Selenium Service 时发生错误: {e}")
+            finally:
+                self.service = None
     
     def __enter__(self):
         """上下文管理器入口"""
@@ -1681,9 +1714,32 @@ class SeleniumLoginController:
                 
                 if punch_success:
                     await self.send_notification("完整下班流程", f"下班打卡成功: {punch_message}")
+
+                    # 自动保存下班打卡时间到记录管理器
+                    try:
+                        current_time = datetime.now().strftime('%H:%M:%S')
+                        self.record_manager.update_punch_record(
+                            punch_type="punch_out",
+                            time_str=current_time,
+                            additional_info={
+                                "method": "selenium",
+                                "message": punch_message,
+                                "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                            }
+                        )
+                        await self.send_notification(
+                            "完整下班流程",
+                            f"下班打卡记录已保存: {current_time}"
+                        )
+                    except Exception as record_error:
+                        await self.send_notification(
+                            "完整下班流程",
+                            f"保存打卡记录失败: {str(record_error)}"
+                        )
+                        # 不影响主流程，继续执行
                 else:
                     await self.send_notification("完整下班流程", f"下班打卡失败: {punch_message}")
-            
+
             # 4. 检查mainFrame是否出现变化（时间不足提示）
             await self.send_notification("完整下班流程", "步骤5: 检查mainFrame变化...")
             frame_changes = await self._detect_mainframe_changes()
@@ -1731,16 +1787,20 @@ class SeleniumLoginController:
                 # 统一时间计算流程
                 if worked_minutes is not None:
                     await self.send_notification("完整下班流程", f"[DEBUG] 进入统一时间计算流程，已工作: {worked_minutes}分钟")
-                    
+
                     # 计算剩余工作时间
                     remaining_time = await self._calculate_remaining_time(worked_minutes)
-                    
+
                     # 推算预计下班时间
                     estimated_time = await self._estimate_off_work_time(remaining_time["remaining_minutes"])
-                    
+
+                    remaining_minutes = remaining_time["remaining_minutes"]
+                    remaining_time_str = f"{remaining_minutes // 60}小时{remaining_minutes % 60}分钟"
+
                     time_calculation_result = {
                         "worked_minutes": worked_minutes,
-                        "remaining_minutes": remaining_time["remaining_minutes"],
+                        "remaining_minutes": remaining_minutes,
+                        "remaining_time_str": remaining_time_str,
                         "estimated_off_time": estimated_time,
                         "calculation_method": calculation_method,
                         "confirmation_needed": True

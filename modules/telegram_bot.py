@@ -149,7 +149,7 @@ class TelegramBot:
             "/kill <任务ID> - 直接删除指定任务\n"
             "/check - 查看最新打卡图片\n"
             "/check <用户名> - 查看指定用户的打卡图片\n"
-            "/parallel - 并行登录多个用户\n"
+            "/parallel - 并行登录测试（仅验证多用户能并发登录，不打卡）\n"
             "/mode - 切换登录模式（Selenium无头/传统图像识别）\n"
             "/test_reminder - 测试8:15每日提醒功能\n\n"
             "🛡️ 看门狗功能已内置启用\n"
@@ -267,7 +267,10 @@ class TelegramBot:
             return
 
         try:
-            await update.message.reply_text("🚀 开始并行登录...")
+            await update.message.reply_text(
+                "🧪 并行登录测试：此命令仅验证多用户能否并发登录，不会执行打卡。\n"
+                "如需多账户并行打卡，直接发送 /punch_in 或 /punch_out（Selenium 模式自动启用并行）"
+            )
 
             # 检查系统是否已初始化
             if not self.attendance_system:
@@ -399,9 +402,19 @@ class TelegramBot:
             # 获取系统状态信息
             current_time = datetime.now()
 
-            # 获取今日打卡记录
-            punch_in_time = self.attendance_system.today_punch_records['punch_in_time']
-            punch_out_time = self.attendance_system.today_punch_records['punch_out_time']
+            # 获取今日打卡记录（按用户分桶，组成显示行）
+            user_records = self.attendance_system.today_punch_records
+            if user_records:
+                punch_record_lines = []
+                for uname, record in user_records.items():
+                    in_t = record.get('punch_in_time')
+                    out_t = record.get('punch_out_time')
+                    in_str = ('✅ ' + in_t.strftime('%H:%M:%S')) if in_t else '❌ 未打卡'
+                    out_str = ('✅ ' + out_t.strftime('%H:%M:%S')) if out_t else '❌ 未打卡'
+                    punch_record_lines.append(f"[{uname}] 上班：{in_str} | 下班：{out_str}")
+                punch_record_block = "\n".join(punch_record_lines)
+            else:
+                punch_record_block = "（无用户配置）"
 
             # 获取系统资源使用情况
             memory = psutil.virtual_memory()
@@ -448,8 +461,7 @@ class TelegramBot:
 
             status_text += (
                 "📍 今日打卡记录\n"
-                f"上班打卡：{'✅ ' + punch_in_time.strftime('%H:%M:%S') if punch_in_time else '❌ 未打卡'}\n"
-                f"下班打卡：{'✅ ' + punch_out_time.strftime('%H:%M:%S') if punch_out_time else '❌ 未打卡'}\n\n"
+                f"{punch_record_block}\n\n"
 
                 "⚙️ 系统信息\n"
                 f"运行时长：{int(hours)}小时{int(minutes)}分钟\n"
