@@ -102,22 +102,34 @@ class AttendanceSystem:
         self.late_threshold = config.LATE_THRESHOLD
         self.early_leave_threshold = config.EARLY_LEAVE_THRESHOLD
 
-        # 添加打卡提醒状态跟踪（用于防止重复提醒）
+        # 添加打卡提醒状态跟踪（按用户分桶，避免并行场景下相互污染）
         self.notification_sent_today = {
-            'punch_in_reminder': False,
-            'punch_out_reminder': False,
-            'last_check_date': None
+            user['username']: {
+                'punch_in_reminder': False,
+                'punch_out_reminder': False,
+                'last_check_date': None
+            }
+            for user in (self.users if hasattr(self, 'users') and self.users else [])
+            if user.get('username')
         }
 
         # 初始化任务管理器和打卡记录管理器（使用新的导入模块）
         self.task_manager = task_manager
         self.punch_record_manager = punch_record_manager
 
-        # 加载今日打卡记录
+        # 加载今日打卡记录 —— 改为 dict[username] 嵌套，支持并行场景下按用户隔离
+        # 初始值来自全局 punch_record_manager 单条记录（历史设计无用户区分），各用户共享起点；
+        # 运行时各自更新自己的桶，不再相互覆盖。
         today_record = self.punch_record_manager.get_today_record()
+        initial_in = datetime.strptime(today_record['punch_in_time'], '%H:%M:%S') if today_record['punch_in_time'] else None
+        initial_out = datetime.strptime(today_record['punch_out_time'], '%H:%M:%S') if today_record['punch_out_time'] else None
         self.today_punch_records = {
-            'punch_in_time': datetime.strptime(today_record['punch_in_time'], '%H:%M:%S') if today_record['punch_in_time'] else None,
-            'punch_out_time': datetime.strptime(today_record['punch_out_time'], '%H:%M:%S') if today_record['punch_out_time'] else None
+            user['username']: {
+                'punch_in_time': initial_in,
+                'punch_out_time': initial_out
+            }
+            for user in self.users
+            if user.get('username')
         }
 
         # 设置每日状态推送时间
@@ -148,8 +160,152 @@ class AttendanceSystem:
         self.operation_lock = asyncio.Lock()  # 确保互斥的锁
         self.operation_start_time = None  # 操作开始时间
 
+        # send_daily_status 并发去重（并行打卡场景下 N 个用户成功后会同时触发）
+        self._last_daily_status_send = None  # type: Optional[datetime]
+        self._daily_status_lock = asyncio.Lock()
+
+        # 浏览器资源跟踪：活跃 SeleniumLoginController 集合 + 同步锁
+        # 用 threading.Lock 而非 asyncio.Lock，因为 atexit/signal 处理时事件循环可能已关
+        import threading as _threading
+        self._active_controllers = set()
+        self._controllers_lock = _threading.Lock()
+
+        # 启动时清理上次崩溃残留的孤儿 driver 进程（用户机器无手工 driver，无误杀风险）
+        self._kill_orphan_msedgedrivers()
+
+        # 安装进程退出钩子（atexit + SIGINT/SIGTERM），无论怎样退出都尽力清掉活跃 driver
+        self._install_exit_handlers()
+
         # 初始化完成，取消静默模式
         self._silent_init = False
+
+    def _kill_orphan_msedgedrivers(self):
+        """启动时清理上次崩溃残留的 msedgedriver.exe / chromedriver 进程"""
+        try:
+            killed = []
+            for proc in psutil.process_iter(['pid', 'name']):
+                try:
+                    name = (proc.info.get('name') or '').lower()
+                    if name in ('msedgedriver.exe', 'chromedriver.exe', 'msedgedriver', 'chromedriver'):
+                        proc.kill()
+                        killed.append((proc.info['pid'], name))
+                except (psutil.NoSuchProcess, psutil.AccessDenied):
+                    continue
+                except Exception as inner_e:
+                    logging.debug(f"扫描进程时跳过单个项: {inner_e}")
+                    continue
+            if killed:
+                logging.info(f"启动时清理了 {len(killed)} 个残留 driver 进程: {killed}")
+            else:
+                logging.debug("启动时未发现残留 driver 进程")
+        except Exception as e:
+            logging.error(f"清理孤儿 driver 进程时异常: {e}")
+
+    def _install_exit_handlers(self):
+        """注册 atexit + signal 钩子，确保进程退出时关闭所有活跃 selenium driver"""
+        import atexit
+        import signal as _signal
+        try:
+            atexit.register(self._sync_cleanup_on_exit)
+        except Exception as e:
+            logging.warning(f"注册 atexit 钩子失败: {e}")
+        try:
+            _signal.signal(_signal.SIGINT, self._signal_handler)
+        except Exception as e:
+            logging.warning(f"注册 SIGINT 钩子失败: {e}")
+        try:
+            _signal.signal(_signal.SIGTERM, self._signal_handler)
+        except Exception as e:
+            logging.warning(f"注册 SIGTERM 钩子失败: {e}")
+
+    def _sync_cleanup_on_exit(self):
+        """同步清理所有活跃 driver（atexit/signal 路径用，event loop 可能已关）"""
+        if not getattr(self, '_active_controllers', None):
+            return
+        with self._controllers_lock:
+            controllers = list(self._active_controllers)
+            self._active_controllers.clear()
+        if not controllers:
+            return
+        logging.info(f"退出钩子：清理 {len(controllers)} 个活跃 selenium controller")
+        for ctrl in controllers:
+            try:
+                ctrl.close()
+            except Exception as e:
+                logging.error(f"退出钩子关闭 controller 失败: {e}")
+
+    def _signal_handler(self, signum, frame):
+        """SIGINT/SIGTERM 信号处理器：清理 driver 后退出"""
+        try:
+            logging.info(f"收到信号 {signum}，开始清理活跃 driver...")
+            self._sync_cleanup_on_exit()
+        finally:
+            # 让 atexit 钩子也能跑（_sync_cleanup_on_exit 已幂等，二次调用无害）
+            import sys
+            sys.exit(0)
+
+    def _get_user_today_record(self, username):
+        """获取指定用户的今日打卡记录字典。
+        如该用户不在初始字典中（理论不会发生），懒初始化一条空记录。
+        """
+        if not username:
+            username = 'default'
+        if username not in self.today_punch_records:
+            self.today_punch_records[username] = {
+                'punch_in_time': None,
+                'punch_out_time': None
+            }
+        return self.today_punch_records[username]
+
+    def _set_user_punch_time(self, username, kind, time):
+        """设置指定用户的打卡时间。
+        kind 取值: 'punch_in_time' / 'punch_out_time'
+        """
+        record = self._get_user_today_record(username)
+        record[kind] = time
+
+    def _reset_today_punch_records(self):
+        """重置所有用户的今日打卡记录（用于跨日重置）"""
+        for username in list(self.today_punch_records.keys()):
+            self.today_punch_records[username] = {
+                'punch_in_time': None,
+                'punch_out_time': None
+            }
+
+    def _get_user_notification_state(self, username):
+        """获取指定用户的提醒状态字典（懒初始化）"""
+        if not username:
+            username = 'default'
+        if username not in self.notification_sent_today:
+            self.notification_sent_today[username] = {
+                'punch_in_reminder': False,
+                'punch_out_reminder': False,
+                'last_check_date': None
+            }
+        return self.notification_sent_today[username]
+
+    def _set_user_notification_flag(self, username, flag, value):
+        """设置指定用户的提醒状态标志。
+        flag 取值: 'punch_in_reminder' / 'punch_out_reminder' / 'last_check_date'
+        """
+        state = self._get_user_notification_state(username)
+        state[flag] = value
+
+    def _register_controller(self, controller):
+        """注册一个活跃的 SeleniumLoginController（创建成功后立即调用）"""
+        if controller is None:
+            return
+        with self._controllers_lock:
+            self._active_controllers.add(controller)
+            logging.debug(f"已注册 selenium controller，当前活跃数: {len(self._active_controllers)}")
+
+    def _unregister_controller(self, controller):
+        """从活跃集合中移除一个 controller（close 后立即调用）"""
+        if controller is None:
+            return
+        with self._controllers_lock:
+            self._active_controllers.discard(controller)
+            logging.debug(f"已注销 selenium controller，当前活跃数: {len(self._active_controllers)}")
 
     def get_surname_honorific(self, username):
         """根据用户名获取姓氏和合适的敬语称谓"""
@@ -1102,17 +1258,13 @@ class AttendanceSystem:
             time_str = retry_time.strftime("%H:%M")
 
             if clear_existing:
-                # 只有在明确指定时才清除所有任务
-                schedule.clear()
-                logging.info("清除了之前的所有定时任务")
+                # 仅清除"下班重试"类型任务，不再清空全局 schedule（避免误清日报、其他用户的定时）
+                schedule.clear('punch_out_retry')
+                logging.info("清除了之前的所有 punch_out_retry 定时任务")
             else:
-                # 如果不清除所有任务，则只移除同一时间的下班打卡任务
-                # 由于schedule库的限制，我们需要通过遍历查找同一时间的任务
-                all_jobs = schedule.get_jobs()
-                punch_out_jobs = [job for job in all_jobs if "punch_out" in str(job.job_func)]
-                for job in punch_out_jobs:
-                    schedule.cancel_job(job)
-                logging.info(f"已移除{len(punch_out_jobs)}个已有的下班打卡定时任务")
+                # 仅替换 punch_out_retry tag 下的任务；不再启发式扫描 str(job.job_func)
+                schedule.clear('punch_out_retry')
+                logging.info("已替换 punch_out_retry tag 下所有定时任务")
 
             async def punch_out_job():
                 try:
@@ -1120,17 +1272,17 @@ class AttendanceSystem:
                     await self.punch_out()
                     # 打卡完成后发送状态信息
                     await self.send_daily_status()
-                    # 删除已执行的任务
+                    # 仅删除自己 tag 的任务，保留日报等其他 tag
                     self.task_manager.clear_tasks()
-                    schedule.clear()
+                    schedule.clear('punch_out_retry')
                     logging.info("定时下班打卡任务执行完成")
                 except Exception as e:
                     logging.error(f"执行定时下班打卡任务时发生错误: {str(e)}")
 
-            # 设置定时任务
+            # 设置定时任务（加 tag，便于后续按 tag 清除）
             time_str = retry_time.strftime("%H:%M")
-            schedule.every().day.at(time_str).do(lambda: asyncio.create_task(punch_out_job()))
-            logging.info(f"已设置定时任务: 每天{time_str}执行下班打卡")
+            schedule.every().day.at(time_str).do(lambda: asyncio.create_task(punch_out_job())).tag('punch_out_retry')
+            logging.info(f"已设置定时任务: 每天{time_str}执行下班打卡 (tag=punch_out_retry)")
 
             # 保存定时任务到文件
             if clear_existing:
@@ -1160,6 +1312,69 @@ class AttendanceSystem:
             logging.error(error_msg)
             logging.error(traceback.format_exc())
             await self.send_notification("定时设置", f"设置定时任务失败: {str(e)}")
+            return None
+
+    async def _schedule_unified_retry(self, remaining_times):
+        """收集多用户剩余时间，按最长时间统一调度下班打卡定时任务（串行/并行路径共用）。
+
+        Args:
+            remaining_times: List[Dict[str, str]] 形如 [{'username': ..., 'remaining_time': 'X小时Y分钟'}, ...]
+        Returns:
+            Optional[str]: 调度的 'HH:MM' 时间字符串；无可调度时间则返回 None。
+        """
+        if not remaining_times:
+            return None
+
+        await self.send_notification("下班打卡", f"检测到{len(remaining_times)}个用户未满足下班条件")
+        logging.info(f"统一定时调度：检测到{len(remaining_times)}个用户未满足下班条件，开始处理")
+
+        max_remaining_time = None
+        max_time_user = None
+
+        for item in remaining_times:
+            time_match = re.match(r'(\d+)小时(\d+)分钟', item.get('remaining_time', '') or '')
+            if time_match:
+                hours = int(time_match.group(1))
+                minutes = int(time_match.group(2))
+                total_minutes = hours * 60 + minutes
+                logging.info(f"处理用户 {item.get('username')} 剩余时间: {total_minutes}分钟")
+
+                if max_remaining_time is None or total_minutes > max_remaining_time:
+                    max_remaining_time = total_minutes
+                    max_time_user = item.get('username')
+
+        if max_remaining_time is None:
+            logging.warning("无法确定最长剩余时间，定时打卡设置失败")
+            await self.send_notification("定时打卡", "⚠️ 无法确定最长剩余时间，定时打卡设置失败")
+            return None
+
+        logging.info(f"确定最长剩余时间: {max_remaining_time}分钟，来自用户: {max_time_user}")
+        await self.send_notification(
+            "定时打卡",
+            f"将为所有用户设置统一的下班打卡时间，基于用户 {max_time_user} 的剩余时间：{max_remaining_time}分钟后"
+        )
+
+        try:
+            # 只清除已有的下班打卡任务，保留其他类型任务
+            saved_tasks = self.task_manager.get_tasks()
+            for task in saved_tasks:
+                if task['type'] == 'punch_out':
+                    self.task_manager.remove_task_by_id(task['id'])
+                    logging.info(f"已移除旧的下班打卡任务 #{task['id']}")
+
+            retry_time = await self.schedule_retry_punch_out(max_remaining_time, clear_existing=False)
+            if retry_time:
+                logging.info(f"成功设置定时打卡时间: {retry_time}")
+                await self.send_notification("定时打卡", f"✅ 已成功设置在 {retry_time} 为所有用户执行自动下班打卡")
+                return retry_time
+            else:
+                logging.error("设置定时打卡失败，返回的时间为空")
+                await self.send_notification("定时打卡", "❌ 设置定时打卡失败，返回的时间为空")
+                return None
+        except Exception as e:
+            error_msg = f"设置定时打卡时发生错误: {str(e)}"
+            logging.error(error_msg)
+            await self.send_notification("定时打卡", f"❌ {error_msg}")
             return None
 
     async def schedule_punch_out(self, hour, minute):
@@ -1236,9 +1451,9 @@ class AttendanceSystem:
                 except Exception as e:
                     logging.error(f"执行定时下班打卡任务时发生错误: {str(e)}")
 
-            # 设置定时任务
-            schedule.every().day.at(time_str).do(lambda: asyncio.create_task(punch_out_job()))
-            logging.info(f"已设置定时任务: 每天{time_str}执行下班打卡（仅在创建当天或工作日执行）")
+            # 设置定时任务（加 tag 便于按类清除）
+            schedule.every().day.at(time_str).do(lambda: asyncio.create_task(punch_out_job())).tag('punch_out_scheduled')
+            logging.info(f"已设置定时任务: 每天{time_str}执行下班打卡（仅在创建当天或工作日执行，tag=punch_out_scheduled）")
 
             await self.send_notification("定时设置", f"设置下班打卡任务 #{task_id}: {time_str}\n任务将在今天执行，次日仅在工作日执行")
             
@@ -1252,13 +1467,14 @@ class AttendanceSystem:
 
     def init_schedule_tasks(self):
         """初始化定时任务"""
-        # 清除所有现有任务
+        # 启动时清除所有现有任务（合理：首次初始化场景）
+        # 注：运行期间的其他 schedule.clear 都改为按 tag 过滤，不会回到这里
         schedule.clear()
 
-        # 设置每天早上的状态推送
+        # 设置每天早上的状态推送（加 tag）
         async def daily_status_job():
             await self.send_daily_status()
-        schedule.every().day.at(self.daily_status_time).do(lambda: asyncio.create_task(daily_status_job()))
+        schedule.every().day.at(self.daily_status_time).do(lambda: asyncio.create_task(daily_status_job())).tag('daily_status')
 
         # 从文件加载保存的定时任务
         saved_tasks = self.task_manager.get_tasks()
@@ -1305,7 +1521,7 @@ class AttendanceSystem:
                     except Exception as e:
                         logging.error(f"执行定时下班打卡任务时发生错误: {str(e)}")
 
-                schedule.every().day.at(task['scheduled_time']).do(lambda: asyncio.create_task(punch_out_job()))
+                schedule.every().day.at(task['scheduled_time']).do(lambda: asyncio.create_task(punch_out_job())).tag('punch_out_scheduled')
             elif task['type'] == 'punch_in':
                 async def punch_in_job():
                     try:
@@ -1314,10 +1530,20 @@ class AttendanceSystem:
                         await self.send_daily_status()
                     except Exception as e:
                         logging.error(f"执行定时上班打卡任务时发生错误: {str(e)}")
-                schedule.every().day.at(task['scheduled_time']).do(lambda: asyncio.create_task(punch_in_job()))
+                schedule.every().day.at(task['scheduled_time']).do(lambda: asyncio.create_task(punch_in_job())).tag('punch_in_scheduled')
 
     async def send_daily_status(self):
         """发送每日状态信息"""
+        # 5 秒去重：并行打卡多用户成功时会同时触发，避免重复发出 N 份日报
+        async with self._daily_status_lock:
+            now = datetime.now()
+            if self._last_daily_status_send is not None:
+                elapsed = (now - self._last_daily_status_send).total_seconds()
+                if elapsed < 5:
+                    logging.info(f"send_daily_status 5 秒内重复触发（间隔 {elapsed:.2f}s），跳过")
+                    return
+            self._last_daily_status_send = now
+
         try:
             # 构建与 /status 命令相同的状态信息
             current_time = datetime.now()
@@ -1503,7 +1729,7 @@ class AttendanceSystem:
                             "打卡异常",
                             f"⚠️ 检测到迟到打卡！打卡时间：{current_time.strftime('%H:%M')}"
                         )
-                    self.today_punch_records['punch_in_time'] = current_time
+                    self._set_user_punch_time(username, 'punch_in_time', current_time)
                     # 保存打卡记录
                     self.punch_record_manager.update_record(
                         current_time.strftime('%Y-%m-%d'),
@@ -1618,7 +1844,7 @@ class AttendanceSystem:
                             await self.send_notification("打卡流程", "检查页面上的今日下班打卡记录...")
                             try:
                                 # 复用现有的get_punch_records_from_page方法
-                                await self.get_punch_records_from_page()
+                                await self.get_punch_records_from_page(username=username)
                                 
                                 # 检查今日是否已有下班记录
                                 today_record = self.punch_record_manager.get_today_record()
@@ -1630,7 +1856,7 @@ class AttendanceSystem:
                                     logging.info("通过页面记录确认今日已下班打卡")
                                     
                                     # 更新内存中的记录
-                                    self.today_punch_records['punch_out_time'] = current_time
+                                    self._set_user_punch_time(username, 'punch_out_time', current_time)
                                     punch_success = True
                                 else:
                                     # 未找到下班记录，确认无法下班
@@ -1663,7 +1889,7 @@ class AttendanceSystem:
                                     "打卡异常",
                                     f"⚠️ 检测到早退打卡！打卡时间：{current_time.strftime('%H:%M')}"
                                 )
-                            self.today_punch_records['punch_out_time'] = current_time
+                            self._set_user_punch_time(username, 'punch_out_time', current_time)
                             # 保存打卡记录
                             self.punch_record_manager.update_record(
                                 current_time.strftime('%Y-%m-%d'),
@@ -1674,15 +1900,15 @@ class AttendanceSystem:
 
                 if punch_success:
                     # 识别并更新打卡记录
-                    await self.get_punch_records_from_page()
+                    await self.get_punch_records_from_page(username=username)
 
-                    # 重置相应的提醒状态（如果用户补打卡了）
+                    # 重置相应的提醒状态（按用户分桶）
                     if punch_type == "上班":
-                        self.notification_sent_today['punch_in_reminder'] = False
-                        logging.info("上班打卡成功，重置上班打卡提醒状态")
+                        self._set_user_notification_flag(username, 'punch_in_reminder', False)
+                        logging.info(f"用户 {username} 上班打卡成功，重置该用户上班打卡提醒状态")
                     else:
-                        self.notification_sent_today['punch_out_reminder'] = False
-                        logging.info("下班打卡成功，重置下班打卡提醒状态")
+                        self._set_user_notification_flag(username, 'punch_out_reminder', False)
+                        logging.info(f"用户 {username} 下班打卡成功，重置该用户下班打卡提醒状态")
 
                     # 打卡完成后发送状态信息
                     await self.send_daily_status()
@@ -1924,172 +2150,455 @@ class AttendanceSystem:
             return (False, None)
 
     async def _do_selenium_punch(self, punch_type="上班", username=None, password=None, collect_remaining_time=False):
-        """使用Selenium模式的打卡方法（增强版，支持完整功能）"""
-        from modules.selenium_login import SeleniumLoginController, SeleniumRecordManager
+        """使用Selenium模式的打卡方法（移植传统模式全部功能）
+
+        Returns:
+            Tuple[bool, str|None]: (是否成功, 剩余时间字符串"X小时Y分钟"或None)
+                与 _do_punch 协议一致；第二项仅在下班 unable_escape 场景下非 None。
+        """
+        from modules.selenium_login import SeleniumLoginController
 
         flow_type = "punch_in" if punch_type == "上班" else "punch_out"
         flow_name = punch_type
+        effective_username = username or self.login_username
+        effective_password = password or self.login_password
 
-        # 创建消息内容追踪
-        message_content = f"🔧 Selenium完整{flow_name}打卡流程开始...\n"
+        def _decode_screenshot_bytes(b):
+            """selenium 截图 bytes → numpy 数组，供 cv2.imwrite 使用"""
+            if not b:
+                return None
+            try:
+                arr = np.frombuffer(b, np.uint8)
+                return cv2.imdecode(arr, cv2.IMREAD_COLOR)
+            except Exception as decode_err:
+                logging.warning(f"截图bytes解码失败: {decode_err}")
+                return None
+
+        def _safe_message(content):
+            """防止 Telegram 4096 字符上限"""
+            if len(content) > 3800:
+                return content[:200] + "\n...(已截断)...\n" + content[-3500:]
+            return content
+
+        async def _send_tg_photo_with_retry(photo_bytes, caption, max_retries=3):
+            """发送 Telegram 截图：3 次重试 + bot 初始化检查 + HTTPXRequest 自动恢复 + 渐进式延迟。
+            与传统模式 _do_punch 1709-1785 行的容错策略对齐。
+            """
+            for retry in range(max_retries):
+                try:
+                    await self.bot._ensure_app_initialized()
+                    if not self.bot.app:
+                        await self.send_notification(
+                            "打卡流程", "无法发送截图：Telegram Bot未正确初始化"
+                        )
+                        return False
+                    await self.bot.app.bot.send_photo(
+                        chat_id=self.bot.chat_id,
+                        photo=photo_bytes,
+                        caption=caption
+                    )
+                    return True
+                except Exception as e:
+                    error_type = type(e).__name__
+                    error_msg_detail = str(e)
+
+                    if "HTTPXRequest" in error_msg_detail and "not initialized" in error_msg_detail:
+                        self.bot._is_initialized = False
+                        kind = "HTTPXRequest"
+                        if retry < max_retries - 1:
+                            await self._force_reinitialize_bot()
+                    elif "NetworkError" in error_type or "TimedOut" in error_type:
+                        kind = "网络"
+                    else:
+                        kind = "其他"
+
+                    if retry < max_retries - 1:
+                        await self.send_notification(
+                            "打卡流程",
+                            f"发送截图时发生{kind}错误 ({retry+1}/{max_retries})，准备重试: {error_msg_detail}"
+                        )
+                        # 渐进式延迟：HTTPXRequest 走 [1,5,15]，其他走 [5,10,15]
+                        if kind == "HTTPXRequest":
+                            delay = [1, 5, 15][retry]
+                        else:
+                            delay = 5 * (retry + 1)
+                        await asyncio.sleep(delay)
+                    else:
+                        await self.send_notification(
+                            "打卡流程",
+                            f"发送截图失败 ({kind}): {error_msg_detail}"
+                        )
+                        return False
+            return False
+
+        message_content = f"🔧 Selenium完整{flow_name}打卡流程开始 - 用户: {effective_username}\n"
         status_message = None
+        selenium_controller = None
+        screenshot_bytes = None
+
+        # 取消事件读取助手：从实例属性读，避免改函数签名
+        def _cancel_triggered():
+            ev = getattr(self, 'operation_cancel_event', None)
+            return ev is not None and ev.is_set()
 
         try:
-            # 发送初始消息
+            # 取消检查点 1/4：进入 try 块即检查，driver 未启动可零成本短路
+            if _cancel_triggered():
+                logging.info(f"_do_selenium_punch ({effective_username}/{punch_type}) 入口即被取消")
+                return (False, None)
+
+            # 发送初始状态消息
             try:
-                from telegram import Update
-                # 尝试发送初始状态消息
                 status_message = await self.bot.app.bot.send_message(
                     chat_id=self.bot.chat_id,
                     text=message_content
                 )
-            except:
-                # 如果无法发送消息，则使用普通通知
+            except Exception:
                 await self.send_notification("Selenium打卡", f"开始{flow_name}流程...")
 
-            # 创建增强的通知回调，支持实时消息更新
             async def enhanced_notification_callback(context: str, msg: str):
                 nonlocal message_content
                 message_content += f"[{context}] {msg}\n"
                 try:
                     if status_message:
-                        await status_message.edit_text(message_content)
+                        await status_message.edit_text(_safe_message(message_content))
                     else:
                         await self.send_notification(context, msg)
-                except:
-                    pass  # 忽略编辑失败
+                except Exception:
+                    pass
 
-            # 创建SeleniumLoginController实例
+            # 创建 SeleniumLoginController（传入 username 让 SeleniumRecordManager 隔离）
             message_content += "📋 正在创建Selenium控制器...\n"
-            if status_message:
-                await status_message.edit_text(message_content)
+            try:
+                if status_message:
+                    await status_message.edit_text(_safe_message(message_content))
+            except Exception:
+                pass
+
+            # 取消检查点 2/4：创建 controller 前，driver 仍未启动
+            if _cancel_triggered():
+                logging.info(f"_do_selenium_punch ({effective_username}/{punch_type}) 创建controller前被取消")
+                return (False, None)
 
             selenium_controller = SeleniumLoginController(
                 login_url=self.login_url,
                 headless=self.selenium_headless,
-                notification_callback=enhanced_notification_callback
+                notification_callback=enhanced_notification_callback,
+                username=effective_username or "default"
             )
+            # 立即注册到活跃集合，便于 atexit/signal/cancel 路径统一兜底关闭
+            self._register_controller(selenium_controller)
 
             # 执行完整打卡流程
             message_content += f"🚀 开始执行完整{flow_name}打卡流程...\n"
-            if status_message:
-                await status_message.edit_text(message_content)
+            try:
+                if status_message:
+                    await status_message.edit_text(_safe_message(message_content))
+            except Exception:
+                pass
 
-            # 根据流程类型选择对应的方法
+            # 取消检查点 3/4：driver 已启但还未触发登录+打卡，可避免一次完整登录浪费
+            if _cancel_triggered():
+                logging.info(f"_do_selenium_punch ({effective_username}/{punch_type}) 调用 complete_*_flow 前被取消")
+                return (False, None)
+
             if flow_type == "punch_in":
                 success, message_result, flow_data = await selenium_controller.complete_punch_in_flow(
-                    username=username or self.login_username,
-                    password=password or self.login_password
+                    username=effective_username,
+                    password=effective_password
                 )
-            else:  # punch_out
+            else:
                 success, message_result, flow_data = await selenium_controller.complete_punch_out_flow(
-                    username=username or self.login_username,
-                    password=password or self.login_password
+                    username=effective_username,
+                    password=effective_password
                 )
 
-            # 处理流程结果（增强版）
+            # 取消检查点 4/4：拿到 success/message_result 但还未写记录/发邮件
+            # 此时若打卡按钮已点过，记录已落到 SeleniumRecordManager（complete_*_flow 内部），
+            # 跳过外层日报/截图归档/Telegram 推送是相对干净的退出
+            if _cancel_triggered():
+                logging.info(f"_do_selenium_punch ({effective_username}/{punch_type}) complete_*_flow 返回后被取消")
+                return (False, None)
+
+            # 获取最终截图（bytes）
+            try:
+                screenshot_bytes = selenium_controller.take_screenshot()
+            except Exception as e:
+                logging.warning(f"获取最终截图失败: {e}")
+                screenshot_bytes = None
+
+            punch_result = (flow_data or {}).get('punch_result', {})
+            was_punched = bool(punch_result.get('punched'))
+            was_already_punched = bool(punch_result.get('already_punched'))
+            time_calculation = (flow_data or {}).get('time_calculation') or {}
+            confirmation_needed = bool(time_calculation.get('confirmation_needed'))
+            remaining_time_str = time_calculation.get('remaining_time_str')
+            remaining_minutes = time_calculation.get('remaining_minutes')
+
+            # ===== 成功分支（含 punched 和 already_punched）=====
             if success:
                 message_content += f"✅ 完整{flow_name}流程成功: {message_result}\n"
 
-                # 显示详细结果
-                if flow_data:
-                    punch_result = flow_data.get('punch_result', {})
-                    if punch_result.get('punched'):
-                        message_content += f"✅ {flow_name}打卡已执行\n"
-                    elif punch_result.get('already_punched'):
-                        message_content += f"ℹ️ 之前已打过{flow_name}卡\n"
+                if was_punched:
+                    message_content += f"✅ {flow_name}打卡已执行\n"
+                elif was_already_punched:
+                    message_content += f"ℹ️ 之前已打过{flow_name}卡\n"
 
-                    # 显示下班时间确认信息（如果有）
-                    if flow_type == "punch_out":
-                        message_content = await self._display_punch_out_time_info(
-                            message_content, flow_data
+                if flow_type == "punch_out":
+                    message_content = await self._display_punch_out_time_info(
+                        message_content, flow_data or {}
+                    )
+
+                attendance_status = (flow_data or {}).get('attendance_status', {})
+                if attendance_status.get('today'):
+                    message_content += f"📅 今日状态: {attendance_status['today']}\n"
+
+                # 仅 was_punched=True 才走完整业务流程（与传统模式对齐）
+                if was_punched:
+                    real_punch_time = datetime.now()
+                    date_str = real_punch_time.strftime('%Y-%m-%d')
+                    time_str = real_punch_time.strftime('%H:%M:%S')
+
+                    # 迟到/早退检测
+                    if punch_type == "上班" and self._is_late_punch_in(real_punch_time):
+                        await self.send_notification(
+                            "打卡异常",
+                            f"⚠️ 检测到迟到打卡！打卡时间：{real_punch_time.strftime('%H:%M')}"
+                        )
+                    elif punch_type == "下班" and self._is_early_leave(real_punch_time):
+                        await self.send_notification(
+                            "打卡异常",
+                            f"⚠️ 检测到早退打卡！打卡时间：{real_punch_time.strftime('%H:%M')}"
                         )
 
-                    # 显示考勤状态
-                    attendance_status = flow_data.get('attendance_status', {})
-                    if attendance_status.get('today'):
-                        message_content += f"📅 今日状态: {attendance_status['today']}\n"
+                    # 内存记录同步（按用户隔离，并行打卡场景下不再相互覆盖）
+                    if punch_type == "上班":
+                        self._set_user_punch_time(effective_username, 'punch_in_time', real_punch_time)
+                    else:
+                        self._set_user_punch_time(effective_username, 'punch_out_time', real_punch_time)
 
-                # 使用SeleniumRecordManager更新记录
-                record_manager = SeleniumRecordManager(username or "default")
-                current_time = datetime.now()
-                time_str = current_time.strftime('%H:%M:%S')
+                    # 全局 punch_record_manager 写入（与 SeleniumRecordManager 双写）
+                    try:
+                        self.punch_record_manager.update_record(date_str, punch_type, time_str)
+                    except Exception as record_err:
+                        logging.error(f"全局punch_record_manager写入失败: {record_err}")
 
-                # 更新打卡记录
-                additional_info = {}
-                if flow_data:
-                    additional_info.update(flow_data)
+                    # 重置对应提醒状态（按用户分桶）
+                    if punch_type == "上班":
+                        self._set_user_notification_flag(effective_username, 'punch_in_reminder', False)
+                    else:
+                        self._set_user_notification_flag(effective_username, 'punch_out_reminder', False)
 
-                record_manager.update_punch_record(
-                    punch_type=flow_type,
-                    time_str=time_str,
-                    status_data={"success": True, "message": message_result},
-                    additional_info=additional_info
+                    # 用户截图归档（save_user_screenshot 已支持 bytes）
+                    if screenshot_bytes:
+                        try:
+                            self.save_user_screenshot(
+                                screenshot_bytes,
+                                effective_username,
+                                punch_type,
+                                success=True
+                            )
+                        except Exception as save_err:
+                            logging.error(f"save_user_screenshot 失败: {save_err}")
+
+                    # 发送成功邮件（含截图附件） —— 与传统模式 1745 行对齐
+                    if screenshot_bytes:
+                        try:
+                            surname = self.get_surname_honorific(effective_username)
+                            current_time_str = real_punch_time.strftime('%Y-%m-%d %H:%M:%S')
+                            subject = f"{punch_type}打卡成功 - {surname} - {current_time_str}"
+                            body = (
+                                f"{surname}您好，\n\n"
+                                f"您的{punch_type}打卡已于 {current_time_str} 成功完成。\n\n"
+                                f"详情请查看附件截图。\n\n"
+                                f"此邮件由自动打卡系统发送，请勿回复。"
+                            )
+
+                            os.makedirs('logs', exist_ok=True)
+                            email_screenshot_path = f'logs/punch_{"in" if punch_type == "上班" else "out"}_email.png'
+                            with open(email_screenshot_path, 'wb') as f:
+                                f.write(screenshot_bytes)
+
+                            await self.send_email_with_attachment(
+                                subject, body, email_screenshot_path, punch_type
+                            )
+
+                            if os.path.exists(email_screenshot_path):
+                                os.remove(email_screenshot_path)
+                        except Exception as email_err:
+                            logging.error(f"发送{punch_type}成功邮件失败: {email_err}")
+
+                    # 发送日报
+                    try:
+                        await self.send_daily_status()
+                    except Exception as daily_err:
+                        logging.error(f"send_daily_status 失败: {daily_err}")
+
+                # 发 Telegram 截图（成功路径，含 already_punched）—— 走 3 次重试容错
+                if screenshot_bytes:
+                    sent_ok = await _send_tg_photo_with_retry(
+                        screenshot_bytes,
+                        f"{punch_type}打卡结果截图"
+                    )
+                    if not sent_ok:
+                        message_content += "⚠️ 截图发送最终失败（已重试3次）\n"
+
+                message_content += "✅ 完整流程完成！"
+                try:
+                    if status_message:
+                        await status_message.edit_text(_safe_message(message_content))
+                except Exception:
+                    pass
+
+                return (True, None)
+
+            # ===== 失败分支 =====
+            message_content += f"❌ 完整{flow_name}流程失败: {message_result}\n"
+
+            # 下班 unable_escape 子分支（工作时间不足）
+            if flow_type == "punch_out" and confirmation_needed and remaining_minutes is not None:
+                error_msg = f"未满足下班条件，还需工作: {remaining_time_str}"
+
+                # 单账户场景：直接调度定时重试
+                if not collect_remaining_time:
+                    try:
+                        retry_time = await self.schedule_retry_punch_out(
+                            int(remaining_minutes),
+                            clear_existing=False
+                        )
+                        if retry_time:
+                            error_msg += f"\n已设置在 {retry_time} 自动重试下班打卡"
+                    except Exception as schedule_err:
+                        logging.error(f"调度下班重试失败: {schedule_err}")
+                        error_msg += f"\n⚠️ 设置定时重试失败: {str(schedule_err)}"
+                # 多账户场景：把 remaining_time_str 通过返回值传给 punch_out_internal 统一调度
+
+                await self.send_notification("打卡流程", error_msg)
+
+                # 失败通知三连发（Telegram + 邮件 + 用户归档）
+                screen_numpy = _decode_screenshot_bytes(screenshot_bytes)
+                if screen_numpy is not None:
+                    await self._send_punch_failure_screenshot(
+                        screen_numpy, effective_username, punch_type, error_msg
+                    )
+                else:
+                    logging.warning("截图解码失败，跳过 _send_punch_failure_screenshot")
+
+                return (False, remaining_time_str)
+
+            # 其他失败（登录失败、按钮异常、等）
+            error_msg = message_result or f"{flow_name}流程失败"
+            screen_numpy = _decode_screenshot_bytes(screenshot_bytes)
+            if screen_numpy is not None:
+                await self._send_punch_failure_screenshot(
+                    screen_numpy, effective_username, punch_type, error_msg
+                )
+            else:
+                await self.send_notification(
+                    "打卡失败",
+                    f"{punch_type}打卡失败 - {error_msg}（无截图）"
                 )
 
-                message_content += f"📝 {flow_name}记录已保存\n"
-            else:
-                message_content += f"❌ 完整{flow_name}流程失败: {message_result}\n"
-
-            # 更新状态：获取截图
-            message_content += "📸 正在获取页面截图...\n"
-            if status_message:
-                await status_message.edit_text(message_content)
-
-            # 截取最终状态截图
-            screenshot = selenium_controller.take_screenshot()
-            screenshot_data = None
-
-            if screenshot:
-                message_content += "✅ 截图获取成功\n"
-                if status_message:
-                    await status_message.edit_text(message_content)
-                try:
-                    await self.bot.app.bot.send_photo(
-                        chat_id=self.bot.chat_id,
-                        photo=screenshot,
-                        caption=f"Selenium完整{flow_name}打卡流程结果截图"
-                    )
-                    screenshot_data = screenshot.read() if hasattr(screenshot, 'read') else screenshot
-                except Exception as e:
-                    message_content += f"⚠️ 截图发送失败: {str(e)}\n"
-            else:
-                message_content += "⚠️ 无法获取截图\n"
-
-            # 关闭浏览器
-            message_content += "🔒 正在关闭浏览器...\n"
-            if status_message:
-                await status_message.edit_text(message_content)
-            selenium_controller.close()
-
-            message_content += "✅ 完整流程完成！"
-            if status_message:
-                await status_message.edit_text(message_content)
-
-            return (success, screenshot_data)
+            return (False, None)
 
         except Exception as e:
             error_msg = f"Selenium{flow_name}打卡流程异常: {str(e)}"
-            logging.error(error_msg)
+            logging.error(error_msg, exc_info=True)
             message_content += f"❌ 发生错误: {str(e)}\n"
 
-            # 尝试获取异常截图
             try:
                 if status_message:
-                    await status_message.edit_text(message_content)
-                if 'selenium_controller' in locals():
-                    screenshot = selenium_controller.take_screenshot()
-                    if screenshot:
-                        await self.bot.app.bot.send_photo(
-                            chat_id=self.bot.chat_id,
-                            photo=screenshot,
-                            caption=f"Selenium完整{flow_name}流程异常截图"
+                    await status_message.edit_text(_safe_message(message_content))
+            except Exception:
+                pass
+
+            # 异常路径下尝试用最新截图走完整失败通知
+            try:
+                if selenium_controller is not None:
+                    try:
+                        exc_screenshot = selenium_controller.take_screenshot()
+                    except Exception:
+                        exc_screenshot = None
+                    screen_numpy = _decode_screenshot_bytes(exc_screenshot)
+                    if screen_numpy is not None:
+                        await self._send_punch_failure_screenshot(
+                            screen_numpy, effective_username, punch_type, error_msg
                         )
-                    selenium_controller.close()
             except Exception as cleanup_error:
-                logging.error(f"清理Selenium资源时发生错误: {str(cleanup_error)}")
+                logging.error(f"异常路径发送失败截图失败: {cleanup_error}")
+
+            # 走全局错误归集
+            try:
+                await self.handle_error(e, f"{punch_type}打卡(Selenium)")
+            except Exception:
+                pass
 
             return (False, None)
+
+        finally:
+            # 资源清理兜底（先 close 再从活跃集合移除）
+            if selenium_controller is not None:
+                try:
+                    selenium_controller.close()
+                except Exception as cleanup_error:
+                    logging.error(f"关闭 selenium_controller 失败: {cleanup_error}")
+                finally:
+                    self._unregister_controller(selenium_controller)
+
+    async def _do_selenium_punch_for_user(self, user, punch_type, cancel_event, semaphore, collect_remaining_time=True):
+        """Selenium 模式下"单用户打卡"的并行包装协程。
+
+        多账户并行打卡时，每个用户在自己的协程任务里执行；用信号量限制并发，
+        用 try/except 把单用户异常隔离，避免一个用户崩溃拖累 asyncio.gather 整批。
+
+        Args:
+            user: 用户配置 dict，含 'username' / 'password'
+            punch_type: "上班" 或 "下班"
+            cancel_event: asyncio.Event，由外层 start_punch_operation 建立
+            semaphore: asyncio.Semaphore 限制并发数
+            collect_remaining_time: True 时把 unable_escape 的剩余时间回传给外层统一调度
+        Returns:
+            dict: {'username': str, 'success': bool, 'remaining_time': str|None, 'exception': Exception|None}
+        """
+        username = user.get('username') if isinstance(user, dict) else None
+        password = user.get('password') if isinstance(user, dict) else None
+        result = {
+            'username': username,
+            'success': False,
+            'remaining_time': None,
+            'exception': None,
+        }
+
+        # 提前短路：cancel_event 已触发就不再启动 driver
+        if cancel_event is not None and cancel_event.is_set():
+            result['exception'] = asyncio.CancelledError("操作已被取消")
+            return result
+
+        try:
+            async with semaphore:
+                # 进入信号量前再次确认 cancel 状态，避免排队等待期间被取消
+                if cancel_event is not None and cancel_event.is_set():
+                    result['exception'] = asyncio.CancelledError("操作已被取消")
+                    return result
+
+                await self.send_notification(
+                    "并行打卡",
+                    f"[{username}] 开始 {punch_type} 流程"
+                )
+                success, remaining_time_info = await self._do_selenium_punch(
+                    punch_type, username, password, collect_remaining_time
+                )
+                result['success'] = bool(success)
+                result['remaining_time'] = remaining_time_info
+        except asyncio.CancelledError as ce:
+            result['exception'] = ce
+            await self.send_notification("并行打卡", f"[{username}] 任务被取消")
+        except Exception as e:
+            result['exception'] = e
+            logging.error(f"并行打卡用户 {username} 异常: {e}", exc_info=True)
+            await self.send_notification("并行打卡", f"[{username}] 任务异常: {str(e)}")
+
+        return result
 
     async def _display_punch_out_time_info(self, message_content: str, flow_data: dict) -> str:
         """显示下班打卡的时间信息（基于selenium_login的计算结果）"""
@@ -2184,11 +2693,32 @@ class AttendanceSystem:
         return True, f"{operation_type}操作已取消"
 
     async def cleanup_browser(self):
-        """清理浏览器资源"""
-        try:
-            await self.send_notification("系统清理", "正在关闭浏览器...")
+        """清理浏览器资源（按当前打卡模式分流）
 
-            # 关闭浏览器（新的Selenium实现在各自的方法中管理，无需统一清理）
+        - Selenium 模式：遍历活跃 controllers 集合逐个关闭（覆盖多并发 driver 场景）
+        - 传统模式：调 bot.close_browser() 用 PyAutoGUI 找关闭按钮
+        """
+        try:
+            if self.use_selenium_login:
+                # Selenium 路径：跳过 PyAutoGUI 找关闭按钮的虚假尝试（对 headless 无效）
+                with self._controllers_lock:
+                    controllers = list(self._active_controllers)
+                if controllers:
+                    await self.send_notification("系统清理", f"关闭 {len(controllers)} 个活跃 selenium driver...")
+                    for ctrl in controllers:
+                        try:
+                            ctrl.close()
+                        except Exception as e:
+                            logging.error(f"关闭 selenium driver 失败: {e}")
+                        finally:
+                            self._unregister_controller(ctrl)
+                    await self.send_notification("系统清理", "selenium driver 已全部关闭")
+                else:
+                    await self.send_notification("系统清理", "无活跃 selenium driver 待关闭")
+                return
+
+            # 传统模式（PyAutoGUI）
+            await self.send_notification("系统清理", "正在关闭浏览器...")
             browser_closed = self.bot.close_browser()
             if browser_closed:
                 await self.send_notification("系统清理", "传统浏览器已关闭")
@@ -2223,6 +2753,41 @@ class AttendanceSystem:
                     return False
             else:
                 users_to_process = self.users
+
+            # Selenium 模式 + 多用户 → 走并行分支
+            if self.use_selenium_login and len(users_to_process) > 1:
+                max_concurrent = min(3, len(users_to_process))
+                semaphore = asyncio.Semaphore(max_concurrent)
+                await self.send_notification(
+                    "并行打卡",
+                    f"启动 {len(users_to_process)} 个用户并行上班打卡（并发上限 {max_concurrent}）"
+                )
+
+                tasks = [
+                    self._do_selenium_punch_for_user(u, "上班", cancel_event, semaphore, collect_remaining_time=False)
+                    for u in users_to_process
+                ]
+                results = await asyncio.gather(*tasks, return_exceptions=True)
+
+                # 归一化（gather 中的裸异常 → 字典形态）
+                normalized = []
+                for r in results:
+                    if isinstance(r, dict):
+                        normalized.append(r)
+                    elif isinstance(r, BaseException):
+                        normalized.append({'username': None, 'success': False, 'remaining_time': None, 'exception': r})
+
+                if cancel_event.is_set():
+                    await self.send_notification("操作取消", "并行上班打卡过程中被取消")
+                    return "cancelled"
+
+                success_count = sum(1 for r in normalized if r.get('success'))
+                fail_users = [r.get('username') or '?' for r in normalized if not r.get('success')]
+                detail = f"成功: {success_count}/{len(users_to_process)}"
+                if fail_users:
+                    detail += f"；失败用户: {', '.join(fail_users)}"
+                await self.send_notification("打卡完成", f"并行上班打卡完成 - {detail}")
+                return success_count > 0
 
             success_count = 0
             for i, user in enumerate(users_to_process):
@@ -2325,6 +2890,49 @@ class AttendanceSystem:
             else:
                 users_to_process = self.users
 
+            # Selenium 模式 + 多用户 → 走并行分支
+            if self.use_selenium_login and len(users_to_process) > 1:
+                max_concurrent = min(3, len(users_to_process))
+                semaphore = asyncio.Semaphore(max_concurrent)
+                await self.send_notification(
+                    "并行打卡",
+                    f"启动 {len(users_to_process)} 个用户并行下班打卡（并发上限 {max_concurrent}）"
+                )
+
+                tasks = [
+                    self._do_selenium_punch_for_user(u, "下班", cancel_event, semaphore, collect_remaining_time=True)
+                    for u in users_to_process
+                ]
+                results = await asyncio.gather(*tasks, return_exceptions=True)
+
+                # 归一化结果
+                normalized = []
+                for r in results:
+                    if isinstance(r, dict):
+                        normalized.append(r)
+                    elif isinstance(r, BaseException):
+                        normalized.append({'username': None, 'success': False, 'remaining_time': None, 'exception': r})
+
+                if cancel_event.is_set():
+                    await self.send_notification("操作取消", "并行下班打卡过程中被取消")
+                    return "cancelled"
+
+                success_count = sum(1 for r in normalized if r.get('success'))
+                # 失败且有剩余时间的用户 → 统一定时重试
+                remaining_times = [
+                    {'username': r.get('username'), 'remaining_time': r.get('remaining_time')}
+                    for r in normalized
+                    if not r.get('success') and r.get('remaining_time')
+                ]
+                await self._schedule_unified_retry(remaining_times)
+
+                fail_users = [r.get('username') or '?' for r in normalized if not r.get('success')]
+                detail = f"成功: {success_count}/{len(users_to_process)}"
+                if fail_users:
+                    detail += f"；失败用户: {', '.join(fail_users)}"
+                await self.send_notification("打卡完成", f"并行下班打卡完成 - {detail}")
+                return success_count > 0
+
             success_count = 0
             remaining_times = []  # 用于存储每个用户的剩余工作时间
 
@@ -2393,55 +3001,8 @@ class AttendanceSystem:
                 await self.send_notification("操作取消", "在处理定时任务前操作被取消")
                 return "cancelled"
 
-            # 所有用户打卡完成后，处理统一的定时任务
-            if remaining_times:
-                await self.send_notification("下班打卡", f"检测到{len(remaining_times)}个用户未满足下班条件")
-                logging.info(f"多账户模式：检测到{len(remaining_times)}个用户未满足下班条件，开始处理统一定时任务")
-
-                # 找出最长的剩余时间
-                max_remaining_time = None
-                max_time_user = None
-
-                for item in remaining_times:
-                    time_match = re.match(r'(\d+)小时(\d+)分钟', item['remaining_time'])
-                    if time_match:
-                        hours = int(time_match.group(1))
-                        minutes = int(time_match.group(2))
-                        total_minutes = hours * 60 + minutes
-                        logging.info(f"处理用户 {item['username']} 剩余时间: {total_minutes}分钟")
-
-                        if max_remaining_time is None or total_minutes > max_remaining_time:
-                            max_remaining_time = total_minutes
-                            max_time_user = item['username']
-
-                if max_remaining_time is not None:
-                    logging.info(f"确定最长剩余时间: {max_remaining_time}分钟，来自用户: {max_time_user}")
-                    await self.send_notification("定时打卡", f"将为所有用户设置统一的下班打卡时间，基于用户 {max_time_user} 的剩余时间：{max_remaining_time}分钟后")
-
-                    # 设置统一的定时打卡 - 确保这里的代码被执行
-                    try:
-                        # 只清除已有的下班打卡任务，保留其他类型任务
-                        saved_tasks = self.task_manager.get_tasks()
-                        for task in saved_tasks:
-                            if task['type'] == 'punch_out':
-                                self.task_manager.remove_task_by_id(task['id'])
-                                logging.info(f"已移除旧的下班打卡任务 #{task['id']}")
-
-                        # 不直接清空schedule，而是在设置新任务时覆盖同类型任务
-                        retry_time = await self.schedule_retry_punch_out(max_remaining_time, clear_existing=False)
-                        if retry_time:
-                            logging.info(f"成功设置定时打卡时间: {retry_time}")
-                            await self.send_notification("定时打卡", f"✅ 已成功设置在 {retry_time} 为所有用户执行自动下班打卡")
-                        else:
-                            logging.error("设置定时打卡失败，返回的时间为空")
-                            await self.send_notification("定时打卡", "❌ 设置定时打卡失败，返回的时间为空")
-                    except Exception as e:
-                        error_msg = f"设置定时打卡时发生错误: {str(e)}"
-                        logging.error(error_msg)
-                        await self.send_notification("定时打卡", f"❌ {error_msg}")
-                else:
-                    logging.warning("无法确定最长剩余时间，定时打卡设置失败")
-                    await self.send_notification("定时打卡", "⚠️ 无法确定最长剩余时间，定时打卡设置失败")
+            # 所有用户打卡完成后，处理统一的定时任务（抽出为 _schedule_unified_retry，串行/并行共用）
+            await self._schedule_unified_retry(remaining_times)
 
             # 所有用户打卡完成后发送总结消息
             await self.send_notification("打卡完成", f"下班打卡完成，成功: {success_count}/{len(users_to_process)}")
@@ -2544,48 +3105,56 @@ class AttendanceSystem:
             if not is_workday(current_date):
                 return
 
-            # 检查是否是新的一天，如果是则重置提醒状态
-            if self.notification_sent_today['last_check_date'] != current_date:
-                self.notification_sent_today = {
-                    'punch_in_reminder': False,
-                    'punch_out_reminder': False,
-                    'last_check_date': current_date
-                }
-                logging.info(f"新的一天开始，重置打卡提醒状态: {current_date}")
+            # 跨日重置：按用户分桶，每个用户独立判断是否需要重置
+            for uname in list(self.notification_sent_today.keys()):
+                state = self.notification_sent_today[uname]
+                if state.get('last_check_date') != current_date:
+                    self.notification_sent_today[uname] = {
+                        'punch_in_reminder': False,
+                        'punch_out_reminder': False,
+                        'last_check_date': current_date
+                    }
+                    logging.info(f"用户 {uname} 跨日，重置打卡提醒状态: {current_date}")
 
-            # 重置昨天的打卡记录
-            if self.today_punch_records['punch_in_time'] and \
-               self.today_punch_records['punch_in_time'].date() < current_date:
-                self.today_punch_records = {
-                    'punch_in_time': None,
-                    'punch_out_time': None
-                }
-                logging.info(f"重置昨天的打卡记录")
+            # 重置昨天的打卡记录（按用户分桶后，任一用户的 punch_in_time 是昨天即触发重置所有用户）
+            needs_reset = any(
+                record.get('punch_in_time') and record['punch_in_time'].date() < current_date
+                for record in self.today_punch_records.values()
+            )
+            if needs_reset:
+                self._reset_today_punch_records()
+                logging.info(f"重置昨天的打卡记录（所有用户）")
 
-            # 检查上班打卡（只在未发送过提醒时发送）
-            if (not self.today_punch_records['punch_in_time'] and
-                not self.notification_sent_today['punch_in_reminder'] and
-                current_time.time() > datetime.strptime(self.work_start_time, "%H:%M").time()):
+            # 按用户独立判断上下班提醒（用户分桶 → 各自独立状态机）
+            work_start_t = datetime.strptime(self.work_start_time, "%H:%M").time()
+            punch_out_remind_t = datetime.strptime("18:00", "%H:%M").time()
 
-                await self.send_notification(
-                    "打卡提醒",
-                    "⚠️ 今日未检测到上班打卡记录，请及时补卡！"
-                )
-                self.notification_sent_today['punch_in_reminder'] = True
-                logging.info(f"已发送上班打卡提醒，标记为已发送")
+            for uname, record in self.today_punch_records.items():
+                state = self._get_user_notification_state(uname)
+                in_t = record.get('punch_in_time')
+                out_t = record.get('punch_out_time')
 
-            # 检查下班打卡（只在未发送过提醒时发送）
-            if (self.today_punch_records['punch_in_time'] and
-                not self.today_punch_records['punch_out_time'] and
-                not self.notification_sent_today['punch_out_reminder'] and
-                current_time.time() > datetime.strptime("18:00", "%H:%M").time()):
+                # 上班提醒：该用户未打卡 + 未发过提醒 + 已过上班时间
+                if (not in_t and
+                    not state['punch_in_reminder'] and
+                    current_time.time() > work_start_t):
+                    await self.send_notification(
+                        "打卡提醒",
+                        f"⚠️ [{uname}] 今日未检测到上班打卡记录，请及时补卡！"
+                    )
+                    state['punch_in_reminder'] = True
+                    logging.info(f"已发送用户 {uname} 上班打卡提醒")
 
-                await self.send_notification(
-                    "打卡提醒",
-                    "⚠️ 今日未检测到下班打卡记录，请及时补卡！"
-                )
-                self.notification_sent_today['punch_out_reminder'] = True
-                logging.info(f"已发送下班打卡提醒，标记为已发送")
+                # 下班提醒：该用户已上班 + 未下班 + 未发过提醒 + 已过下班提醒时间
+                if (in_t and not out_t and
+                    not state['punch_out_reminder'] and
+                    current_time.time() > punch_out_remind_t):
+                    await self.send_notification(
+                        "打卡提醒",
+                        f"⚠️ [{uname}] 今日未检测到下班打卡记录，请及时补卡！"
+                    )
+                    state['punch_out_reminder'] = True
+                    logging.info(f"已发送用户 {uname} 下班打卡提醒")
 
         except Exception as e:
             logging.error(f"检查打卡状态时发生错误: {str(e)}")
@@ -2618,8 +3187,12 @@ class AttendanceSystem:
         except Exception as e:
             logging.critical(f"错误处理器本身发生错误: {str(e)}")
 
-    async def get_punch_records_from_page(self):
-        """从页面识别今日打卡记录"""
+    async def get_punch_records_from_page(self, username=None):
+        """从页面识别今日打卡记录（OCR 路径，传统模式专用）
+
+        Args:
+            username: 当前归属用户，决定回写到 today_punch_records 的哪个桶；None 时退化为 'default'
+        """
         try:
             # 获取浏览器窗口截图
             screen = self.take_screenshot()
@@ -2705,7 +3278,7 @@ class AttendanceSystem:
                 # 更新打卡记录
                 if punch_in_time:
                     try:
-                        self.today_punch_records['punch_in_time'] = datetime.strptime(punch_in_time, '%H:%M:%S')
+                        self._set_user_punch_time(username, 'punch_in_time', datetime.strptime(punch_in_time, '%H:%M:%S'))
                         self.punch_record_manager.update_record(today_str, "上班", punch_in_time)
                         logging.info(f"成功更新今日上班打卡记录: {punch_in_time}")
                     except Exception as e:
@@ -2713,7 +3286,7 @@ class AttendanceSystem:
 
                 if punch_out_time:
                     try:
-                        self.today_punch_records['punch_out_time'] = datetime.strptime(punch_out_time, '%H:%M:%S')
+                        self._set_user_punch_time(username, 'punch_out_time', datetime.strptime(punch_out_time, '%H:%M:%S'))
                         self.punch_record_manager.update_record(today_str, "下班", punch_out_time)
                         logging.info(f"成功更新今日下班打卡记录: {punch_out_time}")
                     except Exception as e:
@@ -2799,7 +3372,7 @@ class AttendanceSystem:
                 return (False, None, "登录系统失败，无法识别页面打卡记录")
 
             # 从页面识别打卡记录
-            records_found = await self.get_punch_records_from_page()
+            records_found = await self.get_punch_records_from_page(username=username)
             if records_found:
                 # 重新检查本地记录
                 updated_record = self.punch_record_manager.get_today_record()

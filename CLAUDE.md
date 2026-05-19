@@ -113,6 +113,7 @@ The system supports multiple users with separate:
 
 - **Dual Automation Modes**: Selenium WebDriver and traditional computer vision
 - **Multi-User Support**: Parallel login and data isolation for multiple users
+- **Parallel Multi-Account Punch**: 当 `USE_SELENIUM_LOGIN=true` 且配置多用户时，`/punch_in` / `/punch_out` 自动以 `asyncio.Semaphore + gather` 并行执行（上限 3 并发）；下班失败的用户会按"最长剩余时间"统一调度一次定时重试。`today_punch_records` / `notification_sent_today` 按用户分桶隔离，`PunchRecordManager.update_record` 加 `threading.Lock` 防 JSON 损坏；`send_daily_status` 有 5 秒去重；schedule 任务用 tag 隔离（`punch_out_retry` / `punch_out_scheduled` / `punch_in_scheduled` / `daily_status`）避免互相误清。PyAutoGUI 模式仍走串行（单焦点限制）。
 - **Intelligent Time Management**: Automatic punch-out scheduling with work time calculation
 - **Telegram Integration**: Comprehensive remote control (/punch_in, /punch_out, /status, /log)
 - **Robust Error Handling**: Automatic retry mechanisms and fallback strategies
