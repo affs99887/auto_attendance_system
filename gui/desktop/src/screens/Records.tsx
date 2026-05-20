@@ -1,4 +1,4 @@
-// 打卡记录 — 设计稿 screens/records.jsx 的 TS 平移。
+// 打卡记录 — 接真实后端 API，mock 兜底。
 import * as React from 'react';
 import { useApp } from '../App';
 import { Icon } from '../lib/icons';
@@ -11,6 +11,21 @@ import {
   TODAY,
 } from '../lib/data';
 import type { PunchRec } from '../lib/types';
+import { api, ApiError } from '../lib/api';
+
+/** 把后端 records ({punch_in_time, punch_out_time}) 归一为前端 PunchRec ({in, out}) */
+function normalizeRecords(raw: unknown): Record<string, PunchRec> {
+  const result: Record<string, PunchRec> = {};
+  if (!raw || typeof raw !== 'object') return result;
+  for (const [date, val] of Object.entries(raw as Record<string, unknown>)) {
+    if (!val || typeof val !== 'object') continue;
+    const v = val as Record<string, unknown>;
+    const inV = (v.punch_in_time ?? v.in ?? null) as string | null;
+    const outV = (v.punch_out_time ?? v.out ?? null) as string | null;
+    result[date] = { in: inV, out: outV };
+  }
+  return result;
+}
 
 function MonthPicker({ ym, setYm }: { ym: string; setYm: (v: string) => void }) {
   const [y, m] = ym.split('-').map(Number);
@@ -107,9 +122,59 @@ export function RecordsScreen() {
   const { currentUser } = useApp();
   const [ym, setYm] = React.useState('2026-05');
   const [view, setView] = React.useState<'calendar' | 'table'>('calendar');
-  const recs = getUserRecords(currentUser, ym);
+  const [apiRecs, setApiRecs] = React.useState<Record<string, PunchRec> | null>(null);
+  const [loading, setLoading] = React.useState(false);
+  const [error, setError] = React.useState<string | null>(null);
+
+  // 拉 API 数据 — 用 epoch 防 race
+  React.useEffect(() => {
+    const [year, month] = ym.split('-').map(Number);
+    let cancelled = false;
+    setLoading(true);
+    setError(null);
+    api.getRecords(currentUser, year, month)
+      .then(r => {
+        if (cancelled) return;
+        setApiRecs(normalizeRecords(r.records));
+      })
+      .catch(e => {
+        if (cancelled) return;
+        // 静默退到 mock；error 只在调试时展示
+        setApiRecs(null);
+        setError(e instanceof ApiError ? `${e.status}` : (e as Error).message);
+      })
+      .finally(() => {
+        if (!cancelled) setLoading(false);
+      });
+    return () => { cancelled = true; };
+  }, [currentUser, ym]);
+
+  // 优先 API，fallback mock
+  const recs: Record<string, PunchRec> = apiRecs ?? getUserRecords(currentUser, ym);
   const cells = React.useMemo(() => buildMonthGrid(ym), [ym]);
-  const stats = computeStats(currentUser, ym);
+
+  // stats：用 recs 直接算（apiRecs 时算真实，mock 时同 mock）
+  const stats = React.useMemo(() => {
+    if (apiRecs) {
+      const entries = Object.values(apiRecs);
+      const total = entries.length;
+      const both = entries.filter(r => r.in && r.out).length;
+      const inOnly = entries.filter(r => r.in && !r.out).length;
+      const inTimes = entries.map(r => r.in).filter((x): x is string => Boolean(x));
+      const outTimes = entries.map(r => r.out).filter((x): x is string => Boolean(x));
+      const avg = (arr: string[]) => {
+        if (!arr.length) return '—';
+        const secs = arr.map(t => {
+          const [h, m, s] = t.split(':').map(Number);
+          return h * 3600 + m * 60 + (s || 0);
+        });
+        const a = Math.round(secs.reduce((x, y) => x + y, 0) / secs.length);
+        return `${String(Math.floor(a / 3600)).padStart(2, '0')}:${String(Math.floor((a % 3600) / 60)).padStart(2, '0')}`;
+      };
+      return { total, both, inOnly, avgIn: avg(inTimes), avgOut: avg(outTimes) };
+    }
+    return computeStats(currentUser, ym);
+  }, [apiRecs, currentUser, ym]);
 
   return (
     <div className="col gap-6">
@@ -133,6 +198,13 @@ export function RecordsScreen() {
         </div>
         <div className="row gap-2">
           <span className="pill pill-info"><span className="dot" />当前用户 {currentUser}</span>
+          {loading ? (
+            <span className="pill pill-info"><span className="dot" />加载中</span>
+          ) : apiRecs ? (
+            <span className="pill pill-success"><span className="dot" />API 已加载</span>
+          ) : (
+            <span className="pill pill-warning" title={error ?? ''}><span className="dot" />Mock 数据</span>
+          )}
           <button className="btn"><Icon.Download size={12} />导出 JSON</button>
         </div>
       </div>

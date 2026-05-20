@@ -1,0 +1,77 @@
+# electron-builder 配置 — 打包 Windows NSIS 安装包
+#
+# 输出：release/AutoAttendance-Setup-<version>.exe
+# 安装后目录结构：
+#   <Install>\AutoAttendance.exe
+#   <Install>\resources\app.asar                # Electron 应用
+#   <Install>\resources\backend\                # Python 后端源码（运行需系统装 Python）
+#
+# 注意：当前为"源码方案"，用户机器必须装 Python 3.10+ 和 pip 依赖。
+#       PyInstaller 二进制方案见 P2-4 升级。
+
+appId: com.aas.desktop
+productName: AutoAttendance
+copyright: Copyright © 2026 自动打卡系统
+
+directories:
+  output: release
+  buildResources: electron
+
+# Electron 内打包的文件（asar 中）
+files:
+  - dist/**/*
+  - electron/main.cjs
+  - electron/preload.cjs
+  - electron/tray-icon.png
+  - electron/tray-icon@2x.png
+  - package.json
+  - "!**/*.map"
+  - "!**/.DS_Store"
+
+# 项目根的 Python 后端，作为 extraResources 放到 resources/backend/
+extraResources:
+  - from: ../../
+    to: backend
+    filter:
+      - main.py
+      - start.py
+      - watchdog.py
+      - requirements.txt
+      - .env.example
+      - modules/**/*
+      - templates/**/*
+      - "!**/__pycache__/**"
+      - "!**/*.pyc"
+      - "!**/venv/**"
+      - "!**/gui/**"
+      - "!**/.git/**"
+      - "!**/punch_records/**"
+      - "!**/screenshots/**"
+      - "!**/logs/**"
+      - "!**/release/**"
+
+asar: true
+asarUnpack:
+  - electron/tray-icon.png
+  - electron/tray-icon@2x.png
+
+win:
+  target:
+    - target: nsis
+      arch: [x64]
+  icon: electron/app-icon.png
+  artifactName: AutoAttendance-Setup-${version}-${arch}.${ext}
+
+nsis:
+  oneClick: false
+  allowToChangeInstallationDirectory: true
+  perMachine: false
+  createDesktopShortcut: always
+  createStartMenuShortcut: true
+  shortcutName: 自动打卡系统
+  installerLanguages:
+    - zh_CN
+  language: '2052'
+
+# 不签名 — 用户自己机器跑，无需代码签名
+forceCodeSigning: false

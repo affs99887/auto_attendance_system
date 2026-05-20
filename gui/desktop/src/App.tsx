@@ -11,6 +11,8 @@ import { TasksScreen } from './screens/Tasks';
 import { LogsScreen } from './screens/Logs';
 import { SettingsScreen } from './screens/Settings';
 import { AboutScreen } from './screens/About';
+import { ProgressDrawer } from './components/ProgressDrawer';
+import { LegacyModeOverlay } from './components/LegacyModeOverlay';
 
 type ScreenComponent = React.ComponentType;
 
@@ -169,6 +171,7 @@ function Sidebar({ screen, setScreen, currentUser, setCurrentUser, sysStatus }: 
 }
 
 function TitleBar() {
+  const win = window.AAS_WINDOW;
   return (
     <div className="titlebar">
       <div className="titlebar-app">
@@ -178,9 +181,15 @@ function TitleBar() {
       </div>
       <div className="titlebar-title">Auto Attendance · 邓蕴哲@localhost</div>
       <div className="window-controls">
-        <button className="win-btn" title="最小化"><Icon.Minus size={10} /></button>
-        <button className="win-btn" title="最大化"><Icon.Maximize size={10} /></button>
-        <button className="win-btn close" title="关闭"><Icon.Close size={10} /></button>
+        <button className="win-btn" title="最小化" onClick={() => win?.minimize()}>
+          <Icon.Minus size={10} />
+        </button>
+        <button className="win-btn" title="最大化" onClick={() => win?.maximizeToggle()}>
+          <Icon.Maximize size={10} />
+        </button>
+        <button className="win-btn close" title="关闭" onClick={() => win?.close()}>
+          <Icon.Close size={10} />
+        </button>
       </div>
     </div>
   );
@@ -251,17 +260,13 @@ export function App() {
             <main className="main">
               <Toolbar title={screenTitle} sub={screenSub} actions={null} clock={clock} />
               <div className="content scroll-area" key={screen}>
-                {ScreenCmp
-                  ? <ScreenCmp />
-                  : (
-                    <div className="empty-state">
-                      该页面尚未在阶段 2a 实现 — 将于阶段 2a-2 平移自设计稿 ({screen}.jsx)
-                    </div>
-                  )}
+                {ScreenCmp ? <ScreenCmp /> : <div className="empty-state">未知页面: {screen}</div>}
               </div>
             </main>
           </div>
         </div>
+        <ProgressDrawer />
+        <LegacyModeOverlay />
       </div>
     </AppCtx.Provider>
   );

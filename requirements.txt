@@ -10,7 +10,7 @@ requests>=2.31.0
 Flask>=3.0.0
 waitress>=2.1.2
 python-telegram-bot==20.7
-chinese-calendar==1.10.0
+chinese-calendar>=1.11.0
 pywin32>=306
 colorama>=0.4.6
 selenium>=4.15.0

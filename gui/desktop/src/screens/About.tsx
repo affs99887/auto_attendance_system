@@ -1,6 +1,9 @@
-// 关于 & 命令 — 设计稿 screens/about.jsx 的 TS 平移。
+// 关于 & 命令 — 系统信息 + 模块 + Telegram 命令速查 + ASCII 数据流。
+import * as React from 'react';
 import { Icon } from '../lib/icons';
 import { COMMANDS } from '../lib/data';
+import { api, ApiError } from '../lib/api';
+import { useSystemStore } from '../store/system';
 
 const DATA_FLOW = `  ┌─────────────────┐
   │  Telegram Bot   │ ◄── 用户命令 (/punch_in 等)
@@ -37,8 +40,73 @@ const MODULES = [
 ];
 
 export function AboutScreen() {
+  const snapshot = useSystemStore(s => s.snapshot);
+  const [confirmStop, setConfirmStop] = React.useState(false);
+  const [toast, setToast] = React.useState<string | null>(null);
+
+  const showToast = (text: string) => {
+    setToast(text);
+    window.setTimeout(() => setToast(null), 4000);
+  };
+
+  const handleRestart = async () => {
+    try {
+      const r = await api.systemRestart();
+      showToast(r.note ?? '已发出重启信号（由 Electron 处理）');
+    } catch (e) {
+      showToast(`请求失败: ${e instanceof ApiError ? e.status : (e as Error).message}`);
+    }
+  };
+
+  const heartbeatMs = snapshot?.heartbeat?.last
+    ? new Date(snapshot.heartbeat.last).getTime()
+    : null;
+  const runMins = heartbeatMs ? Math.max(0, Math.round((Date.now() - heartbeatMs) / 60_000)) : null;
+
   return (
     <div className="col gap-6">
+      {toast && (
+        <div
+          style={{
+            position: 'fixed', top: 80, right: 24, zIndex: 200,
+            background: 'var(--bg-card)',
+            border: '1px solid var(--accent-border)',
+            borderLeft: '3px solid var(--accent)',
+            borderRadius: 'var(--radius)',
+            padding: '10px 16px',
+            boxShadow: 'var(--shadow-lg)',
+            fontSize: 13,
+            maxWidth: 360,
+          }}
+        >
+          {toast}
+        </div>
+      )}
+      {confirmStop && (
+        <div
+          style={{
+            position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.4)',
+            display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 1500,
+          }}
+          onClick={() => setConfirmStop(false)}
+        >
+          <div className="card" style={{ width: 400 }} onClick={e => e.stopPropagation()}>
+            <div className="card-body">
+              <div className="h2" style={{ marginBottom: 8 }}>停止系统？</div>
+              <div className="muted" style={{ fontSize: 12, marginBottom: 16 }}>
+                此操作将停止 main.py（包括 Telegram bot 与 GUI 后端）。
+                需要重新启动才能继续打卡。
+              </div>
+              <div className="row gap-2" style={{ justifyContent: 'flex-end' }}>
+                <button className="btn" onClick={() => setConfirmStop(false)}>取消</button>
+                <button className="btn btn-danger" onClick={() => { setConfirmStop(false); showToast('请通过托盘菜单或 Ctrl+C 退出'); }}>
+                  我已确认（手动 Ctrl+C）
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
       <div className="grid" style={{ gridTemplateColumns: '1fr 1.4fr', gap: 16 }}>
         <div className="card">
           <div className="card-body">
@@ -67,8 +135,17 @@ export function AboutScreen() {
             </div>
             <div className="divider" />
             <div className="row gap-2">
-              <button className="btn"><Icon.Refresh size={12} />重启 main.py</button>
-              <button className="btn btn-danger"><Icon.Power size={12} />停止系统</button>
+              <button className="btn" onClick={handleRestart}>
+                <Icon.Refresh size={12} />重启 main.py
+              </button>
+              <button className="btn btn-danger" onClick={() => setConfirmStop(true)}>
+                <Icon.Power size={12} />停止系统
+              </button>
+              {runMins !== null && (
+                <span className="muted" style={{ fontSize: 11, marginLeft: 'auto' }}>
+                  上次心跳：{runMins} 分钟前
+                </span>
+              )}
             </div>
           </div>
         </div>

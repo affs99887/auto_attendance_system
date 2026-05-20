@@ -1,34 +1,216 @@
-// 定时任务 — 设计稿 screens/tasks.jsx 的 TS 平移。
+// 定时任务 — 接真实后端 API。
+// 数据源：useSystemStore.snapshot.scheduled_tasks（由 status snapshot 提供）
+// 操作：api.createTask / api.deleteTask
 import * as React from 'react';
 import { Icon } from '../lib/icons';
-import { SCHEDULED_TASKS, USERS } from '../lib/data';
-import type { ScheduledTask } from '../lib/types';
+import { USERS } from '../lib/data';
+import { api, ApiError } from '../lib/api';
+import { useSystemStore } from '../store/system';
 
-function timeUntil(target: string): string {
-  const now = new Date('2026-05-19T08:45:32');
-  const t = new Date(target.replace(' ', 'T'));
-  let diff = Math.max(0, t.getTime() - now.getTime());
-  const h = Math.floor(diff / 3_600_000);
-  diff -= h * 3_600_000;
-  const m = Math.floor(diff / 60_000);
-  diff -= m * 60_000;
-  const s = Math.floor(diff / 1000);
-  if (h > 0) return `${h}h${String(m).padStart(2, '0')}m`;
-  if (m > 0) return `${m}m${String(s).padStart(2, '0')}s`;
-  return `${s}s`;
+interface TaskRow {
+  id: number;
+  type: string;
+  scheduled_time: string;
+  created_at?: string;
+  username?: string;
+}
+
+/** 从 HH:MM 字符串计算今日剩余时间（粗略） */
+function timeUntil(timeStr: string): string {
+  const [h, m] = timeStr.split(':').map(Number);
+  if (Number.isNaN(h) || Number.isNaN(m)) return '—';
+  const now = new Date();
+  const target = new Date(now);
+  target.setHours(h, m, 0, 0);
+  let diff = target.getTime() - now.getTime();
+  if (diff < 0) diff += 24 * 3600 * 1000; // 已过 → 显示明日剩余
+  const hh = Math.floor(diff / 3_600_000);
+  const mm = Math.floor((diff % 3_600_000) / 60_000);
+  const ss = Math.floor((diff % 60_000) / 1000);
+  if (hh > 0) return `${hh}h${String(mm).padStart(2, '0')}m`;
+  if (mm > 0) return `${mm}m${String(ss).padStart(2, '0')}s`;
+  return `${ss}s`;
+}
+
+function CreateTaskForm({ onClose, onCreated }: { onClose: () => void; onCreated: () => void }) {
+  const [type, setType] = React.useState<'punch_in' | 'punch_out'>('punch_out');
+  const [mode, setMode] = React.useState<'absolute' | 'delay'>('absolute');
+  const [hour, setHour] = React.useState('17');
+  const [minute, setMinute] = React.useState('30');
+  const [delay, setDelay] = React.useState('5');
+  const [username, setUsername] = React.useState<string>('');
+  const [busy, setBusy] = React.useState(false);
+  const [err, setErr] = React.useState<string | null>(null);
+
+  const handleSubmit = async () => {
+    setBusy(true);
+    setErr(null);
+    try {
+      const body: Parameters<typeof api.createTask>[0] = {
+        type, mode, username: username || undefined,
+      };
+      if (mode === 'absolute') {
+        body.hour = parseInt(hour, 10);
+        body.minute = parseInt(minute, 10);
+      } else {
+        body.delay_minutes = parseInt(delay, 10);
+      }
+      const r = await api.createTask(body);
+      if (!r.success) {
+        setErr(r.message ?? '创建失败');
+        return;
+      }
+      onCreated();
+      onClose();
+    } catch (e) {
+      setErr(e instanceof ApiError ? `${e.status} ${e.message}` : (e as Error).message);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  // 预览
+  let preview = '—';
+  if (mode === 'absolute') {
+    preview = `每天 ${hour.padStart(2, '0')}:${minute.padStart(2, '0')} 执行${type === 'punch_in' ? '上班' : '下班'}打卡`;
+  } else {
+    const d = parseInt(delay, 10);
+    if (!Number.isNaN(d)) {
+      const t = new Date(Date.now() + d * 60_000);
+      preview = `约 ${String(t.getHours()).padStart(2, '0')}:${String(t.getMinutes()).padStart(2, '0')} 执行${type === 'punch_in' ? '上班' : '下班'}打卡 (${d} 分钟后)`;
+    }
+  }
+
+  return (
+    <div
+      style={{
+        position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.4)',
+        display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 100,
+      }}
+      onClick={onClose}
+    >
+      <div
+        className="card"
+        style={{ width: 480, boxShadow: 'var(--shadow-lg)' }}
+        onClick={e => e.stopPropagation()}
+      >
+        <div className="card-header">
+          <div className="card-title">新建定时任务</div>
+          <button className="btn btn-ico" onClick={onClose}><Icon.Close size={12} /></button>
+        </div>
+        <div className="card-body">
+          <div className="field">
+            <div className="field-label">打卡类型</div>
+            <div className="tab-bar">
+              <button
+                className={`tab-btn ${type === 'punch_in' ? 'active' : ''}`}
+                onClick={() => setType('punch_in')}
+              >上班</button>
+              <button
+                className={`tab-btn ${type === 'punch_out' ? 'active' : ''}`}
+                onClick={() => setType('punch_out')}
+              >下班</button>
+            </div>
+          </div>
+          <div className="field">
+            <div className="field-label">执行模式</div>
+            <div className="tab-bar">
+              <button
+                className={`tab-btn ${mode === 'absolute' ? 'active' : ''}`}
+                onClick={() => setMode('absolute')}
+              >指定时间</button>
+              <button
+                className={`tab-btn ${mode === 'delay' ? 'active' : ''}`}
+                onClick={() => setMode('delay')}
+              >延迟执行</button>
+            </div>
+          </div>
+
+          {mode === 'absolute' ? (
+            <div className="field-row">
+              <div className="field">
+                <div className="field-label">小时 (0-23)</div>
+                <input className="input mono" value={hour} onChange={e => setHour(e.target.value)} />
+              </div>
+              <div className="field">
+                <div className="field-label">分钟 (0-59)</div>
+                <input className="input mono" value={minute} onChange={e => setMinute(e.target.value)} />
+              </div>
+            </div>
+          ) : (
+            <div className="field">
+              <div className="field-label">延迟分钟数</div>
+              <input className="input mono" value={delay} onChange={e => setDelay(e.target.value)} />
+            </div>
+          )}
+
+          <div className="field">
+            <div className="field-label">绑定用户 (可选)</div>
+            <select className="input" value={username} onChange={e => setUsername(e.target.value)}>
+              <option value="">— 全部用户 —</option>
+              {USERS.map(u => <option key={u.id} value={u.id}>{u.name}</option>)}
+            </select>
+          </div>
+
+          <div
+            style={{
+              padding: 10,
+              background: 'var(--accent-bg)',
+              borderLeft: '3px solid var(--accent)',
+              borderRadius: 'var(--radius)',
+              fontSize: 12,
+              color: 'var(--accent-fg)',
+              marginBottom: 12,
+            }}
+          >
+            <strong>预览：</strong>{preview}
+          </div>
+
+          {err && (
+            <div
+              style={{
+                padding: '8px 12px', background: 'var(--danger-bg)',
+                border: '1px solid var(--danger-border)', borderRadius: 'var(--radius)',
+                fontSize: 12, color: 'var(--danger)', marginBottom: 12,
+              }}
+            >{err}</div>
+          )}
+
+          <div className="row gap-2" style={{ justifyContent: 'flex-end' }}>
+            <button className="btn" onClick={onClose}>取消</button>
+            <button className="btn btn-primary" disabled={busy} onClick={handleSubmit}>
+              <Icon.Plus size={12} />{busy ? '创建中…' : '创建任务'}
+            </button>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
 }
 
 export function TasksScreen() {
-  const [tasks, setTasks] = React.useState<ScheduledTask[]>(SCHEDULED_TASKS);
-  const [confirm, setConfirm] = React.useState<string | null>(null);
+  const snapshot = useSystemStore(s => s.snapshot);
+  const refresh = useSystemStore(s => s.refresh);
+  const tasks: TaskRow[] = (snapshot?.scheduled_tasks ?? []) as TaskRow[];
+  const [confirmDel, setConfirmDel] = React.useState<TaskRow | null>(null);
+  const [showCreate, setShowCreate] = React.useState(false);
+  const [tick, setTick] = React.useState(0);
 
-  const kill = (id: string) => {
-    setTasks(prev => prev.filter(t => t.id !== id));
-    setConfirm(null);
+  // 每秒推进倒计时
+  React.useEffect(() => {
+    const id = window.setInterval(() => setTick(t => t + 1), 1000);
+    return () => window.clearInterval(id);
+  }, []);
+
+  const handleDelete = async (id: number) => {
+    try {
+      await api.deleteTask(id);
+      setConfirmDel(null);
+      void refresh();
+    } catch {
+      setConfirmDel(null);
+    }
   };
-
-  const recurring = tasks.filter(t => t.recurring);
-  const oneShot = tasks.filter(t => !t.recurring);
 
   return (
     <div className="col gap-6">
@@ -38,179 +220,101 @@ export function TasksScreen() {
             <span className="dot" />共 {tasks.length} 个任务
           </span>
           <span className="muted" style={{ fontSize: 12 }}>
-            schedule 库 · 按 tag 隔离 · 每 60s 心跳记录数量
+            schedule 库 · 数据来自 GET /api/v1/status
           </span>
         </div>
         <div className="row gap-2">
-          <button className="btn"><Icon.Refresh size={12} />同步</button>
-          <button className="btn btn-primary"><Icon.Plus size={12} />新建任务</button>
+          <button className="btn" onClick={() => void refresh()}>
+            <Icon.Refresh size={12} />同步
+          </button>
+          <button className="btn btn-primary" onClick={() => setShowCreate(true)}>
+            <Icon.Plus size={12} />新建任务
+          </button>
         </div>
       </div>
 
       <div className="card">
         <div className="card-header">
           <div>
-            <div className="card-title">一次性任务 · 当日</div>
-            <div className="card-sub">执行后自动从队列移除</div>
+            <div className="card-title">定时任务</div>
+            <div className="card-sub">从 scheduled_tasks.json 读取；删除立刻取消 schedule job</div>
           </div>
         </div>
         <table className="table">
           <thead>
             <tr>
-              <th style={{ width: 32 }}></th>
-              <th>任务</th>
+              <th style={{ width: 40 }}>ID</th>
+              <th>类型</th>
               <th>用户</th>
-              <th>tag</th>
-              <th>下次运行</th>
-              <th>距现在</th>
+              <th>计划时间</th>
+              <th>距执行 <span data-tick={tick} style={{ display: 'none' }} /></th>
+              <th>创建于</th>
               <th>操作</th>
             </tr>
           </thead>
           <tbody>
-            {oneShot.map(t => (
-              <tr key={t.id}>
-                <td>
-                  <span
-                    style={{
-                      display: 'inline-block',
-                      width: 8,
-                      height: 8,
-                      borderRadius: '50%',
-                      background: 'var(--warning)',
-                    }}
-                  />
+            {tasks.length === 0 && (
+              <tr>
+                <td colSpan={7} className="empty-state">
+                  暂无定时任务 — 点击右上角「新建任务」创建
                 </td>
-                <td>
-                  <div style={{ fontWeight: 500 }}>{t.name}</div>
-                  <div className="mono muted" style={{ fontSize: 10 }}>{t.fn}</div>
-                </td>
-                <td>
-                  {t.user ? (
-                    <div className="row gap-2">
-                      <div
-                        className="user-avatar"
-                        style={{
-                          background: USERS.find(u => u.id === t.user)?.color,
-                          width: 18,
-                          height: 18,
-                          fontSize: 9,
-                        }}
-                      >
-                        {USERS.find(u => u.id === t.user)?.short}
+              </tr>
+            )}
+            {tasks.map(t => {
+              const user = USERS.find(u => u.id === t.username);
+              return (
+                <tr key={t.id}>
+                  <td className="mono" style={{ fontSize: 11, color: 'var(--text-muted)' }}>#{t.id}</td>
+                  <td>
+                    <span className={`pill ${t.type === 'punch_in' ? 'pill-info' : 'pill-warning'}`}>
+                      <span className="dot" />
+                      {t.type === 'punch_in' ? '上班' : '下班'}
+                    </span>
+                  </td>
+                  <td>
+                    {user ? (
+                      <div className="row gap-2">
+                        <div
+                          className="user-avatar"
+                          style={{
+                            background: user.color, width: 18, height: 18, fontSize: 9,
+                          }}
+                        >{user.short}</div>
+                        {user.name}
                       </div>
-                      {t.user}
-                    </div>
-                  ) : (
-                    <span className="muted">—</span>
-                  )}
-                </td>
-                <td>
-                  <span className="pill pill-neutral mono" style={{ fontSize: 10 }}>{t.tag}</span>
-                </td>
-                <td className="mono">{t.nextRun}</td>
-                <td className="mono" style={{ color: 'var(--accent)' }}>
-                  {timeUntil(t.nextRun)}
-                </td>
-                <td>
-                  <div className="row gap-2">
-                    <button className="btn btn-sm" title="立即执行">
-                      <Icon.Play size={11} />
-                    </button>
+                    ) : (
+                      <span className="muted">全部</span>
+                    )}
+                  </td>
+                  <td className="mono">{t.scheduled_time}</td>
+                  <td className="mono" style={{ color: 'var(--accent)' }}>
+                    {timeUntil(t.scheduled_time)}
+                  </td>
+                  <td className="mono muted" style={{ fontSize: 11 }}>
+                    {t.created_at ?? '—'}
+                  </td>
+                  <td>
                     <button
                       className="btn btn-sm btn-danger"
-                      onClick={() => setConfirm(t.id)}
+                      onClick={() => setConfirmDel(t)}
                     >
                       <Icon.Trash size={11} />Kill
                     </button>
-                  </div>
-                </td>
-              </tr>
-            ))}
-            {oneShot.length === 0 && (
-              <tr>
-                <td colSpan={7} className="empty-state">无一次性任务</td>
-              </tr>
-            )}
+                  </td>
+                </tr>
+              );
+            })}
           </tbody>
         </table>
       </div>
 
-      <div className="card">
-        <div className="card-header">
-          <div>
-            <div className="card-title">循环任务</div>
-            <div className="card-sub">每日定时触发 · schedule.tag 隔离防误删</div>
-          </div>
-        </div>
-        <table className="table">
-          <thead>
-            <tr>
-              <th style={{ width: 32 }}></th>
-              <th>任务</th>
-              <th>tag</th>
-              <th>下次运行</th>
-              <th>循环</th>
-              <th>操作</th>
-            </tr>
-          </thead>
-          <tbody>
-            {recurring.map(t => (
-              <tr key={t.id}>
-                <td>
-                  <span
-                    style={{
-                      display: 'inline-block',
-                      width: 8,
-                      height: 8,
-                      borderRadius: '50%',
-                      background: 'var(--accent)',
-                    }}
-                  />
-                </td>
-                <td>
-                  <div style={{ fontWeight: 500 }}>{t.name}</div>
-                  <div className="mono muted" style={{ fontSize: 10 }}>{t.fn}</div>
-                </td>
-                <td>
-                  <span className="pill pill-neutral mono" style={{ fontSize: 10 }}>{t.tag}</span>
-                </td>
-                <td className="mono">{t.nextRun}</td>
-                <td>
-                  <span className="pill pill-info">
-                    <Icon.Refresh size={9} />每日
-                  </span>
-                </td>
-                <td>
-                  <div className="row gap-2">
-                    <button className="btn btn-sm" title="测试">
-                      <Icon.Zap size={11} />测试
-                    </button>
-                    <button
-                      className="btn btn-sm btn-danger"
-                      onClick={() => setConfirm(t.id)}
-                    >
-                      <Icon.Trash size={11} />
-                    </button>
-                  </div>
-                </td>
-              </tr>
-            ))}
-          </tbody>
-        </table>
-      </div>
-
-      {confirm && (
+      {confirmDel && (
         <div
           style={{
-            position: 'fixed',
-            inset: 0,
-            background: 'rgba(0,0,0,0.3)',
-            display: 'flex',
-            alignItems: 'center',
-            justifyContent: 'center',
-            zIndex: 100,
+            position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.3)',
+            display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 100,
           }}
-          onClick={() => setConfirm(null)}
+          onClick={() => setConfirmDel(null)}
         >
           <div
             className="card"
@@ -220,31 +324,29 @@ export function TasksScreen() {
             <div className="card-body">
               <div className="row gap-2" style={{ marginBottom: 8 }}>
                 <Icon.Trash size={16} style={{ color: 'var(--danger)' }} />
-                <div className="h2">删除任务？</div>
+                <div className="h2">删除任务 #{confirmDel.id}？</div>
               </div>
               <div className="muted" style={{ fontSize: 12, marginBottom: 16 }}>
-                即将执行{' '}
-                <span
-                  className="mono"
-                  style={{
-                    background: 'var(--bg-inset)',
-                    padding: '2px 6px',
-                    borderRadius: 3,
-                  }}
-                >
-                  schedule.cancel_job(tag={tasks.find(t => t.id === confirm)?.tag})
-                </span>
-                ，此操作不可撤销。
+                {confirmDel.type === 'punch_in' ? '上班' : '下班'}打卡 · 计划 {confirmDel.scheduled_time}
+                <br />
+                此操作不可撤销。
               </div>
               <div className="row gap-2" style={{ justifyContent: 'flex-end' }}>
-                <button className="btn" onClick={() => setConfirm(null)}>取消</button>
-                <button className="btn btn-danger" onClick={() => kill(confirm)}>
+                <button className="btn" onClick={() => setConfirmDel(null)}>取消</button>
+                <button className="btn btn-danger" onClick={() => handleDelete(confirmDel.id)}>
                   确认 Kill
                 </button>
               </div>
             </div>
           </div>
         </div>
+      )}
+
+      {showCreate && (
+        <CreateTaskForm
+          onClose={() => setShowCreate(false)}
+          onCreated={() => void refresh()}
+        />
       )}
     </div>
   );

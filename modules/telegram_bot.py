@@ -24,7 +24,7 @@ import numpy as np
 import psutil
 
 # 日历和调度
-from chinese_calendar import is_workday, is_holiday
+from modules.safe_calendar import is_workday, is_holiday
 import schedule
 
 # Windows API

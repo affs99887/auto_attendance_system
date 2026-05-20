@@ -18,9 +18,11 @@ import logging
 import threading
 import secrets
 import functools
+import tempfile
+import re
 from typing import Any, Optional, Set
 
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, send_file
 import waitress
 
 try:
@@ -34,6 +36,22 @@ else:
 
 TOKEN_FILE = os.path.join('logs', '.gui_token')
 LOG_FILE = os.path.join('logs', 'attendance_system.log')
+
+# 允许通过 PATCH /api/v1/config 写入 .env 的字段白名单
+# （登录账号/Telegram token 等敏感字段也允许，但客户端需有 token 才能写）
+ENV_WRITE_WHITELIST = {
+    'LOGIN_USERNAME', 'LOGIN_PASSWORD', 'LOGIN_USERNAME2', 'LOGIN_PASSWORD2', 'LOGIN_URL',
+    'TELEGRAM_BOT_TOKEN', 'TELEGRAM_CHAT_ID',
+    'EMAIL_SENDER', 'EMAIL_PASSWORD', 'EMAIL_SMTP_SERVER', 'EMAIL_SMTP_PORT', 'EMAIL_RECIPIENTS',
+    'TESSERACT_PATH',
+    'WORK_START_TIME', 'WORK_END_TIME', 'LATE_THRESHOLD', 'EARLY_LEAVE_THRESHOLD',
+    'DAILY_STATUS_TIME',
+}
+
+# 返回给前端 GET /api/v1/config/all 时遮罩的敏感字段
+ENV_SENSITIVE_FIELDS = {
+    'LOGIN_PASSWORD', 'LOGIN_PASSWORD2', 'TELEGRAM_BOT_TOKEN', 'EMAIL_PASSWORD',
+}
 
 
 # ----------------------------------------------------------------------------
@@ -124,6 +142,109 @@ def _make_require_token(expected: str):
 # ----------------------------------------------------------------------------
 # Log tail helpers
 # ----------------------------------------------------------------------------
+
+def _read_env_file(path: str = '.env') -> dict:
+    """读取 .env 文件为 dict（保留原值，不解析引号）。"""
+    result: dict = {}
+    if not os.path.exists(path):
+        return result
+    try:
+        with open(path, 'r', encoding='utf-8') as f:
+            for raw in f:
+                line = raw.strip()
+                if not line or line.startswith('#') or '=' not in line:
+                    continue
+                k, v = line.split('=', 1)
+                k = k.strip()
+                v = v.strip()
+                # 去除两端引号
+                if (v.startswith('"') and v.endswith('"')) or (v.startswith("'") and v.endswith("'")):
+                    v = v[1:-1]
+                result[k] = v
+    except Exception:
+        logging.exception(f"读 .env 失败: {path}")
+    return result
+
+
+_ENV_LOCK = threading.Lock()
+
+
+def _write_env_atomic(patch: dict, path: str = '.env') -> dict:
+    """把 patch 中的字段合并写回 .env，原子替换，备份原 .env 到 .env.bak。
+
+    - 仅写入 ENV_WRITE_WHITELIST 中的字段
+    - 已有 key 就地替换；新 key 追加到末尾
+    - 返回应用后的 .env 全量字典（未遮罩）
+    """
+    cleaned: dict = {}
+    for k, v in (patch or {}).items():
+        if k not in ENV_WRITE_WHITELIST:
+            continue
+        if v is None:
+            continue
+        # 防止换行注入
+        s = str(v).replace('\r', '').replace('\n', '')
+        if not re.match(r'^[A-Z][A-Z0-9_]*$', k):
+            continue
+        cleaned[k] = s
+
+    if not cleaned:
+        return _read_env_file(path)
+
+    with _ENV_LOCK:
+        existing_lines: list = []
+        existing_keys: set = set()
+        if os.path.exists(path):
+            try:
+                with open(path, 'r', encoding='utf-8') as f:
+                    existing_lines = f.readlines()
+            except Exception:
+                logging.exception("读 .env 失败")
+                existing_lines = []
+        else:
+            existing_lines = []
+
+        # 替换已有 key
+        out_lines = []
+        for raw in existing_lines:
+            stripped = raw.strip()
+            if not stripped or stripped.startswith('#') or '=' not in stripped:
+                out_lines.append(raw if raw.endswith('\n') else raw + '\n')
+                continue
+            k = stripped.split('=', 1)[0].strip()
+            if k in cleaned:
+                existing_keys.add(k)
+                out_lines.append(f'{k}={cleaned[k]}\n')
+            else:
+                out_lines.append(raw if raw.endswith('\n') else raw + '\n')
+        # 追加新 key
+        for k, v in cleaned.items():
+            if k not in existing_keys:
+                out_lines.append(f'{k}={v}\n')
+
+        # 备份原 .env
+        if os.path.exists(path):
+            try:
+                import shutil
+                shutil.copy2(path, path + '.bak')
+            except Exception:
+                logging.exception(".env 备份失败")
+
+        # 临时文件 + 原子替换
+        tmp_fd, tmp_path = tempfile.mkstemp(prefix='.env.', dir=os.path.dirname(os.path.abspath(path)) or '.')
+        try:
+            with os.fdopen(tmp_fd, 'w', encoding='utf-8') as f:
+                f.writelines(out_lines)
+            os.replace(tmp_path, path)
+        except Exception:
+            try:
+                os.unlink(tmp_path)
+            except Exception:
+                pass
+            raise
+
+    return _read_env_file(path)
+
 
 def _tail_file(path: str, n: int):
     """读取文件最后 n 行（块读法，几 MB 日志够用）。"""
@@ -321,6 +442,293 @@ def _build_flask_app(attendance_system, bridge: AsyncioBridge,
                 'env_key': u.get('env_key'),
             })
         return jsonify({'users': users})
+
+    # ----- Auto byebye -----
+    @app.post('/api/v1/punch/auto_byebye/calc')
+    @require_token
+    def auto_byebye_calc():
+        """根据上班打卡时间计算下班时间。
+
+        body: ``{"username": "<可选>"}``
+        - username 缺省时遍历所有 `today_punch_records`，按上班时间排序取最早的
+        """
+        body = request.get_json(silent=True) or {}
+        username = body.get('username')
+        recs = attendance_system.today_punch_records or {}
+
+        target_user = None
+        target_in = None
+        if username:
+            rec = recs.get(username) or {}
+            target_in = rec.get('punch_in_time')
+            target_user = username
+        else:
+            for u, r in recs.items():
+                t = (r or {}).get('punch_in_time')
+                if t and (target_in is None or t < target_in):
+                    target_in = t
+                    target_user = u
+
+        if not target_in:
+            return jsonify({
+                'success': False,
+                'message': f'{target_user or "所有用户"} 今日尚未上班打卡，无法计算下班时间',
+            })
+
+        in_str = target_in.strftime('%H:%M:%S') if hasattr(target_in, 'strftime') else str(target_in)
+        try:
+            ok, out_str, msg = attendance_system.calculate_punch_out_time(in_str)
+        except Exception as e:
+            logging.exception("auto_byebye_calc failed")
+            return jsonify({'success': False, 'error': str(e)}), 500
+        return jsonify({
+            'success': bool(ok),
+            'username': target_user,
+            'punch_in_time': in_str,
+            'punch_out_time': out_str,
+            'message': msg,
+        })
+
+    @app.post('/api/v1/punch/auto_byebye/confirm')
+    @require_token
+    def auto_byebye_confirm():
+        """安排定时下班打卡任务。body: ``{hour, minute}``"""
+        body = request.get_json(silent=True) or {}
+        try:
+            hour = int(body['hour'])
+            minute = int(body['minute'])
+        except (KeyError, ValueError, TypeError):
+            return jsonify({'success': False, 'error': 'hour 和 minute 必填且为整数'}), 400
+        if not (0 <= hour <= 23) or not (0 <= minute <= 59):
+            return jsonify({'success': False, 'error': '时间超出范围'}), 400
+        try:
+            ok = bridge.call(
+                attendance_system.schedule_punch_out(hour, minute), timeout=15
+            )
+            event_bus.publish_threadsafe('task:changed', {'op': 'add', 'type': 'punch_out'})
+            return jsonify({'success': bool(ok), 'time': f'{hour:02d}:{minute:02d}'})
+        except Exception as e:
+            logging.exception("auto_byebye_confirm failed")
+            return jsonify({'success': False, 'error': str(e)}), 500
+
+    # ----- Tasks (create) -----
+    @app.post('/api/v1/tasks')
+    @require_token
+    def create_task():
+        from modules.services.task_service import create_scheduled_punch_task
+        body = request.get_json(silent=True) or {}
+        punch_type = body.get('type')
+        mode = body.get('mode')
+        hour = body.get('hour')
+        minute = body.get('minute')
+        delay_minutes = body.get('delay_minutes')
+        username = body.get('username')
+        try:
+            ok, msg, task_id = bridge.call(
+                create_scheduled_punch_task(
+                    attendance_system,
+                    punch_type=punch_type,
+                    mode=mode,
+                    hour=hour,
+                    minute=minute,
+                    delay_minutes=delay_minutes,
+                    username=username,
+                ),
+                timeout=15,
+            )
+            if ok:
+                event_bus.publish_threadsafe('task:changed', {'op': 'add', 'id': task_id})
+            return jsonify({'success': bool(ok), 'message': msg, 'task_id': task_id})
+        except Exception as e:
+            logging.exception("create_task failed")
+            return jsonify({'success': False, 'error': str(e)}), 500
+
+    # ----- Screenshots -----
+    @app.get('/api/v1/screenshots')
+    @require_token
+    def list_screenshots_api():
+        from modules.services.screenshot_service import list_screenshots, list_users_with_screenshots
+        username = request.args.get('username')
+        ptype = request.args.get('type', 'punch_in')
+        try:
+            limit = max(1, min(int(request.args.get('limit', 5)), 20))
+        except ValueError:
+            limit = 5
+        try:
+            if username:
+                items = list_screenshots(username, ptype, limit=limit)
+                return jsonify({'username': username, 'type': ptype, 'items': items})
+            else:
+                users = list_users_with_screenshots()
+                grouped = {u: list_screenshots(u, ptype, limit=limit) for u in users}
+                return jsonify({'type': ptype, 'users': users, 'grouped': grouped})
+        except Exception as e:
+            logging.exception("list_screenshots failed")
+            return jsonify({'error': str(e)}), 500
+
+    @app.get('/api/v1/screenshots/file')
+    @require_token
+    def screenshot_file():
+        from modules.services.screenshot_service import safe_screenshot_path
+        path = request.args.get('path', '')
+        safe = safe_screenshot_path(path)
+        if not safe:
+            return jsonify({'error': 'forbidden or not found'}), 404
+        try:
+            return send_file(safe, mimetype='image/png')
+        except Exception as e:
+            logging.exception("send_file failed")
+            return jsonify({'error': str(e)}), 500
+
+    # ----- Records -----
+    @app.get('/api/v1/records')
+    @require_token
+    def get_records():
+        """读取 punch_records/{username}/YYYY_MM.json。"""
+        username = request.args.get('username')
+        year = request.args.get('year')
+        month = request.args.get('month')
+        if not username or not year or not month:
+            return jsonify({'error': 'username/year/month 必填'}), 400
+        try:
+            year_i = int(year); month_i = int(month)
+            if not (1 <= month_i <= 12):
+                raise ValueError('month range')
+        except ValueError:
+            return jsonify({'error': 'year/month 非法'}), 400
+        # 防目录穿越：username 只允许包含合法字符
+        if '/' in username or '\\' in username or '..' in username:
+            return jsonify({'error': 'username 非法'}), 400
+        ym = f'{year_i}_{month_i:02d}'
+        path = os.path.join('punch_records', username, f'{ym}.json')
+        if not os.path.exists(path):
+            return jsonify({'username': username, 'year': year_i, 'month': month_i, 'records': {}})
+        try:
+            with open(path, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+            return jsonify({
+                'username': username, 'year': year_i, 'month': month_i,
+                'records': data, 'path': path,
+            })
+        except Exception as e:
+            logging.exception("get_records failed")
+            return jsonify({'error': str(e)}), 500
+
+    # ----- Error logs (分页) -----
+    @app.get('/api/v1/logs/errors')
+    @require_token
+    def get_error_logs():
+        from modules.services.log_service import get_recent_errors
+        try:
+            page = max(1, int(request.args.get('page', 1)))
+            per_page = max(1, min(int(request.args.get('per_page', 5)), 20))
+        except ValueError:
+            page, per_page = 1, 5
+        try:
+            res = get_recent_errors(LOG_FILE, page=page, per_page=per_page)
+            return jsonify(res)
+        except Exception as e:
+            logging.exception("get_error_logs failed")
+            return jsonify({'error': str(e)}), 500
+
+    # ----- Config full read / write -----
+    @app.get('/api/v1/config/all')
+    @require_token
+    def get_config_all():
+        env = _read_env_file('.env')
+        masked = {}
+        for k, v in env.items():
+            if k in ENV_SENSITIVE_FIELDS:
+                masked[k] = ('•' * 8) if v else ''
+                masked[f'{k}__has'] = bool(v)
+            else:
+                masked[k] = v
+        # 附加 dynamic_config + 当前内存值方便前端展示
+        from modules.config import config as cfg
+        masked['_dynamic'] = {
+            'USE_SELENIUM_LOGIN': cfg.get_use_selenium_login(),
+            'SELENIUM_HEADLESS': cfg.get_selenium_headless(),
+        }
+        return jsonify({'env': masked, 'whitelist': sorted(ENV_WRITE_WHITELIST)})
+
+    @app.patch('/api/v1/config')
+    @require_token
+    def patch_config():
+        body = request.get_json(silent=True) or {}
+        patch = body.get('patch') if isinstance(body.get('patch'), dict) else body
+        if not isinstance(patch, dict):
+            return jsonify({'success': False, 'error': '请求体应为字段字典或 {patch: {...}}'}), 400
+        invalid = [k for k in patch.keys() if k not in ENV_WRITE_WHITELIST]
+        if invalid:
+            return jsonify({'success': False, 'error': f'以下字段不在白名单: {invalid}'}), 400
+        try:
+            new_env = _write_env_atomic(patch)
+            # 遮罩敏感字段后返回
+            masked = {k: ('•' * 8 if k in ENV_SENSITIVE_FIELDS and v else v) for k, v in new_env.items()}
+            return jsonify({
+                'success': True,
+                'env': masked,
+                'note': '已写入 .env（.env.bak 已备份）。**多数字段需重启 main.py 生效**。',
+            })
+        except Exception as e:
+            logging.exception("patch_config failed")
+            return jsonify({'success': False, 'error': str(e)}), 500
+
+    # ----- Email test -----
+    @app.post('/api/v1/email/test')
+    @require_token
+    def test_email():
+        try:
+            from modules.email_service import email_service
+            ok = bool(email_service.check_email_connection())
+            return jsonify({'success': ok, 'message': '邮件服务器连接 OK' if ok else 'SMTP 连接失败'})
+        except Exception as e:
+            logging.exception("test_email failed")
+            return jsonify({'success': False, 'error': str(e)}), 500
+
+    # ----- System control -----
+    @app.post('/api/v1/system/restart')
+    @require_token
+    def system_restart():
+        """请求重启 main.py — 当前仅记录意图并响应；真正重启由 Electron 主进程负责。"""
+        event_bus.publish_threadsafe('system:restart_requested', {'ts': time.time()})
+        return jsonify({'success': True, 'note': '已发出重启信号；Electron 主进程将在收到 system:restart_requested 时执行'})
+
+    # ----- Daily reminder test -----
+    @app.post('/api/v1/test/reminder')
+    @require_token
+    def test_reminder():
+        try:
+            ok = bool(attendance_system.bot.verify_daily_reminder_setup())
+            return jsonify({'success': ok, 'message': '提醒任务已验证' if ok else '验证失败'})
+        except Exception as e:
+            logging.exception("test_reminder failed")
+            return jsonify({'success': False, 'error': str(e)}), 500
+
+    # ----- Parallel login test -----
+    @app.post('/api/v1/test/parallel_login')
+    @require_token
+    def parallel_login_test():
+        try:
+            users_config = attendance_system.prepare_users_config_from_env()
+            if not users_config:
+                return jsonify({'success': False, 'error': '未配置任何用户'}), 400
+            results = bridge.call(
+                attendance_system.parallel_punch_login(users_config), timeout=120
+            )
+            normalized = {}
+            for uid, val in (results or {}).items():
+                ok, msg = (val if isinstance(val, (list, tuple)) and len(val) >= 2 else (False, str(val)))
+                normalized[uid] = {'success': bool(ok), 'message': str(msg)}
+            return jsonify({
+                'success': True,
+                'count': len(normalized),
+                'success_count': sum(1 for v in normalized.values() if v['success']),
+                'results': normalized,
+            })
+        except Exception as e:
+            logging.exception("parallel_login_test failed")
+            return jsonify({'success': False, 'error': str(e)}), 500
 
     return app
 

@@ -1,7 +1,8 @@
-// 截图档案 — 设计稿 screens/shots.jsx 的 TS 平移。
+// 截图档案 — 接真实后端 API；无数据时回退占位 SVG。
 import * as React from 'react';
 import { Icon } from '../lib/icons';
 import { USERS } from '../lib/data';
+import { api, ApiError, type ScreenshotItem } from '../lib/api';
 
 interface PlaceholderImgProps {
   kind: 'punch_in' | 'punch_out';
@@ -109,12 +110,39 @@ function formatTs(s: string): string {
 export function ShotsScreen() {
   const [user, setUser] = React.useState<string>(USERS[0].id);
   const [kind, setKind] = React.useState<'punch_in' | 'punch_out'>('punch_in');
+  const [items, setItems] = React.useState<ScreenshotItem[] | null>(null);
+  const [loading, setLoading] = React.useState(false);
+  const [error, setError] = React.useState<string | null>(null);
 
-  const samples = [
-    { ts: '20260519_082947', success: true },
-    { ts: '20260518_084600', success: true },
-    { ts: '20260517_085012', success: false },
-  ];
+  const refresh = React.useCallback(() => {
+    let cancelled = false;
+    setLoading(true);
+    setError(null);
+    api.listScreenshots({ username: user, type: kind, limit: 5 })
+      .then(r => {
+        if (cancelled) return;
+        const data = ('items' in r) ? r.items : [];
+        setItems(data);
+      })
+      .catch(e => {
+        if (cancelled) return;
+        setItems(null);
+        setError(e instanceof ApiError ? `${e.status} ${e.message}` : (e as Error).message);
+      })
+      .finally(() => {
+        if (!cancelled) setLoading(false);
+      });
+    return () => { cancelled = true; };
+  }, [user, kind]);
+
+  React.useEffect(() => refresh(), [refresh]);
+
+  const apiSamples = items ?? [];
+  // 兜底：API 空时显示三个占位
+  const placeholderTs = ['20260519_082947', '20260518_084600', '20260517_085012'];
+  const samples = apiSamples.length > 0
+    ? apiSamples.map(it => ({ ts: it.time_str.replace(/[-: ]/g, '').slice(0, 15), success: true, path: it.path, time_str: it.time_str }))
+    : placeholderTs.map(ts => ({ ts, success: true, path: '', time_str: '' }));
 
   return (
     <div className="col gap-6">
@@ -160,8 +188,14 @@ export function ShotsScreen() {
           </div>
         </div>
         <div className="row gap-2">
-          <button className="btn"><Icon.Refresh size={12} />重新加载</button>
-          <button className="btn"><Icon.Bot size={12} />Telegram /check</button>
+          <button className="btn" onClick={() => refresh()} disabled={loading}>
+            <Icon.Refresh size={12} />{loading ? '加载中…' : '重新加载'}
+          </button>
+          {items ? (
+            <span className="pill pill-success"><span className="dot" />API · {items.length} 张</span>
+          ) : (
+            <span className="pill pill-warning" title={error ?? ''}><span className="dot" />Mock 占位</span>
+          )}
         </div>
       </div>
 
@@ -181,17 +215,51 @@ export function ShotsScreen() {
           <div className="grid grid-3" style={{ gap: 16 }}>
             {samples.map((s, i) => (
               <div className="col gap-2" key={i}>
-                <PlaceholderImg kind={kind} ts={s.ts} user={user} success={s.success} />
+                {s.path ? (
+                  <a
+                    href={api.screenshotFileUrl(s.path)}
+                    target="_blank"
+                    rel="noreferrer"
+                    style={{
+                      display: 'block',
+                      aspectRatio: '16 / 10',
+                      borderRadius: 6,
+                      overflow: 'hidden',
+                      border: '1px solid var(--border)',
+                      background: 'var(--bg-inset)',
+                    }}
+                  >
+                    <img
+                      src={api.screenshotFileUrl(s.path)}
+                      alt={s.time_str || s.ts}
+                      style={{ width: '100%', height: '100%', objectFit: 'cover', display: 'block' }}
+                    />
+                  </a>
+                ) : (
+                  <PlaceholderImg kind={kind} ts={s.ts} user={user} success={s.success} />
+                )}
                 <div className="row spread" style={{ fontSize: 11 }}>
-                  <span className="mono">{formatTs(s.ts)}</span>
-                  <span className="muted">{['最新', '前次', '最早'][i]}</span>
+                  <span className="mono">{s.time_str || formatTs(s.ts)}</span>
+                  <span className="muted">{['最新', '前次', '最早'][i] ?? `#${i + 1}`}</span>
                 </div>
                 <div className="row gap-2">
-                  <button className="btn btn-sm" style={{ flex: 1 }}>
-                    <Icon.Eye size={11} />查看
-                  </button>
-                  <button className="btn btn-sm"><Icon.Download size={11} /></button>
-                  <button className="btn btn-sm btn-danger"><Icon.Trash size={11} /></button>
+                  {s.path && (
+                    <a
+                      className="btn btn-sm"
+                      style={{ flex: 1, textDecoration: 'none' }}
+                      href={api.screenshotFileUrl(s.path)}
+                      target="_blank"
+                      rel="noreferrer"
+                    >
+                      <Icon.Eye size={11} />查看原图
+                    </a>
+                  )}
+                  {!s.path && (
+                    <button className="btn btn-sm" style={{ flex: 1 }} disabled>
+                      <Icon.Eye size={11} />占位
+                    </button>
+                  )}
+                  <button className="btn btn-sm" disabled={!s.path}><Icon.Download size={11} /></button>
                 </div>
               </div>
             ))}

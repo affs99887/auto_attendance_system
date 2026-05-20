@@ -23,7 +23,7 @@ import cv2
 import numpy as np
 import pyautogui
 import psutil
-from chinese_calendar import is_workday, is_holiday
+from modules.safe_calendar import is_workday, is_holiday
 import sys
 
 # Windows API imports

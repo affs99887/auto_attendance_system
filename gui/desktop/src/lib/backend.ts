@@ -12,6 +12,13 @@ declare global {
       httpUrl: string;
       wsUrl: string;
     };
+    /** Electron preload 注入的窗口控制（纯浏览器下为 undefined） */
+    AAS_WINDOW?: {
+      minimize: () => void;
+      maximizeToggle: () => void;
+      close: () => void;
+      isMaximized: () => Promise<boolean>;
+    };
   }
 }
 

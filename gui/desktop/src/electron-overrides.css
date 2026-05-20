@@ -1,0 +1,21 @@
+/* Electron 桌面外壳适配
+ *
+ * 设计稿 styles.css 的 .desktop 用 24px padding + 暖色径向渐变模拟
+ * "桌面背景 + 居中应用窗口" 的效果 —— 那是给浏览器预览用的。
+ * 在真实 Electron 窗口里，OS 已经提供窗口，这层模拟就成了多余的边框。
+ *
+ * 通过 <html data-shell="electron"> 标记后，这里把窗口拉满、去掉边框/圆角/阴影。
+ */
+
+[data-shell='electron'] .desktop {
+  padding: 0;
+  background: var(--bg-base);
+}
+
+[data-shell='electron'] .win {
+  max-width: none;
+  max-height: none;
+  border-radius: 0;
+  border: none;
+  box-shadow: none;
+}

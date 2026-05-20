@@ -1,8 +1,14 @@
-// 系统设置 — 设计稿 screens/settings.jsx 的 TS 平移。
+// 系统设置 — 接真实 API。
+// - automation tab: setConfigMode (热生效)
+// - email tab: testEmail
+// - schedule/users/telegram/email/advanced: patchConfig (.env 写入)
+// - general tab 主题切换走 window.AAS_THEME
 import * as React from 'react';
 import { useApp } from '../App';
 import { Icon, type IconName } from '../lib/icons';
 import { USERS } from '../lib/data';
+import { api, ApiError } from '../lib/api';
+import { useSystemStore } from '../store/system';
 
 interface SectionProps {
   title: string;
@@ -59,13 +65,102 @@ type TabKey =
 
 export function SettingsScreen() {
   const { seleniumOn, setSeleniumOn, headless, setHeadless } = useApp();
+  const snapshot = useSystemStore(s => s.snapshot);
+  const refreshStatus = useSystemStore(s => s.refresh);
   const [tab, setTab] = React.useState<TabKey>('general');
-  const [workStart, setWorkStart] = React.useState('09:00');
-  const [workEnd, setWorkEnd] = React.useState('17:30');
-  const [lateThr, setLateThr] = React.useState('15');
-  const [earlyThr, setEarlyThr] = React.useState('15');
-  const [dailyStatus, setDailyStatus] = React.useState('08:20');
 
+  // Toast 状态
+  const [toast, setToast] = React.useState<{ type: 'ok' | 'err'; text: string } | null>(null);
+  const showToast = (type: 'ok' | 'err', text: string) => {
+    setToast({ type, text });
+    window.setTimeout(() => setToast(null), 4000);
+  };
+
+  // 从 API 拉初始 .env
+  const [envFields, setEnvFields] = React.useState<Record<string, string>>({});
+  const [envLoading, setEnvLoading] = React.useState(false);
+  React.useEffect(() => {
+    setEnvLoading(true);
+    api.getConfigAll()
+      .then(r => {
+        const out: Record<string, string> = {};
+        for (const [k, v] of Object.entries(r.env)) {
+          if (typeof v === 'string') out[k] = v;
+        }
+        setEnvFields(out);
+      })
+      .catch(() => { /* ignore，留空表示用 fallback */ })
+      .finally(() => setEnvLoading(false));
+  }, []);
+
+  const updateField = (k: string, v: string) => setEnvFields(prev => ({ ...prev, [k]: v }));
+
+  const saveFields = async (keys: string[]) => {
+    const patch: Record<string, string> = {};
+    keys.forEach(k => { if (envFields[k] !== undefined) patch[k] = envFields[k]; });
+    if (Object.keys(patch).length === 0) {
+      showToast('err', '没有可保存的字段');
+      return;
+    }
+    try {
+      const r = await api.patchConfig(patch);
+      if (r.success) {
+        showToast('ok', '已保存到 .env（重启 main.py 后生效）');
+      } else {
+        showToast('err', r.error ?? '保存失败');
+      }
+    } catch (e) {
+      showToast('err', e instanceof ApiError ? `${e.status}` : (e as Error).message);
+    }
+  };
+
+  // mode 切换 — 接 setConfigMode 立即生效
+  const handleSelenium = async (v: boolean) => {
+    setSeleniumOn(v);
+    try {
+      await api.setConfigMode({ use_selenium_login: v });
+      showToast('ok', `已切换到 ${v ? 'Selenium' : '图像识别'} 模式`);
+      void refreshStatus();
+    } catch (e) {
+      showToast('err', `切换失败: ${e instanceof ApiError ? e.status : (e as Error).message}`);
+    }
+  };
+
+  const handleHeadless = async (v: boolean) => {
+    // headless 切换需提示 "下次打卡生效"
+    if (snapshot?.current_operation) {
+      showToast('err', '当前有打卡进行中，此设置仅对下次打卡生效');
+    }
+    setHeadless(v);
+    try {
+      await api.setConfigMode({ selenium_headless: v });
+      showToast('ok', `已切换到 ${v ? '无头' : '可见'} 模式（下次打卡生效）`);
+      void refreshStatus();
+    } catch (e) {
+      showToast('err', `切换失败: ${e instanceof ApiError ? e.status : (e as Error).message}`);
+    }
+  };
+
+  // 邮件测试
+  const handleEmailTest = async () => {
+    showToast('ok', '正在测试 SMTP 连接...');
+    try {
+      const r = await api.testEmail();
+      showToast(r.success ? 'ok' : 'err', r.message ?? r.error ?? '');
+    } catch (e) {
+      showToast('err', e instanceof ApiError ? `${e.status}` : (e as Error).message);
+    }
+  };
+
+  // 工作时间等字段：优先用 envFields，回退到 snapshot.config，再退到本地默认
+  const fieldVal = (key: string, fallback: string) => envFields[key] ?? fallback;
+  const workStart = fieldVal('WORK_START_TIME', snapshot?.config?.work_start_time ?? '09:00');
+  const workEnd = fieldVal('WORK_END_TIME', snapshot?.config?.work_end_time ?? '17:30');
+  const lateThr = fieldVal('LATE_THRESHOLD', String(snapshot?.config?.late_threshold ?? '15'));
+  const earlyThr = fieldVal('EARLY_LEAVE_THRESHOLD', String(snapshot?.config?.early_leave_threshold ?? '15'));
+  const dailyStatus = fieldVal('DAILY_STATUS_TIME', snapshot?.config?.daily_status_time ?? '08:20');
+
+  // 本地行为开关（仅 UI，dynamic_config schema 暂未扩展）
   const [reminder, setReminder] = React.useState(true);
   const [autoByebye, setAutoByebye] = React.useState(true);
   const [parallelLogin, setParallelLogin] = React.useState(true);
@@ -73,6 +168,23 @@ export function SettingsScreen() {
 
   return (
     <div className="col gap-4">
+      {toast && (
+        <div
+          style={{
+            position: 'fixed', top: 80, right: 24, zIndex: 200,
+            background: 'var(--bg-card)',
+            border: `1px solid var(--${toast.type === 'ok' ? 'success' : 'danger'}-border)`,
+            borderLeft: `3px solid var(--${toast.type === 'ok' ? 'success' : 'danger'})`,
+            borderRadius: 'var(--radius)',
+            padding: '10px 16px',
+            boxShadow: 'var(--shadow-lg)',
+            fontSize: 13,
+            maxWidth: 360,
+          }}
+        >
+          {toast.text}
+        </div>
+      )}
       <div className="row gap-2">
         <div className="tab-bar">
           {([
@@ -236,7 +348,7 @@ export function SettingsScreen() {
               <input
                 className="input mono"
                 value={workStart}
-                onChange={e => setWorkStart(e.target.value)}
+                onChange={e => updateField('WORK_START_TIME', e.target.value)}
               />
             </div>
             <div className="field">
@@ -244,7 +356,7 @@ export function SettingsScreen() {
               <input
                 className="input mono"
                 value={workEnd}
-                onChange={e => setWorkEnd(e.target.value)}
+                onChange={e => updateField('WORK_END_TIME', e.target.value)}
               />
             </div>
           </div>
@@ -254,7 +366,7 @@ export function SettingsScreen() {
               <input
                 className="input mono"
                 value={lateThr}
-                onChange={e => setLateThr(e.target.value)}
+                onChange={e => updateField('LATE_THRESHOLD', e.target.value)}
               />
               <div className="field-hint">
                 {workStart} 后 {lateThr} 分钟仍未打卡视为迟到
@@ -265,7 +377,7 @@ export function SettingsScreen() {
               <input
                 className="input mono"
                 value={earlyThr}
-                onChange={e => setEarlyThr(e.target.value)}
+                onChange={e => updateField('EARLY_LEAVE_THRESHOLD', e.target.value)}
               />
             </div>
           </div>
@@ -274,7 +386,7 @@ export function SettingsScreen() {
             <input
               className="input mono"
               value={dailyStatus}
-              onChange={e => setDailyStatus(e.target.value)}
+              onChange={e => updateField('DAILY_STATUS_TIME', e.target.value)}
               style={{ maxWidth: 180 }}
             />
             <div className="field-hint">每日该时间自动向 Telegram 推送当日状态</div>
@@ -288,6 +400,15 @@ export function SettingsScreen() {
               </div>
             </div>
             <span className="pill pill-success"><span className="dot" />已启用</span>
+          </div>
+          <div className="row gap-2" style={{ marginTop: 12, justifyContent: 'flex-end' }}>
+            <button
+              className="btn btn-primary"
+              disabled={envLoading}
+              onClick={() => saveFields(['WORK_START_TIME', 'WORK_END_TIME', 'LATE_THRESHOLD', 'EARLY_LEAVE_THRESHOLD', 'DAILY_STATUS_TIME'])}
+            >
+              <Icon.Check size={12} />保存到 .env（需重启）
+            </button>
           </div>
         </Section>
       )}
@@ -303,17 +424,17 @@ export function SettingsScreen() {
               <div className="toggle-row-info">
                 <div className="toggle-row-title">USE_SELENIUM_LOGIN</div>
                 <div className="toggle-row-desc">
-                  使用 Selenium WebDriver（推荐 · 更稳定 · 支持并行）
+                  使用 Selenium WebDriver（推荐 · 更稳定 · 支持并行）— 实时生效
                 </div>
               </div>
-              <Toggle on={seleniumOn} onChange={setSeleniumOn} />
+              <Toggle on={seleniumOn} onChange={handleSelenium} />
             </div>
             <div className="toggle-row">
               <div className="toggle-row-info">
                 <div className="toggle-row-title">SELENIUM_HEADLESS</div>
-                <div className="toggle-row-desc">无头模式 · 不弹出浏览器窗口，节省资源</div>
+                <div className="toggle-row-desc">无头模式 · 不弹出浏览器窗口 — 下次打卡生效</div>
               </div>
-              <Toggle on={headless} onChange={setHeadless} />
+              <Toggle on={headless} onChange={handleHeadless} />
             </div>
             <div
               style={{
@@ -434,9 +555,17 @@ export function SettingsScreen() {
             <div className="field-hint">英文逗号分隔，可多个</div>
           </div>
           <div className="row gap-2">
-            <button className="btn btn-primary"><Icon.Mail size={12} />发送测试邮件</button>
-            <span className="pill pill-success" style={{ marginLeft: 'auto' }}>
-              <span className="dot" />SMTP 可达
+            <button className="btn btn-primary" onClick={handleEmailTest}>
+              <Icon.Mail size={12} />测试 SMTP 连接
+            </button>
+            <button
+              className="btn"
+              onClick={() => saveFields(['EMAIL_SENDER', 'EMAIL_PASSWORD', 'EMAIL_SMTP_SERVER', 'EMAIL_SMTP_PORT', 'EMAIL_RECIPIENTS'])}
+            >
+              <Icon.Check size={12} />保存到 .env
+            </button>
+            <span className="muted" style={{ fontSize: 11, marginLeft: 'auto' }}>
+              修改后需重启 main.py 生效
             </span>
           </div>
         </Section>
