@@ -76,35 +76,71 @@ export function SettingsScreen() {
     window.setTimeout(() => setToast(null), 4000);
   };
 
+  // 敏感字段：后端 getConfigAll 返回掩码（••••），前端置空，留空=不修改，避免保存时覆盖真实值
+  const SENSITIVE = React.useMemo(
+    () => new Set(['LOGIN_PASSWORD', 'LOGIN_PASSWORD2', 'TELEGRAM_BOT_TOKEN', 'EMAIL_PASSWORD']),
+    [],
+  );
+
   // 从 API 拉初始 .env
   const [envFields, setEnvFields] = React.useState<Record<string, string>>({});
+  const [hasSecret, setHasSecret] = React.useState<Record<string, boolean>>({});
   const [envLoading, setEnvLoading] = React.useState(false);
   React.useEffect(() => {
     setEnvLoading(true);
     api.getConfigAll()
       .then(r => {
         const out: Record<string, string> = {};
+        const secrets: Record<string, boolean> = {};
         for (const [k, v] of Object.entries(r.env)) {
-          if (typeof v === 'string') out[k] = v;
+          // 后端用 `${key}__has` 布尔标志表示敏感字段当前是否已设置
+          if (k.endsWith('__has')) { secrets[k.slice(0, -5)] = Boolean(v); continue; }
+          if (typeof v === 'string') {
+            out[k] = SENSITIVE.has(k) ? '' : v; // 敏感字段不回填掩码
+          }
         }
         setEnvFields(out);
+        setHasSecret(secrets);
       })
       .catch(() => { /* ignore，留空表示用 fallback */ })
       .finally(() => setEnvLoading(false));
-  }, []);
+  }, [SENSITIVE]);
 
   const updateField = (k: string, v: string) => setEnvFields(prev => ({ ...prev, [k]: v }));
 
+  // 敏感字段占位提示：已设置则提示"留空不修改"
+  const secretPlaceholder = (k: string) => (hasSecret[k] ? '已设置 · 留空表示不修改' : '未设置');
+
   const saveFields = async (keys: string[]) => {
     const patch: Record<string, string> = {};
-    keys.forEach(k => { if (envFields[k] !== undefined) patch[k] = envFields[k]; });
+    keys.forEach(k => {
+      const v = envFields[k];
+      if (v === undefined) return;
+      // 敏感字段留空 = 不修改，跳过以免覆盖真实值
+      if (SENSITIVE.has(k) && v === '') return;
+      patch[k] = v;
+    });
     if (Object.keys(patch).length === 0) {
-      showToast('err', '没有可保存的字段');
+      showToast('err', '没有需要保存的字段（敏感字段留空表示不修改）');
       return;
     }
     try {
       const r = await api.patchConfig(patch);
       if (r.success) {
+        // 已保存的敏感字段从内存清空（避免明文滞留），并标记为"已设置"，恢复占位语义
+        const savedSecrets = Object.keys(patch).filter(k => SENSITIVE.has(k));
+        if (savedSecrets.length) {
+          setEnvFields(prev => {
+            const next = { ...prev };
+            savedSecrets.forEach(k => { next[k] = ''; });
+            return next;
+          });
+          setHasSecret(prev => {
+            const next = { ...prev };
+            savedSecrets.forEach(k => { next[k] = true; });
+            return next;
+          });
+        }
         showToast('ok', '已保存到 .env（重启 main.py 后生效）');
       } else {
         showToast('err', r.error ?? '保存失败');
@@ -147,6 +183,17 @@ export function SettingsScreen() {
     try {
       const r = await api.testEmail();
       showToast(r.success ? 'ok' : 'err', r.message ?? r.error ?? '');
+    } catch (e) {
+      showToast('err', e instanceof ApiError ? `${e.status}` : (e as Error).message);
+    }
+  };
+
+  // 测试每日提醒任务设置 (/test_reminder)
+  const handleTestReminder = async () => {
+    showToast('ok', '正在验证每日提醒任务设置...');
+    try {
+      const r = await api.testReminder();
+      showToast(r.success ? 'ok' : 'err', r.message ?? r.error ?? (r.success ? '每日提醒任务已就绪' : '验证失败'));
     } catch (e) {
       showToast('err', e instanceof ApiError ? `${e.status}` : (e as Error).message);
     }
@@ -244,6 +291,12 @@ export function SettingsScreen() {
                 <Toggle on={r.v} onChange={r.set} />
               </div>
             ))}
+            <div className="divider" />
+            <div className="row gap-2" style={{ justifyContent: 'flex-end' }}>
+              <button className="btn" onClick={handleTestReminder}>
+                <Icon.Zap size={12} />测试每日提醒推送
+              </button>
+            </div>
           </Section>
 
           <Section title="外观与语言" icon="Globe">
@@ -288,7 +341,10 @@ export function SettingsScreen() {
           sub=".env 中 LOGIN_USERNAME / LOGIN_USERNAME2 · 支持并行"
           icon="Users"
         >
-          {USERS.map((u, i) => (
+          {USERS.map((u, i) => {
+            const uKey = `LOGIN_USERNAME${i === 1 ? '2' : ''}`;
+            const pKey = `LOGIN_PASSWORD${i === 1 ? '2' : ''}`;
+            return (
             <div key={u.id} className="card" style={{ marginBottom: 12, border: '1px solid var(--border)' }}>
               <div className="card-header" style={{ background: 'var(--bg-inset)' }}>
                 <div className="row gap-2">
@@ -306,12 +362,22 @@ export function SettingsScreen() {
               <div className="card-body">
                 <div className="field-row">
                   <div className="field">
-                    <div className="field-label">用户名 (LOGIN_USERNAME{i === 1 ? '2' : ''})</div>
-                    <input className="input mono" defaultValue={u.name} />
+                    <div className="field-label">用户名 ({uKey})</div>
+                    <input
+                      className="input mono"
+                      value={envFields[uKey] ?? ''}
+                      onChange={e => updateField(uKey, e.target.value)}
+                    />
                   </div>
                   <div className="field">
-                    <div className="field-label">密码 (LOGIN_PASSWORD{i === 1 ? '2' : ''})</div>
-                    <input className="input mono" defaultValue="●●●●●●●●●●●●" type="password" />
+                    <div className="field-label">密码 ({pKey})</div>
+                    <input
+                      className="input mono"
+                      type="password"
+                      value={envFields[pKey] ?? ''}
+                      placeholder={secretPlaceholder(pKey)}
+                      onChange={e => updateField(pKey, e.target.value)}
+                    />
                   </div>
                 </div>
                 <div className="field">
@@ -320,7 +386,8 @@ export function SettingsScreen() {
                 </div>
               </div>
             </div>
-          ))}
+            );
+          })}
           <div className="row gap-2">
             <button className="btn"><Icon.Plus size={12} />添加账户</button>
             <div className="muted" style={{ fontSize: 11, marginLeft: 'auto' }}>
@@ -330,8 +397,21 @@ export function SettingsScreen() {
           <div className="divider" />
           <div className="field">
             <div className="field-label">登录 URL (LOGIN_URL)</div>
-            <input className="input mono" defaultValue="https://timecard.example.corp/login" />
+            <input
+              className="input mono"
+              value={envFields['LOGIN_URL'] ?? ''}
+              onChange={e => updateField('LOGIN_URL', e.target.value)}
+            />
             <div className="field-hint">所有用户共用同一登录入口</div>
+          </div>
+          <div className="row gap-2" style={{ marginTop: 12, justifyContent: 'flex-end' }}>
+            <button
+              className="btn btn-primary"
+              disabled={envLoading}
+              onClick={() => saveFields(['LOGIN_USERNAME', 'LOGIN_PASSWORD', 'LOGIN_USERNAME2', 'LOGIN_PASSWORD2', 'LOGIN_URL'])}
+            >
+              <Icon.Check size={12} />保存到 .env（需重启）
+            </button>
           </div>
         </Section>
       )}
@@ -465,12 +545,14 @@ export function SettingsScreen() {
                 <div className="field-label">Tesseract 路径 TESSERACT_PATH</div>
                 <input
                   className="input mono"
-                  defaultValue="C:\Program Files\Tesseract-OCR\tesseract.exe"
+                  value={envFields['TESSERACT_PATH'] ?? ''}
+                  onChange={e => updateField('TESSERACT_PATH', e.target.value)}
                 />
               </div>
               <div className="field">
                 <div className="field-label">匹配阈值 MATCH_THRESHOLD</div>
-                <input className="input mono" defaultValue="0.8" />
+                <input className="input mono" defaultValue="0.8" disabled />
+                <div className="field-hint">代码常量，暂不支持在此修改</div>
               </div>
             </div>
             <div className="field">
@@ -479,6 +561,15 @@ export function SettingsScreen() {
               <div className="field-hint">
                 19 张模板图片 · username_field / login_button / punch_button …
               </div>
+            </div>
+            <div className="row gap-2" style={{ marginTop: 12, justifyContent: 'flex-end' }}>
+              <button
+                className="btn btn-primary"
+                disabled={envLoading}
+                onClick={() => saveFields(['TESSERACT_PATH'])}
+              >
+                <Icon.Check size={12} />保存到 .env（需重启）
+              </button>
             </div>
           </Section>
         </div>
@@ -491,13 +582,19 @@ export function SettingsScreen() {
               <div className="field-label">Bot Token TELEGRAM_BOT_TOKEN</div>
               <input
                 className="input mono"
-                defaultValue="7595731872:AAHPdLF...redacted"
                 type="password"
+                value={envFields['TELEGRAM_BOT_TOKEN'] ?? ''}
+                placeholder={secretPlaceholder('TELEGRAM_BOT_TOKEN')}
+                onChange={e => updateField('TELEGRAM_BOT_TOKEN', e.target.value)}
               />
             </div>
             <div className="field">
               <div className="field-label">Chat ID TELEGRAM_CHAT_ID</div>
-              <input className="input mono" defaultValue="123456789" />
+              <input
+                className="input mono"
+                value={envFields['TELEGRAM_CHAT_ID'] ?? ''}
+                onChange={e => updateField('TELEGRAM_CHAT_ID', e.target.value)}
+              />
             </div>
           </div>
           <div className="grid grid-3" style={{ marginTop: 8 }}>
@@ -514,10 +611,15 @@ export function SettingsScreen() {
           </div>
           <div className="divider" />
           <div className="row gap-2">
-            <button className="btn btn-primary"><Icon.Zap size={12} />测试 Bot 连接</button>
-            <button className="btn">查看活动 chat_id</button>
+            <button
+              className="btn btn-primary"
+              disabled={envLoading}
+              onClick={() => saveFields(['TELEGRAM_BOT_TOKEN', 'TELEGRAM_CHAT_ID'])}
+            >
+              <Icon.Check size={12} />保存到 .env（需重启）
+            </button>
             <span className="muted" style={{ fontSize: 11, marginLeft: 'auto' }}>
-              最近连接 0.4s 前 · OK
+              修改后需重启 main.py 生效
             </span>
           </div>
         </Section>
@@ -527,31 +629,50 @@ export function SettingsScreen() {
         <Section title="邮件通知" sub="SMTP · 打卡成功/失败截图抄送" icon="Mail">
           <div className="field-row">
             <div className="field">
-              <div className="field-label">SMTP 服务器</div>
-              <input className="input mono" defaultValue="smtp.qq.com" />
+              <div className="field-label">SMTP 服务器 EMAIL_SMTP_SERVER</div>
+              <input
+                className="input mono"
+                value={envFields['EMAIL_SMTP_SERVER'] ?? ''}
+                onChange={e => updateField('EMAIL_SMTP_SERVER', e.target.value)}
+              />
             </div>
             <div className="field">
-              <div className="field-label">端口</div>
-              <input className="input mono" defaultValue="465" style={{ maxWidth: 120 }} />
+              <div className="field-label">端口 EMAIL_SMTP_PORT</div>
+              <input
+                className="input mono"
+                value={envFields['EMAIL_SMTP_PORT'] ?? ''}
+                onChange={e => updateField('EMAIL_SMTP_PORT', e.target.value)}
+                style={{ maxWidth: 120 }}
+              />
             </div>
           </div>
           <div className="field-row">
             <div className="field">
               <div className="field-label">发件人 EMAIL_SENDER</div>
-              <input className="input mono" defaultValue="your_email@qq.com" />
+              <input
+                className="input mono"
+                value={envFields['EMAIL_SENDER'] ?? ''}
+                onChange={e => updateField('EMAIL_SENDER', e.target.value)}
+              />
             </div>
             <div className="field">
               <div className="field-label">授权码 EMAIL_PASSWORD</div>
               <input
                 className="input mono"
-                defaultValue="●●●●●●●●●●●●●●●●"
                 type="password"
+                value={envFields['EMAIL_PASSWORD'] ?? ''}
+                placeholder={secretPlaceholder('EMAIL_PASSWORD')}
+                onChange={e => updateField('EMAIL_PASSWORD', e.target.value)}
               />
             </div>
           </div>
           <div className="field">
             <div className="field-label">收件人列表 EMAIL_RECIPIENTS</div>
-            <input className="input mono" defaultValue="manager@corp.com, hr@corp.com" />
+            <input
+              className="input mono"
+              value={envFields['EMAIL_RECIPIENTS'] ?? ''}
+              onChange={e => updateField('EMAIL_RECIPIENTS', e.target.value)}
+            />
             <div className="field-hint">英文逗号分隔，可多个</div>
           </div>
           <div className="row gap-2">

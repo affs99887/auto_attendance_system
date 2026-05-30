@@ -6,6 +6,7 @@ import { RECENT_ACTIVITY, RECORDS, TODAY, USERS } from '../lib/data';
 import type { RecentActivityEntry, User } from '../lib/types';
 import { useSystemStore } from '../store/system';
 import { usePunchStore } from '../store/punch';
+import { api } from '../lib/api';
 
 /** 后端 today_records 时间字段：`'08:29:55'` 或 `'1900-01-01T08:29:55'`，统一抽 HH:MM:SS */
 function extractTime(raw: string | null | undefined): string | null {
@@ -60,6 +61,24 @@ function estimateOut(inT: string | null): string | null {
 function PunchUserCard({ user }: { user: User }) {
   const { setScreen, setCurrentUser } = useApp();
   const snapshot = useSystemStore(s => s.snapshot);
+  const refreshStatus = useSystemStore(s => s.refresh);
+  // 触发该用户的上/下班打卡（与 /punch_in /punch_out 同接口，进度经 WS punch:progress 展示）
+  const [busy, setBusy] = React.useState<null | 'in' | 'out'>(null);
+  const [hint, setHint] = React.useState<{ ok: boolean; text: string } | null>(null);
+  const doPunch = async (kind: 'in' | 'out') => {
+    setBusy(kind);
+    setHint(null);
+    try {
+      const r = kind === 'in' ? await api.punchIn(user.id) : await api.punchOut(user.id);
+      // 后端业务失败经 HTTP 200 {success:false} 返回（不会进 catch），需显式判断给出反馈
+      setHint({ ok: Boolean(r.success), text: r.message || (r.success ? '操作已启动' : '操作失败') });
+    } catch (e) {
+      setHint({ ok: false, text: e instanceof Error ? e.message : '请求失败' });
+    } finally {
+      setBusy(null);
+      void refreshStatus();
+    }
+  };
   // 优先用后端 today_records；为空时回退 mock 以便开发模式可见
   const apiRec = snapshot?.today_records?.[user.id];
   const today = apiRec
@@ -116,11 +135,19 @@ function PunchUserCard({ user }: { user: User }) {
         </div>
         <div className="divider" />
         <div className="row gap-2">
-          <button className="btn btn-primary" disabled={punchedIn}>
-            <Icon.Punch size={12} /> 上班打卡
+          <button
+            className="btn btn-primary"
+            disabled={punchedIn || busy !== null}
+            onClick={() => doPunch('in')}
+          >
+            <Icon.Punch size={12} /> {busy === 'in' ? '打卡中…' : '上班打卡'}
           </button>
-          <button className="btn" disabled={!punchedIn || punchedOut}>
-            <Icon.Power size={12} /> 下班打卡
+          <button
+            className="btn"
+            disabled={!punchedIn || punchedOut || busy !== null}
+            onClick={() => doPunch('out')}
+          >
+            <Icon.Power size={12} /> {busy === 'out' ? '打卡中…' : '下班打卡'}
           </button>
           <button
             className="btn btn-sm"
@@ -133,6 +160,18 @@ function PunchUserCard({ user }: { user: User }) {
             查看记录 <Icon.ChevronRight size={10} />
           </button>
         </div>
+        {hint && (
+          <div
+            className="mono"
+            style={{
+              marginTop: 8,
+              fontSize: 11,
+              color: hint.ok ? 'var(--success)' : 'var(--danger)',
+            }}
+          >
+            {hint.ok ? '✓ ' : '✗ '}{hint.text}
+          </div>
+        )}
       </div>
     </div>
   );

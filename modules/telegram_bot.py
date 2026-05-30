@@ -291,7 +291,7 @@ class TelegramBot:
             await update.message.reply_text("🕐 正在获取当日上班打卡时间...")
 
             # 获取当日上班打卡时间
-            success, punch_in_time, message = await self.attendance_system.get_today_punch_in_time()
+            success, punch_in_time, message = await self.attendance_system.get_today_punch_in_time_auto()
 
             if not success:
                 await update.message.reply_text(f"❌ 获取上班时间失败：{message}")
@@ -1787,7 +1787,7 @@ class TelegramBot:
 
                 try:
                     # 通过浏览器获取当日上班打卡时间
-                    success, punch_in_time, message = await self.attendance_system.get_today_punch_in_time()
+                    success, punch_in_time, message = await self.attendance_system.get_today_punch_in_time_auto()
 
                     if not success:
                         await query.message.edit_text(f"❌ 获取上班时间失败：{message}")
@@ -3170,7 +3170,7 @@ class TelegramBot:
             logging.info(f"开始执行16:35自动下班任务 - 当前时间: {current_time.strftime('%Y-%m-%d %H:%M:%S')}")
             
             # 获取当日上班打卡时间，检查是否有早上打卡记录
-            success, punch_in_time, message = await self.attendance_system.get_today_punch_in_time()
+            success, punch_in_time, message = await self.attendance_system.get_today_punch_in_time_auto()
             
             if not success:
                 # 没有早上打卡记录，询问用户如何获取上班时间

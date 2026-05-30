@@ -1136,7 +1136,55 @@ class SeleniumLoginController:
             error_msg = f"获取考勤状态时发生错误: {str(e)}"
             await self.send_notification("状态解析", error_msg)
             return {"error": error_msg}
-    
+
+    async def get_today_punch_times_from_page(self, skip_frame_switch: bool = False) -> Dict[str, Optional[str]]:
+        """从页面 DOM 解析今日上班/下班打卡时间（Selenium 版，对应传统模式 OCR get_punch_records_from_page）
+
+        复用 get_attendance_status 抓取的今日状态文本，用与 OCR 版一致的正则提取 HH:MM，
+        统一标准化为 HH:MM:SS 返回，供 attendance_system 在 selenium 模式下回写本地记录。
+
+        Args:
+            skip_frame_switch: 已在 mainFrame 时跳过 frame 切换
+
+        Returns:
+            dict: {'punch_in_time': 'HH:MM:SS'|None, 'punch_out_time': 'HH:MM:SS'|None}
+        """
+        result = {'punch_in_time': None, 'punch_out_time': None}
+        try:
+            status = await self.get_attendance_status(skip_frame_switch=skip_frame_switch)
+            today_text = (status or {}).get('today', '') or ''
+            today_raw = (status or {}).get('today_raw', '') or ''
+
+            import re
+            # 时间必须紧邻"上班/下班"关键字，避免命中 HTML 中无关的带冒号数字
+            patterns = {
+                'punch_in_time': [r'(\d{1,2}[:：]\d{2})\s*上班', r'上班\s*[:：]?\s*(\d{1,2}[:：]\d{2})'],
+                'punch_out_time': [r'(\d{1,2}[:：]\d{2})\s*下班', r'下班\s*[:：]?\s*(\d{1,2}[:：]\d{2})'],
+            }
+            for key, pats in patterns.items():
+                # 优先在清洗后的纯文本匹配，未命中再回退原始 HTML，降低误判
+                for source in (today_text, today_raw):
+                    matched = None
+                    for pat in pats:
+                        m = re.search(pat, source)
+                        if m:
+                            matched = m.group(1).replace('：', ':')
+                            break
+                    if matched:
+                        if matched.count(':') == 1:
+                            matched += ':00'  # 标准化为 HH:MM:SS
+                        result[key] = matched
+                        break
+
+            await self.send_notification(
+                "页面识别",
+                f"页面解析今日打卡: 上班={result['punch_in_time'] or '未识别'} "
+                f"下班={result['punch_out_time'] or '未识别'}"
+            )
+        except Exception as e:
+            self.logger.error(f"Selenium 页面解析今日打卡时间失败: {str(e)}")
+        return result
+
     async def complete_punch_in_flow(self, username: str, password: str) -> Tuple[bool, str, Dict]:
         """
         完整的上班打卡流程

@@ -3412,6 +3412,113 @@ class AttendanceSystem:
             await self.send_notification("时间识别", error_msg)
             return (False, None, error_msg)
 
+    async def get_today_punch_in_time_auto(self):
+        """获取今日上班时间（模式分派包装，新增方法，不改动传统 get_today_punch_in_time）。
+
+        - 传统模式：调用原有 get_today_punch_in_time（PyAutoGUI 登录 + OCR 页面识别），逻辑一字不动。
+        - Selenium 模式：调用 get_today_punch_in_time_via_selenium（WebDriver 登录 + DOM 解析）。
+
+        Returns:
+            tuple: (success: bool, punch_in_time: str|None, message: str)
+        """
+        if self.use_selenium_login:
+            return await self.get_today_punch_in_time_via_selenium()
+        return await self.get_today_punch_in_time()
+
+    async def get_today_punch_in_time_via_selenium(self):
+        """Selenium 版获取今日上班时间（新增方法，复刻传统页面识别能力，不依赖 OCR/PyAutoGUI）。
+
+        步骤：先查本地记录（模式无关）→ 无则用 SeleniumLoginController 登录并从页面 DOM 解析，
+        识别成功后回写记录。替代传统 _login_to_system + get_punch_records_from_page + bot.close_browser，
+        使 selenium（含无头）模式下 /auto_byebye、16:35 自动下班在无本地记录时也能识别页面上班时间。
+
+        Returns:
+            tuple: (success: bool, punch_in_time: str|None, message: str)
+        """
+        # 方法1：从本地记录获取（与传统一致，模式无关）
+        try:
+            today_record = self.punch_record_manager.get_today_record()
+            if today_record and today_record.get('punch_in_time'):
+                punch_in_time = today_record['punch_in_time']
+                return (True, punch_in_time, f"从本地记录获取到上班时间: {punch_in_time}")
+        except Exception as e:
+            logging.warning(f"读取本地上班记录失败: {e}")
+
+        # 方法2：Selenium 登录系统页面识别（DOM 解析）
+        if not self.users or len(self.users) == 0:
+            return (False, None, "未配置用户信息，无法登录系统")
+
+        from modules.selenium_login import SeleniumLoginController
+        user = self.users[0]  # 使用第一个用户
+        username = user.get('username')
+        password = user.get('password')
+        controller = None
+        try:
+            await self.send_notification("时间识别", "Selenium 模式：登录系统页面识别今日上班时间...")
+            controller = SeleniumLoginController(
+                login_url=self.login_url,
+                headless=self.selenium_headless,
+                notification_callback=None,
+                username=username or "default"
+            )
+            # 注册到活跃集合，便于 atexit/signal/cancel 路径统一兜底关闭
+            self._register_controller(controller)
+
+            login_ok, login_msg = await controller.login(username, password)
+            if not login_ok:
+                return (False, None, f"Selenium 登录系统失败，无法识别页面打卡记录: {login_msg}")
+
+            # 登录提交后页面已导航，需经 _switch_to_main_frame 重新切 mainFrame，故 skip_frame_switch=False
+            page_times = await controller.get_today_punch_times_from_page(skip_frame_switch=False)
+            punch_in_time = (page_times or {}).get('punch_in_time')
+            punch_out_time = (page_times or {}).get('punch_out_time')
+
+            if punch_in_time:
+                today_str = datetime.now().strftime('%Y-%m-%d')
+                # 回写记录：与传统 OCR get_punch_records_from_page 对齐——内存分桶 +
+                # 共享 PunchRecordManager（上面"方法1"正是读它，保证后续调用缓存命中、避免重复登录识别）
+                try:
+                    self._set_user_punch_time(
+                        username, 'punch_in_time',
+                        datetime.strptime(punch_in_time, '%H:%M:%S')
+                    )
+                    self.punch_record_manager.update_record(today_str, "上班", punch_in_time)
+                except Exception as set_err:
+                    logging.warning(f"回写上班记录失败: {set_err}")
+                if punch_out_time:
+                    try:
+                        self._set_user_punch_time(
+                            username, 'punch_out_time',
+                            datetime.strptime(punch_out_time, '%H:%M:%S')
+                        )
+                        self.punch_record_manager.update_record(today_str, "下班", punch_out_time)
+                    except Exception as set_err:
+                        logging.warning(f"回写下班记录失败: {set_err}")
+                # 同步写入 Selenium 用户隔离记录（与 _do_selenium_punch 记录系统一致）
+                try:
+                    controller.record_manager.update_punch_record('punch_in', punch_in_time)
+                    if punch_out_time:
+                        controller.record_manager.update_punch_record('punch_out', punch_out_time)
+                except Exception as rec_err:
+                    logging.warning(f"回写 Selenium 月度记录失败: {rec_err}")
+
+                await self.send_notification("时间识别", "页面识别完成，浏览器已关闭")
+                return (True, punch_in_time, f"从系统页面识别到上班时间: {punch_in_time}")
+
+            return (False, None, "系统页面未找到今日上班打卡记录")
+
+        except Exception as e:
+            error_msg = f"Selenium 页面识别上班时间失败: {str(e)}"
+            logging.error(error_msg)
+            return (False, None, error_msg)
+        finally:
+            if controller is not None:
+                try:
+                    controller.close()
+                except Exception as close_err:
+                    logging.warning(f"关闭 Selenium 控制器失败: {close_err}")
+                self._unregister_controller(controller)
+
     def calculate_punch_out_time(self, punch_in_time_str):
         """根据上班时间计算下班时间（8小时15分钟后 + 1-3分钟随机延迟）
 
