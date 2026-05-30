@@ -63,6 +63,8 @@ class TelegramBot:
         self.read_timeout = 20
         self.write_timeout = 20
         self.connect_timeout = 20
+        # Telegram代理：按 config.TELEGRAM_PROXY_PORTS 顺序探测，失败则直连
+        self.proxy_url = config.get_telegram_proxy()
         # 添加设置定时打卡的状态变量
         self.setting_time_state = {}  # 用于存储用户的设置状态
         self.setting_time_timer = {}  # 用于存储设置超时计时器
@@ -77,62 +79,130 @@ class TelegramBot:
         self.daily_reminder_task_set = False  # 防止重复设置每日提醒任务
         self.daily_reminder_lock = asyncio.Lock()  # 防止并发执行每日提醒
 
+    def _build_application(self, proxy_url=None):
+        """构建 Telegram Application；存在可用代理则自动应用到普通请求与 getUpdates 两条通道。
+
+        Args:
+            proxy_url: 显式传入的代理 URL；为 None 时使用 self.proxy_url；传入 ""（空串）强制直连。
+        """
+        effective_proxy = self.proxy_url if proxy_url is None else proxy_url
+        builder = (
+            Application.builder()
+            .token(self.token)
+            .pool_timeout(self.pool_timeout)
+            .connect_timeout(self.connect_timeout)
+            .read_timeout(self.read_timeout)
+            .write_timeout(self.write_timeout)
+            .connection_pool_size(self.connection_pool_size)
+            .get_updates_connection_pool_size(self.connection_pool_size)
+        )
+        if effective_proxy:
+            builder = builder.proxy(effective_proxy).get_updates_proxy(effective_proxy)
+        return builder.build()
+
     async def _ensure_app_initialized(self):
-        """确保Application已正确初始化"""
+        """确保Application已正确初始化
+
+        策略：必须走代理（中国大陆网络无法直连 Telegram）。
+        启动时代理软件常出现"端口监听但 HTTP 隧道尚未就绪"的窗口期，因此对 initialize()
+        失败做有限次重试（每次间隔递增），让代理有时间完成启动后再尝试。
+        """
+        max_init_retries = 4
+        retry_delays = [2, 5, 10]  # 第 1/2/3 次失败后等待的秒数
         async with self._initialization_lock:
             if not self._is_initialized or not self.app:
-                try:
-                    # 如果已有app实例，先清理
-                    if self.app:
-                        try:
-                            await self.app.stop()
-                            await self.app.shutdown()
-                        except Exception as e:
-                            logging.warning(f"清理旧应用实例时发生错误: {e}")
+                last_error = None
 
-                    # 创建新的Application实例
-                    self.app = Application.builder().token(self.token).pool_timeout(self.pool_timeout).connect_timeout(self.connect_timeout).read_timeout(self.read_timeout).write_timeout(self.write_timeout).connection_pool_size(self.connection_pool_size).get_updates_connection_pool_size(self.connection_pool_size).build()
+                for attempt_idx in range(max_init_retries):
+                    # 每次重试前重新探测代理，避免使用一个早已不通的端口
+                    if attempt_idx > 0:
+                        self.proxy_url = config.get_telegram_proxy()
+                    if not self.proxy_url:
+                        last_error = RuntimeError(
+                            f"未探测到可用 Telegram 代理（已尝试端口 {config.TELEGRAM_PROXY_PORTS}），"
+                            f"请确认代理软件已启动"
+                        )
+                        logging.warning(str(last_error))
+                        if attempt_idx < max_init_retries - 1:
+                            delay = retry_delays[min(attempt_idx, len(retry_delays) - 1)]
+                            logging.info(f"{delay} 秒后重试代理探测...")
+                            await asyncio.sleep(delay)
+                            continue
+                        else:
+                            break
 
-                    # 注册处理器
-                    self.app.add_handler(CommandHandler('start', self.start_command))
-                    self.app.add_handler(CommandHandler('punch_in', self.punch_in_command))
-                    self.app.add_handler(CommandHandler('punch_out', self.punch_out_command))
-                    self.app.add_handler(CommandHandler('stop', self.stop_command))
-                    self.app.add_handler(CommandHandler('status', self.status_command))
-                    self.app.add_handler(CommandHandler('errors', self.get_recent_errors))
-                    self.app.add_handler(CommandHandler('kill', self.kill_command))
-                    self.app.add_handler(CommandHandler('set_time', self.settime_command))
-                    self.app.add_handler(CommandHandler('check', self.check_command))
-                    self.app.add_handler(CommandHandler('auto_byebye', self.auto_byebye_command))
-                    self.app.add_handler(CommandHandler('parallel', self.parallel_login_command))
-                    self.app.add_handler(CommandHandler('mode', self.mode_command))
-                    self.app.add_handler(CommandHandler('test_reminder', self.test_reminder_command))
-                    # Selenium完整流程命令
-                    self.app.add_handler(CommandHandler('selenium_complete_punch_in', self.selenium_complete_punch_in_command))
-                    self.app.add_handler(CommandHandler('selenium_complete_punch_out', self.selenium_complete_punch_out_command))
-                    self.app.add_handler(CallbackQueryHandler(self.button_callback))
-                    self.app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self.handle_message))
+                    try:
+                        # 如果已有app实例，先清理
+                        if self.app:
+                            try:
+                                await self.app.stop()
+                                await self.app.shutdown()
+                            except Exception as e:
+                                logging.warning(f"清理旧应用实例时发生错误: {e!r}")
 
-                    # 添加更新时间记录处理器
-                    async def update_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-                        self.last_update_time = datetime.now()
-                        self.connection_error_count = 0  # 重置错误计数
+                        # 创建新的Application实例
+                        self.app = self._build_application(proxy_url=self.proxy_url)
 
-                    self.app.add_handler(MessageHandler(filters.ALL, update_handler))
-                    
-                    # 初始化每日提醒任务
-                    self._setup_daily_reminder()
+                        # 注册处理器
+                        self.app.add_handler(CommandHandler('start', self.start_command))
+                        self.app.add_handler(CommandHandler('punch_in', self.punch_in_command))
+                        self.app.add_handler(CommandHandler('punch_out', self.punch_out_command))
+                        self.app.add_handler(CommandHandler('stop', self.stop_command))
+                        self.app.add_handler(CommandHandler('status', self.status_command))
+                        self.app.add_handler(CommandHandler('errors', self.get_recent_errors))
+                        self.app.add_handler(CommandHandler('kill', self.kill_command))
+                        self.app.add_handler(CommandHandler('set_time', self.settime_command))
+                        self.app.add_handler(CommandHandler('check', self.check_command))
+                        self.app.add_handler(CommandHandler('auto_byebye', self.auto_byebye_command))
+                        self.app.add_handler(CommandHandler('parallel', self.parallel_login_command))
+                        self.app.add_handler(CommandHandler('mode', self.mode_command))
+                        self.app.add_handler(CommandHandler('test_reminder', self.test_reminder_command))
+                        # Selenium完整流程命令
+                        self.app.add_handler(CommandHandler('selenium_complete_punch_in', self.selenium_complete_punch_in_command))
+                        self.app.add_handler(CommandHandler('selenium_complete_punch_out', self.selenium_complete_punch_out_command))
+                        self.app.add_handler(CallbackQueryHandler(self.button_callback))
+                        self.app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self.handle_message))
 
-                    # 初始化应用
-                    await self.app.initialize()
-                    self._is_initialized = True
-                    logging.info("Telegram Bot Application 初始化完成")
+                        # 添加更新时间记录处理器
+                        async def update_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+                            self.last_update_time = datetime.now()
+                            self.connection_error_count = 0  # 重置错误计数
 
-                except Exception as e:
-                    self._is_initialized = False
-                    self.app = None
-                    logging.error(f"初始化Telegram Bot Application失败: {e}")
-                    raise
+                        self.app.add_handler(MessageHandler(filters.ALL, update_handler))
+
+                        # 初始化每日提醒任务
+                        self._setup_daily_reminder()
+
+                        # 初始化应用
+                        await self.app.initialize()
+                        self._is_initialized = True
+                        logging.info(
+                            f"Telegram Bot Application 初始化完成（代理 {self.proxy_url}，"
+                            f"第 {attempt_idx + 1} 次尝试）"
+                        )
+                        return
+
+                    except Exception as e:
+                        last_error = e
+                        self._is_initialized = False
+                        self.app = None
+                        is_last_attempt = (attempt_idx == max_init_retries - 1)
+                        if is_last_attempt:
+                            logging.error(
+                                f"初始化Telegram Bot Application失败（代理 {self.proxy_url}）"
+                                f"，已重试 {max_init_retries} 次: {e!r}",
+                                exc_info=True,
+                            )
+                        else:
+                            delay = retry_delays[min(attempt_idx, len(retry_delays) - 1)]
+                            logging.warning(
+                                f"初始化Telegram Bot Application失败（代理 {self.proxy_url}）: {e!r}"
+                                f"，{delay} 秒后重试（{attempt_idx + 2}/{max_init_retries}）"
+                            )
+                            await asyncio.sleep(delay)
+
+                # 所有尝试都失败
+                raise last_error
 
     async def start_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """处理/start命令"""
@@ -1980,7 +2050,7 @@ class TelegramBot:
         self.attendance_system = attendance_system
 
         # 配置应用程序，添加连接池和超时设置
-        self.app = Application.builder().token(self.token).pool_timeout(self.pool_timeout).connect_timeout(self.connect_timeout).read_timeout(self.read_timeout).write_timeout(self.write_timeout).connection_pool_size(self.connection_pool_size).get_updates_connection_pool_size(self.connection_pool_size).build()
+        self.app = self._build_application()
 
         # 注册命令处理器
         self.app.add_handler(CommandHandler("start", self.start_command))
