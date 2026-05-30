@@ -3,7 +3,7 @@
 # 输出：release/AutoAttendance-Setup-<version>.exe
 # 安装后目录结构：
 #   <Install>\AutoAttendance.exe
-#   <Install>\resources\app.asar                # Electron 应用
+#   <Install>\resources\app\                     # Electron 应用（asar 已关闭，见下方 asar: false）
 #   <Install>\resources\backend\                # Python 后端源码（运行需系统装 Python）
 #
 # 注意：当前为"源码方案"，用户机器必须装 Python 3.10+ 和 pip 依赖。
@@ -50,10 +50,16 @@ extraResources:
       - "!**/logs/**"
       - "!**/release/**"
 
-asar: true
-asarUnpack:
-  - electron/tray-icon.png
-  - electron/tray-icon@2x.png
+# 关闭 asar：electron-builder@26 + Electron 31 在打包末尾为 exe 写入 ASAR 完整性校验
+# (addWinAsarIntegrity → pe-library NtExecutable.generate) 时崩溃：
+#   RangeError: Array buffer allocation failed
+# 关闭后应用以 resources/app/ 文件夹形式打包，功能不变（main.cjs 用 __dirname / process.resourcesPath
+# 定位，不依赖 app.asar）。如需恢复 asar，将下行改回 true 并取消下方 asarUnpack 注释。
+asar: false
+# asar 关闭后 asarUnpack 无意义（文件已是普通目录），保留备查：
+# asarUnpack:
+#   - electron/tray-icon.png
+#   - electron/tray-icon@2x.png
 
 win:
   target:
