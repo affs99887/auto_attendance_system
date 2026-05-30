@@ -6,6 +6,8 @@
 
 import os
 import json
+import socket
+import logging
 from dotenv import load_dotenv
 
 # 加载环境变量
@@ -79,6 +81,15 @@ class Config:
     UPDATE_TIMEOUT = 600  # 10分钟
     MAX_CONNECTION_ERRORS = 10
 
+    # Telegram代理配置（按顺序探测，第一个可连通的端口被采用；都不通则直连）
+    TELEGRAM_PROXY_HOST = os.getenv('TELEGRAM_PROXY_HOST', '127.0.0.1')
+    TELEGRAM_PROXY_PORTS = [
+        int(p.strip()) for p in os.getenv('TELEGRAM_PROXY_PORTS', '7897,7890').split(',')
+        if p.strip().isdigit()
+    ]
+    TELEGRAM_PROXY_SCHEME = os.getenv('TELEGRAM_PROXY_SCHEME', 'http')
+    TELEGRAM_PROXY_PROBE_TIMEOUT = float(os.getenv('TELEGRAM_PROXY_PROBE_TIMEOUT', '1.0'))
+
     # 图像识别配置
     MATCH_THRESHOLD = 0.8
     OCR_CONFIG = '--oem 3 --psm 6 -c tessedit_char_whitelist=0123456789:'
@@ -139,6 +150,25 @@ class Config:
     def get_selenium_headless(cls):
         """是否使用无头模式"""
         return cls.get_selenium_config('SELENIUM_HEADLESS', False)
+
+    @classmethod
+    def get_telegram_proxy(cls):
+        """按顺序探测 TELEGRAM_PROXY_PORTS，返回首个可连通的代理 URL；都不通则返回 None。"""
+        host = cls.TELEGRAM_PROXY_HOST
+        scheme = cls.TELEGRAM_PROXY_SCHEME
+        timeout = cls.TELEGRAM_PROXY_PROBE_TIMEOUT
+        for port in cls.TELEGRAM_PROXY_PORTS:
+            try:
+                with socket.create_connection((host, port), timeout=timeout):
+                    proxy_url = f"{scheme}://{host}:{port}"
+                    logging.info(f"Telegram代理探测成功，使用: {proxy_url}")
+                    return proxy_url
+            except (OSError, socket.timeout):
+                continue
+        logging.warning(
+            f"Telegram代理探测失败（已尝试端口 {cls.TELEGRAM_PROXY_PORTS}），将走直连"
+        )
+        return None
 
     @classmethod
     def get_user_configs(cls):
