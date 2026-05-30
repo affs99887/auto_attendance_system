@@ -97,6 +97,8 @@ class TelegramBot:
             .get_updates_connection_pool_size(self.connection_pool_size)
         )
         if effective_proxy:
+            # 显式 proxy 会覆盖 httpx 的系统环境代理（HTTP(S)_PROXY/ALL_PROXY），
+            # 故启用内置加速时直连本程序自管理端口、不受系统 VPN/代理环境影响。
             builder = builder.proxy(effective_proxy).get_updates_proxy(effective_proxy)
         return builder.build()
 

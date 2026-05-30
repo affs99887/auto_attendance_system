@@ -730,6 +730,176 @@ def _build_flask_app(attendance_system, bridge: AsyncioBridge,
             logging.exception("parallel_login_test failed")
             return jsonify({'success': False, 'error': str(e)}), 500
 
+    # ----- 内置网络加速（mihomo）-----
+    def _pm():
+        return getattr(attendance_system, 'proxy_manager', None)
+
+    @app.get('/api/v1/proxy/config')
+    @require_token
+    def get_proxy_config():
+        pm = _pm()
+        if pm is None:
+            return jsonify({'error': '代理管理未初始化'}), 500
+        try:
+            return jsonify(pm.status())
+        except Exception as e:
+            logging.exception("get_proxy_config failed")
+            return jsonify({'error': str(e)}), 500
+
+    @app.put('/api/v1/proxy/config')
+    @require_token
+    def put_proxy_config():
+        from modules.config import config as cfg
+        pm = _pm()
+        if pm is None:
+            return jsonify({'success': False, 'error': '代理管理未初始化'}), 500
+        body = request.get_json(silent=True) or {}
+        patch = {}
+        for key in ('local_port', 'api_port'):
+            if key in body:
+                try:
+                    patch[key] = int(body[key])
+                except (TypeError, ValueError):
+                    pass
+        toggling = 'enabled' in body
+        if toggling:
+            patch['enabled'] = bool(body['enabled'])
+        note = None
+        try:
+            cfg.set_proxy_config(patch)
+            if toggling and patch['enabled']:
+                ok, msg = pm.start()
+                note = ('内置加速已启动；重启程序后 Telegram 才会切到内置加速。'
+                        if ok else f'启动失败：{msg}')
+            elif toggling and not patch['enabled']:
+                pm.stop()
+                note = '内置加速已停止；重启程序后 Telegram 会回到系统代理/直连。'
+            elif pm.is_running():
+                pm.reload()
+            event_bus.publish_threadsafe('proxy:status', pm.status())
+            return jsonify({'success': True, 'config': pm.status(), 'note': note})
+        except Exception as e:
+            logging.exception("put_proxy_config failed")
+            return jsonify({'success': False, 'error': str(e)}), 500
+
+    @app.post('/api/v1/proxy/subscription')
+    @require_token
+    def set_proxy_subscription():
+        from modules.config import config as cfg
+        pm = _pm()
+        if pm is None:
+            return jsonify({'success': False, 'error': '代理管理未初始化'}), 500
+        body = request.get_json(silent=True) or {}
+        url = (body.get('url') or '').strip()
+        if not url:
+            return jsonify({'success': False, 'error': '订阅 URL 为空'}), 400
+        try:
+            pm.set_subscription(url)
+            node_count = None
+            if cfg.get_proxy_enabled():
+                ok, msg = pm.reload()
+                if not ok:
+                    return jsonify({'success': False, 'error': msg}), 500
+                try:
+                    node_count = len(pm.list_nodes().get('nodes', []))
+                except Exception:
+                    node_count = None
+            event_bus.publish_threadsafe('proxy:status', pm.status())
+            return jsonify({'success': True, 'node_count': node_count, 'config': pm.status()})
+        except Exception as e:
+            logging.exception("set_proxy_subscription failed")
+            return jsonify({'success': False, 'error': str(e)}), 500
+
+    @app.post('/api/v1/proxy/config-text')
+    @require_token
+    def set_proxy_config_text():
+        from modules.config import config as cfg
+        pm = _pm()
+        if pm is None:
+            return jsonify({'success': False, 'error': '代理管理未初始化'}), 500
+        body = request.get_json(silent=True) or {}
+        text = body.get('text') or ''
+        if not text.strip():
+            return jsonify({'success': False, 'error': '配置内容为空'}), 400
+        try:
+            pm.set_config_text(text)
+            node_count = None
+            if cfg.get_proxy_enabled():
+                ok, msg = pm.reload()
+                if not ok:
+                    return jsonify({'success': False, 'error': msg}), 500
+                try:
+                    node_count = len(pm.list_nodes().get('nodes', []))
+                except Exception:
+                    node_count = None
+            event_bus.publish_threadsafe('proxy:status', pm.status())
+            return jsonify({'success': True, 'node_count': node_count, 'config': pm.status()})
+        except Exception as e:
+            logging.exception("set_proxy_config_text failed")
+            return jsonify({'success': False, 'error': str(e)}), 500
+
+    @app.get('/api/v1/proxy/nodes')
+    @require_token
+    def get_proxy_nodes():
+        pm = _pm()
+        if pm is None:
+            return jsonify({'error': '代理管理未初始化'}), 500
+        try:
+            if not pm.is_running():
+                return jsonify({'group': None, 'selected': None, 'nodes': [], 'running': False})
+            data = pm.list_nodes()
+            data['running'] = True
+            return jsonify(data)
+        except Exception as e:
+            logging.exception("get_proxy_nodes failed")
+            return jsonify({'error': str(e)}), 500
+
+    @app.post('/api/v1/proxy/select')
+    @require_token
+    def select_proxy_node():
+        pm = _pm()
+        if pm is None:
+            return jsonify({'success': False, 'error': '代理管理未初始化'}), 500
+        body = request.get_json(silent=True) or {}
+        name = body.get('name') or ''
+        if not name:
+            return jsonify({'success': False, 'error': '节点名为空'}), 400
+        try:
+            ok = pm.select_node(name)
+            return jsonify({'success': bool(ok), 'selected': name})
+        except Exception as e:
+            logging.exception("select_proxy_node failed")
+            return jsonify({'success': False, 'error': str(e)}), 500
+
+    @app.post('/api/v1/proxy/test-delay')
+    @require_token
+    def test_proxy_delay():
+        pm = _pm()
+        if pm is None:
+            return jsonify({'success': False, 'error': '代理管理未初始化'}), 500
+        body = request.get_json(silent=True) or {}
+        name = body.get('name') or ''
+        if not name:
+            return jsonify({'success': False, 'error': '节点名为空'}), 400
+        try:
+            delay = pm.test_delay(name)
+            return jsonify({'success': delay is not None, 'name': name, 'delay': delay})
+        except Exception as e:
+            logging.exception("test_proxy_delay failed")
+            return jsonify({'success': False, 'error': str(e)}), 500
+
+    @app.get('/api/v1/proxy/traffic')
+    @require_token
+    def get_proxy_traffic():
+        pm = _pm()
+        if pm is None or not pm.is_running():
+            return jsonify({'up': 0, 'down': 0, 'up_total': 0, 'down_total': 0})
+        try:
+            return jsonify(pm.get_traffic())
+        except Exception as e:
+            logging.exception("get_proxy_traffic failed")
+            return jsonify({'error': str(e)}), 500
+
     return app
 
 

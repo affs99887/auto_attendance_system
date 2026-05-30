@@ -57,5 +57,9 @@ screenshots/
 scheduled_tasks.json
 dynamic_config.json
 
+# 内置网络加速：二进制随安装包打包（由 scripts/fetch-mihomo.ps1 准备，不入库）
+bin/
+proxy_runtime/
+
 # ai
 .claude

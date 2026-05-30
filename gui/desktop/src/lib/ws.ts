@@ -26,6 +26,8 @@ class WsClient {
 
   start() {
     this.stopped = false;
+    // 幂等：已在连接/已连接则不重复发起（防 StrictMode 双跑、重复 start）
+    if (this.ws && (this.status === 'connecting' || this.status === 'open')) return;
     this.connect();
   }
 
@@ -79,6 +81,11 @@ class WsClient {
       // 没 token 等同未配置，跳过；用户手动设置后调 start()
       this.setStatus('idle');
       return;
+    }
+    // 新建前关掉残留连接，防句柄泄漏（换 token / StrictMode 双跑）
+    if (this.ws) {
+      try { this.ws.close(); } catch { /* noop */ }
+      this.ws = null;
     }
     this.setStatus('connecting');
     const url = `${wsUrl}/?token=${encodeURIComponent(token)}`;

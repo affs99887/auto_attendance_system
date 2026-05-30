@@ -40,6 +40,7 @@ extraResources:
       - .env.example
       - modules/**/*
       - templates/**/*
+      - bin/**/*            # 内置网络加速：mihomo 内核 + geo 数据（由 scripts/fetch-mihomo.ps1 准备）
       - "!**/__pycache__/**"
       - "!**/*.pyc"
       - "!**/venv/**"

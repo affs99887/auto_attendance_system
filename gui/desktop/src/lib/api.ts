@@ -241,6 +241,68 @@ export const api = {
     request<{ success: boolean; message?: string; error?: string }>('/api/v1/test/reminder', {
       method: 'POST',
     }),
+
+  // ===== 内置网络加速（mihomo）=====
+  getProxyConfig: () => request<ProxyStatus>('/api/v1/proxy/config'),
+
+  setProxyConfig: (patch: { enabled?: boolean; local_port?: number; api_port?: number }) =>
+    request<{ success: boolean; config: ProxyStatus; note?: string | null; error?: string }>(
+      '/api/v1/proxy/config',
+      { method: 'PUT', body: patch },
+    ),
+
+  setProxySubscription: (url: string) =>
+    request<{ success: boolean; node_count?: number | null; config?: ProxyStatus; error?: string }>(
+      '/api/v1/proxy/subscription',
+      { method: 'POST', body: { url } },
+    ),
+
+  setProxyConfigText: (text: string) =>
+    request<{ success: boolean; node_count?: number | null; config?: ProxyStatus; error?: string }>(
+      '/api/v1/proxy/config-text',
+      { method: 'POST', body: { text } },
+    ),
+
+  listProxyNodes: () =>
+    request<{ group: string | null; selected: string | null; nodes: ProxyNode[]; running: boolean }>(
+      '/api/v1/proxy/nodes',
+    ),
+
+  selectProxyNode: (name: string) =>
+    request<{ success: boolean; selected: string; error?: string }>('/api/v1/proxy/select', {
+      method: 'POST',
+      body: { name },
+    }),
+
+  testProxyDelay: (name: string) =>
+    request<{ success: boolean; name: string; delay: number | null; error?: string }>(
+      '/api/v1/proxy/test-delay',
+      { method: 'POST', body: { name } },
+    ),
+
+  getProxyTraffic: () =>
+    request<{ up: number; down: number; up_total: number; down_total: number }>(
+      '/api/v1/proxy/traffic',
+    ),
 };
+
+export interface ProxyNode {
+  name: string;
+  type: string;
+  delay: number | null;
+}
+
+export interface ProxyStatus {
+  enabled: boolean;
+  running: boolean;
+  binary_available: boolean;
+  source: 'subscription' | 'config';
+  local_port: number;
+  api_port: number;
+  group: string | null;
+  selected_node: string | null;
+  subscription_url: string;
+  has_config_text: boolean;
+}
 
 export type Api = typeof api;

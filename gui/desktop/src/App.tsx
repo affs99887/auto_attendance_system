@@ -10,9 +10,12 @@ import { ShotsScreen } from './screens/Shots';
 import { TasksScreen } from './screens/Tasks';
 import { LogsScreen } from './screens/Logs';
 import { SettingsScreen } from './screens/Settings';
+import { ProxyScreen } from './screens/Proxy';
 import { AboutScreen } from './screens/About';
 import { ProgressDrawer } from './components/ProgressDrawer';
 import { LegacyModeOverlay } from './components/LegacyModeOverlay';
+import { StartupOverlay } from './components/StartupOverlay';
+import { ToastHost } from './components/ToastHost';
 
 type ScreenComponent = React.ComponentType;
 
@@ -24,6 +27,7 @@ const SCREENS: Record<ScreenId, ScreenComponent> = {
   tasks: TasksScreen,
   logs: LogsScreen,
   settings: SettingsScreen,
+  proxy: ProxyScreen,
   about: AboutScreen,
 };
 
@@ -75,6 +79,7 @@ const NAV: NavEntry[] = [
   { id: 'tasks', label: '定时任务', icon: 'Tasks', group: 'main', badge: '4' },
   { id: 'logs', label: '系统日志', icon: 'Logs', group: 'main' },
   { id: 'settings', label: '系统设置', icon: 'Settings', group: 'config' },
+  { id: 'proxy', label: '网络加速', icon: 'Globe', group: 'config' },
   { id: 'about', label: '关于 & 命令', icon: 'Info', group: 'config' },
 ];
 
@@ -86,6 +91,7 @@ const SCREEN_SUB: Record<ScreenId, string> = {
   tasks: '查看与终止 schedule 计划任务',
   logs: '实时日志、过滤错误与导出',
   settings: '环境变量、动态配置与多账户设置',
+  proxy: '内置网络加速（仅代理本程序）· 订阅 / 节点 / 延迟',
   about: 'Telegram 命令、系统组件与版本信息',
 };
 
@@ -267,6 +273,8 @@ export function App() {
         </div>
         <ProgressDrawer />
         <LegacyModeOverlay />
+        <StartupOverlay />
+        <ToastHost />
       </div>
     </AppCtx.Provider>
   );

@@ -1,7 +1,7 @@
 // Electron 主进程
 // - spawn `python main.py --gui` 作为后端（windowsHide，无控制台窗口）
-// - 等待 logs/.gui_token 文件出现
-// - 读 token，创建 BrowserWindow + preload 注入到 window.AAS_BACKEND
+// - 窗口与后端【并行】启动：窗口立刻创建显示，不再等 token
+// - 后端就绪后（写出 logs/.gui_token）由主进程经 IPC 把 token 异步推给渲染进程
 // - dev 模式加载 Vite dev server，prod 模式加载 dist/
 // - 单实例锁 + 托盘菜单 + 关窗口缩到托盘
 //
@@ -37,20 +37,40 @@ const RESTART_MAX = 5;
 let restartHistory = [];
 
 // ============================================================================
-// 单实例锁 — 第二次启动唤起已有窗口
+// 后端启动状态（推给渲染进程的 backend:status）
+//  - latestStatus: 最近一次状态，供 backend:get-status 拉取 + did-finish-load 补推
+//  - readyGen:     代际计数，每次（重）spawn 自增，作废旧的 waitForToken 结果
 // ============================================================================
-const gotLock = app.requestSingleInstanceLock();
-if (!gotLock) {
-  app.quit();
-  process.exit(0);
-} else {
-  app.on('second-instance', () => {
-    if (mainWindow) {
-      if (mainWindow.isMinimized()) mainWindow.restore();
-      if (!mainWindow.isVisible()) mainWindow.show();
-      mainWindow.focus();
-    }
-  });
+let latestStatus = { state: 'starting', reason: null };
+let readyGen = 0;
+
+function pushStatus(payload) {
+  latestStatus = payload;
+  if (mainWindow && !mainWindow.isDestroyed() && !appQuitting) {
+    try { mainWindow.webContents.send('backend:status', payload); } catch { /* ignore */ }
+  }
+}
+
+// 每次 spawn 后重新 arm：等 token → 推给渲染进程；超时/失败 → 推 failed
+function armReadiness() {
+  const gen = ++readyGen;
+  pushStatus({ state: 'starting', reason: null });
+  waitForToken(120_000)
+    .then(token => {
+      if (gen !== readyGen) return; // 已有更新的 spawn，丢弃过期 token
+      console.info('[aas-electron] token ready, notifying renderer');
+      pushStatus({
+        state: 'token',
+        token,
+        httpUrl: `http://127.0.0.1:${HTTP_PORT}`,
+        wsUrl: `ws://127.0.0.1:${WS_PORT}`,
+      });
+    })
+    .catch(err => {
+      if (gen !== readyGen) return;
+      console.error('[aas-electron] token wait failed:', err.message);
+      pushStatus({ state: 'failed', reason: `后端启动超时：${err.message}（端口可能被占用，请查看日志）` });
+    });
 }
 
 // ============================================================================
@@ -61,6 +81,7 @@ function spawnPython() {
   const mainPy = path.join(PROJECT_ROOT, 'main.py');
   if (!fs.existsSync(mainPy)) {
     console.error('[aas-electron] main.py not found:', mainPy);
+    pushStatus({ state: 'failed', reason: `未找到 main.py：${mainPy}` });
     return;
   }
   // 启动前清掉过期 token 文件，避免读到老 token
@@ -79,6 +100,16 @@ function spawnPython() {
   // python 的 stdout/stderr 转发到 Electron 控制台便于调试（不再有独立窗口）
   pythonProc.stdout?.on('data', d => process.stdout.write(`[py] ${d}`));
   pythonProc.stderr?.on('data', d => process.stderr.write(`[py] ${d}`));
+
+  // spawn 失败（python 不在 PATH / 无法执行）只触发 'error' 不触发 'exit'——首装最高频故障
+  pythonProc.on('error', err => {
+    console.error('[aas-electron] python spawn error:', err.message);
+    pushStatus({
+      state: 'failed',
+      reason: `无法启动 Python（${err.message}）。请确认已安装 Python 并加入 PATH。`,
+    });
+  });
+
   pythonProc.on('exit', (code, signal) => {
     console.warn(`[aas-electron] python exited code=${code} signal=${signal}`);
     pythonProc = null;
@@ -89,6 +120,7 @@ function spawnPython() {
     restartHistory = restartHistory.filter(t => now - t < RESTART_WINDOW_MS);
     if (restartHistory.length >= RESTART_MAX) {
       console.error(`[aas-electron] 重启过频（最近 1 小时已 ${restartHistory.length} 次），停止自动重启`);
+      pushStatus({ state: 'failed', reason: `Python 后端反复崩溃（1 小时内 ${restartHistory.length} 次），已停止自动重启。请查看日志。` });
       if (mainWindow) {
         dialog.showErrorBox(
           'Python 后端反复崩溃',
@@ -101,6 +133,9 @@ function spawnPython() {
     console.info(`[aas-electron] 2 秒后自动重启 Python (第 ${restartHistory.length}/${RESTART_MAX} 次)`);
     setTimeout(() => { if (!appQuitting) spawnPython(); }, 2000);
   });
+
+  // 拉起后开始侦测就绪（重启也会重新 arm，旧代际自动作废）
+  armReadiness();
 }
 
 // ============================================================================
@@ -130,7 +165,7 @@ function killPython() {
   if (!pythonProc) return;
   try {
     if (process.platform === 'win32') {
-      // Windows: 用 taskkill /T 杀进程树
+      // Windows: 用 taskkill /T 杀进程树（连带 python 拉起的 mihomo 子进程一起回收）
       spawn('taskkill', ['/pid', String(pythonProc.pid), '/T', '/F']);
     } else {
       pythonProc.kill('SIGTERM');
@@ -157,18 +192,9 @@ async function waitForToken(timeoutMs = 60_000) {
 }
 
 // ============================================================================
-// 创建主窗口
+// 创建主窗口（不再等 token —— 立刻显示，token 经 IPC 后到）
 // ============================================================================
 async function createWindow() {
-  let token = '';
-  try {
-    token = await waitForToken(60_000);
-    console.info('[aas-electron] token ready, preparing window');
-  } catch (e) {
-    console.error('[aas-electron] token wait failed:', e.message);
-    // 继续创建窗口，让前端在"未连接"状态下显示，用户可看到错误
-  }
-
   const win = new BrowserWindow({
     width: 1480,
     height: 920,
@@ -185,8 +211,9 @@ async function createWindow() {
       contextIsolation: true,
       nodeIntegration: false,
       sandbox: true,
+      // token 不再随窗口创建注入（窗口先于后端就绪），仅保留 http/ws 默认值；
+      // token 由 backend:status('token') 异步推送
       additionalArguments: [
-        `--aas-token=${token}`,
         `--aas-http=http://127.0.0.1:${HTTP_PORT}`,
         `--aas-ws=ws://127.0.0.1:${WS_PORT}`,
       ],
@@ -196,6 +223,9 @@ async function createWindow() {
   mainWindow = win;
 
   win.once('ready-to-show', () => win.show());
+
+  // 渲染进程加载完成后补推一次最近状态（解决 push 早于渲染进程注册监听的竞态；HMR/重载也安全幂等）
+  win.webContents.on('did-finish-load', () => pushStatus(latestStatus));
 
   win.on('close', e => {
     if (!appQuitting) {
@@ -244,9 +274,6 @@ function createTray() {
 }
 
 // ============================================================================
-// 生命周期
-// ============================================================================
-// ============================================================================
 // 窗口控制 IPC（自绘标题栏的三个按钮）
 // ============================================================================
 ipcMain.on('window:minimize', () => {
@@ -263,6 +290,20 @@ ipcMain.on('window:close', () => {
 });
 ipcMain.handle('window:is-maximized', () => mainWindow?.isMaximized() ?? false);
 
+// ============================================================================
+// 后端状态拉取 + 打开日志（供"系统启动中"覆盖层使用）
+// ============================================================================
+ipcMain.handle('backend:get-status', () => latestStatus);
+
+ipcMain.handle('system:open-logs', () => {
+  const dir = path.join(PROJECT_ROOT, 'logs');
+  try { fs.mkdirSync(dir, { recursive: true }); } catch { /* ignore */ }
+  return shell.openPath(dir); // 返回空串=成功，非空=错误信息
+});
+
+// ============================================================================
+// 生命周期
+// ============================================================================
 app.on('ready', async () => {
   if (checkWatchdogRunning()) {
     const choice = dialog.showMessageBoxSync({
@@ -281,6 +322,7 @@ app.on('ready', async () => {
       return;
     }
   }
+  // 窗口与后端并行：先拉起后端，再立刻建窗口（窗口不等 token）
   spawnPython();
   await createWindow();
   createTray();

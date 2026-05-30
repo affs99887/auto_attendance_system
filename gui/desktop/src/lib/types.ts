@@ -75,4 +75,5 @@ export type ScreenId =
   | 'tasks'
   | 'logs'
   | 'settings'
+  | 'proxy'
   | 'about';

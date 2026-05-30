@@ -176,8 +176,17 @@ def print_completion():
     print("\033[32m" + completion_art + "\033[0m")
 
 
-async def initialize_system():
-    """初始化系统，带进度显示"""
+async def initialize_system(fast_boot=False):
+    """初始化系统，带进度显示
+
+    fast_boot=True（GUI 模式）时跳过纯装饰性的进度 sleep，加快后端就绪——
+    真实初始化步骤一律保留。控制台/watchdog 模式 fast_boot=False，行为不变。
+    """
+    async def _tick(seconds):
+        # 装饰性等待：仅为让（GUI 下隐藏的）进度条好看；fast_boot 直接跳过
+        if not fast_boot:
+            await asyncio.sleep(seconds)
+
     total_steps = 10
     current_step = 0
     
@@ -214,42 +223,56 @@ async def initialize_system():
         
         try:
             if current_step == 1:  # 初始化配置模块
-                await asyncio.sleep(0.3)  # 显示进度
+                await _tick(0.3)  # 显示进度
                 config.ensure_directories()
-                await asyncio.sleep(0.5)
+                await _tick(0.5)
             elif current_step == 2:  # 创建打卡系统实例
-                await asyncio.sleep(0.3)  # 显示进度
+                await _tick(0.3)  # 显示进度
+                # 先拉起内置网络加速（mihomo），使随后构建的 bot 能解析到本地代理端口。
+                # 与 GUI/控制台/watchdog 无关——所有模式下均按配置启用。
+                from modules.proxy_manager import ProxyManager
+                _proxy_manager = ProxyManager()
+                if config.get_proxy_enabled():
+                    try:
+                        _ok, _msg = await asyncio.to_thread(_proxy_manager.start)
+                        if _ok:
+                            logging.info(f"内置网络加速已启动: {_msg}")
+                        else:
+                            logging.warning(f"内置网络加速未启动（回退直连/系统代理）: {_msg}")
+                    except Exception:
+                        logging.error("内置网络加速启动异常（回退）", exc_info=True)
                 attendance_system = AttendanceSystem()
-                await asyncio.sleep(0.4)
+                attendance_system.proxy_manager = _proxy_manager
+                await _tick(0.4)
             elif current_step == 3:  # 初始化核心系统组件
-                await asyncio.sleep(0.6)
+                await _tick(0.6)
             elif current_step == 4:  # 加载用户配置和系统参数
-                await asyncio.sleep(0.5)
+                await _tick(0.5)
             elif current_step == 5:  # 初始化Telegram机器人
-                await asyncio.sleep(0.3)  # 显示进度
+                await _tick(0.3)  # 显示进度
                 await attendance_system.bot._ensure_app_initialized()
                 if not attendance_system.bot.app:
                     raise Exception("Telegram Bot 初始化失败")
-                await asyncio.sleep(0.4)
+                await _tick(0.4)
             elif current_step == 6:  # 连接Telegram API服务
-                await asyncio.sleep(0.7)
+                await _tick(0.7)
             elif current_step == 7:  # 验证SMTP服务器连接
-                await asyncio.sleep(0.3)  # 显示进度
+                await _tick(0.3)  # 显示进度
                 await attendance_system.check_email_connection()
-                await asyncio.sleep(0.4)
+                await _tick(0.4)
             elif current_step == 8:  # 启动定时任务调度器
-                await asyncio.sleep(0.3)  # 显示进度
+                await _tick(0.3)  # 显示进度
                 schedule_task = asyncio.create_task(run_schedule())
-                await asyncio.sleep(0.5)
+                await _tick(0.5)
             elif current_step == 9:  # 启动机器人应用
-                await asyncio.sleep(0.3)  # 显示进度
+                await _tick(0.3)  # 显示进度
                 await attendance_system.bot.app.start()
-                await asyncio.sleep(0.4)
+                await _tick(0.4)
             elif current_step == 10:  # 启动连接监控
-                await asyncio.sleep(0.3)  # 显示进度
+                await _tick(0.3)  # 显示进度
                 await attendance_system.bot.start_polling()
                 monitor_task = asyncio.create_task(attendance_system.bot.monitor_connection())
-                await asyncio.sleep(0.3)
+                await _tick(0.3)
         
         except Exception as e:
             # 显示错误状态
@@ -304,11 +327,12 @@ async def main(args=None):
         # 显示欢迎界面
         print_welcome()
 
-        # 等待一秒让用户看到欢迎界面
-        await asyncio.sleep(1)
+        # 等待一秒让用户看到欢迎界面（GUI 模式跳过，加快窗口连上后端）
+        if not args.gui:
+            await asyncio.sleep(1)
 
-        # 初始化系统
-        attendance_system, schedule_task, monitor_task = await initialize_system()
+        # 初始化系统（GUI 模式 fast_boot：跳过装饰 sleep）
+        attendance_system, schedule_task, monitor_task = await initialize_system(fast_boot=args.gui)
 
         # 设置全局变量，供调度器使用
         attendance_system_global = attendance_system
@@ -361,6 +385,13 @@ async def main(args=None):
             if attendance_system.bot.app:
                 await attendance_system.bot.app.stop()
                 await attendance_system.bot.app.shutdown()
+            # 停止内置网络加速子进程
+            _pm = getattr(attendance_system, 'proxy_manager', None)
+            if _pm is not None:
+                try:
+                    _pm.stop()
+                except Exception:
+                    logging.exception("停止内置网络加速失败")
             print("[OK] 系统已安全关闭")
                 
     except Exception as e:

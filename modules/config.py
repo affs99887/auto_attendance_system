@@ -7,6 +7,7 @@
 import os
 import json
 import socket
+import secrets
 import logging
 from dotenv import load_dotenv
 
@@ -151,9 +152,86 @@ class Config:
         """是否使用无头模式"""
         return cls.get_selenium_config('SELENIUM_HEADLESS', False)
 
+    # ========================================================================
+    # 内置网络加速（mihomo）配置 —— 存于 dynamic_config.json 的 PROXY 子对象
+    # 设计：专属私有回环端口（避开系统 Clash 默认 7890/7897），仅代理本程序，
+    # 与系统 VPN/代理状态解耦。
+    # ========================================================================
+    PROXY_DEFAULTS = {
+        'enabled': False,
+        'local_port': 7899,          # mixed-port（http+socks5），本程序 Telegram 走这里
+        'api_port': 9899,            # mihomo external-controller（本地 RESTful API）
+        'secret': '',                # external-controller 鉴权（首次随机生成并持久化）
+        'source': 'subscription',    # 'subscription' | 'config'
+        'subscription_url': '',
+        'selected_node': '',
+        'group': 'AAS-Proxy',        # select 分组名（供 GUI 切换节点）
+    }
+
+    @classmethod
+    def get_proxy_config(cls):
+        """获取内置加速配置（补默认值；secret 缺失则生成并持久化）。"""
+        dynamic = cls._load_dynamic_config()
+        cfg = dict(cls.PROXY_DEFAULTS)
+        stored = dynamic.get('PROXY')
+        if isinstance(stored, dict):
+            cfg.update(stored)
+        if not cfg.get('secret'):
+            cfg['secret'] = secrets.token_hex(16)
+            cls.set_proxy_config({'secret': cfg['secret']})
+        return cfg
+
+    @classmethod
+    def set_proxy_config(cls, patch):
+        """合并更新 PROXY 子对象并持久化，返回最新配置。"""
+        if not isinstance(patch, dict):
+            return cls.get_proxy_config()
+        dynamic = cls._load_dynamic_config()
+        cur = dynamic.get('PROXY')
+        if not isinstance(cur, dict):
+            cur = {}
+        cur.update(patch)
+        dynamic['PROXY'] = cur
+        cls._save_dynamic_config()
+        return cls.get_proxy_config()
+
+    @classmethod
+    def get_proxy_enabled(cls):
+        return bool(cls.get_proxy_config().get('enabled', False))
+
+    @classmethod
+    def get_proxy_local_port(cls):
+        try:
+            return int(cls.get_proxy_config().get('local_port', 7899))
+        except (TypeError, ValueError):
+            return 7899
+
+    @classmethod
+    def get_proxy_api_port(cls):
+        try:
+            return int(cls.get_proxy_config().get('api_port', 9899))
+        except (TypeError, ValueError):
+            return 9899
+
     @classmethod
     def get_telegram_proxy(cls):
-        """按顺序探测 TELEGRAM_PROXY_PORTS，返回首个可连通的代理 URL；都不通则返回 None。"""
+        """返回 Telegram 使用的代理 URL。
+
+        - 启用内置加速：直连本程序自管理的 mihomo 本地端口（确定性，与系统 VPN/代理无关）。
+        - 未启用：按顺序探测 TELEGRAM_PROXY_PORTS（系统 Clash 等），返回首个可连通的；都不通则 None。
+        """
+        if cls.get_proxy_enabled():
+            port = cls.get_proxy_local_port()
+            try:
+                with socket.create_connection(('127.0.0.1', port), timeout=1.0):
+                    url = f"http://127.0.0.1:{port}"
+                    logging.info(f"使用内置网络加速代理: {url}")
+                    return url
+            except (OSError, socket.timeout):
+                logging.warning(
+                    f"内置加速端口 127.0.0.1:{port} 未就绪，回退系统代理探测"
+                )
+                # 落到下方系统端口探测
         host = cls.TELEGRAM_PROXY_HOST
         scheme = cls.TELEGRAM_PROXY_SCHEME
         timeout = cls.TELEGRAM_PROXY_PROBE_TIMEOUT
