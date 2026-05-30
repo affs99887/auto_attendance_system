@@ -1,0 +1,16 @@
+{
+  "name": "auto-attendance-system-root",
+  "version": "0.0.0",
+  "private": true,
+  "description": "项目根便捷脚本：无需先 cd gui/desktop，直接在根目录运行 GUI 的构建/打包命令（转发到 gui/desktop）。electron-builder 仍在 gui/desktop 下执行（其配置与 node_modules 都在那里）。",
+  "scripts": {
+    "build": "cd gui/desktop && npm run build",
+    "dev": "cd gui/desktop && npm run dev",
+    "preview": "cd gui/desktop && npm run preview",
+    "electron": "cd gui/desktop && npm run electron",
+    "electron:dev": "cd gui/desktop && npm run electron:dev",
+    "start": "cd gui/desktop && npm run start",
+    "dist:dir": "cd gui/desktop && npm run dist:dir",
+    "dist:exe": "cd gui/desktop && npm run dist:exe"
+  }
+}
