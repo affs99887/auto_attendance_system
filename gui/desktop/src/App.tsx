@@ -1,7 +1,7 @@
 // 应用主壳 — 设计稿 app.jsx 的 TS 平移：TitleBar + Sidebar + Toolbar + 路由。
 import * as React from 'react';
 import { Icon, type IconName } from './lib/icons';
-import { USERS, TODAY } from './lib/data';
+import { USERS } from './lib/data';
 import type { OpState, ScreenId, SysStatus } from './lib/types';
 import { DashboardScreen } from './screens/Dashboard';
 import { PunchScreen } from './screens/Punch';
@@ -55,9 +55,9 @@ export const useApp = (): AppContextValue => {
 };
 
 function useClock(): Date {
-  const [now, setNow] = React.useState(() => new Date(`${TODAY}T08:45:32`));
+  const [now, setNow] = React.useState(() => new Date());
   React.useEffect(() => {
-    const id = setInterval(() => setNow(prev => new Date(prev.getTime() + 1000)), 1000);
+    const id = setInterval(() => setNow(new Date()), 1000);
     return () => clearInterval(id);
   }, []);
   return now;
