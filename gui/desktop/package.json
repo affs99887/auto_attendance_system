@@ -12,8 +12,8 @@
     "electron": "electron .",
     "electron:dev": "cross-env AAS_DEV=1 electron .",
     "start": "npm run build && electron .",
-    "dist:exe": "npm run build && electron-builder --win --x64",
-    "dist:dir": "npm run build && electron-builder --dir"
+    "dist:exe": "npm run build && cross-env ELECTRON_BUILDER_BINARIES_MIRROR=https://registry.npmmirror.com/-/binary/electron-builder-binaries/ ELECTRON_MIRROR=https://registry.npmmirror.com/-/binary/electron/ electron-builder --win --x64",
+    "dist:dir": "npm run build && cross-env ELECTRON_BUILDER_BINARIES_MIRROR=https://registry.npmmirror.com/-/binary/electron-builder-binaries/ ELECTRON_MIRROR=https://registry.npmmirror.com/-/binary/electron/ electron-builder --dir"
   },
   "dependencies": {
     "@types/react-window": "^1.8.8",
