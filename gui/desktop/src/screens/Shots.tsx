@@ -113,6 +113,8 @@ export function ShotsScreen() {
   const [items, setItems] = React.useState<ScreenshotItem[] | null>(null);
   const [loading, setLoading] = React.useState(false);
   const [error, setError] = React.useState<string | null>(null);
+  // 「存储概览」真实数据：键 `${user}|${kind}` → {张数, 最新时间}
+  const [overview, setOverview] = React.useState<Record<string, { cnt: number; latest: string | null }>>({});
 
   const refresh = React.useCallback(() => {
     let cancelled = false;
@@ -136,6 +138,25 @@ export function ShotsScreen() {
   }, [user, kind]);
 
   React.useEffect(() => refresh(), [refresh]);
+
+  // 拉「存储概览」：两类各取一次 grouped（不带 username → 后端按用户分组），
+  // 从中得到每个用户每类型的张数与最新时间。
+  const loadOverview = React.useCallback(() => {
+    const next: Record<string, { cnt: number; latest: string | null }> = {};
+    void Promise.all((['punch_in', 'punch_out'] as const).map(t =>
+      api.listScreenshots({ type: t, limit: 20 })
+        .then(r => {
+          const grouped = ('grouped' in r) ? r.grouped : {};
+          for (const u of USERS) {
+            const list = grouped[u.id] ?? [];
+            next[`${u.id}|${t}`] = { cnt: list.length, latest: list[0]?.time_str ?? null };
+          }
+        })
+        .catch(() => { /* 该类型拉取失败时保持缺省（0 张 / —） */ }),
+    )).then(() => setOverview(next));
+  }, []);
+
+  React.useEffect(() => loadOverview(), [loadOverview]);
 
   const apiSamples = items ?? [];
   // 兜底：API 空时显示三个占位
@@ -188,7 +209,7 @@ export function ShotsScreen() {
           </div>
         </div>
         <div className="row gap-2">
-          <button className="btn" onClick={() => refresh()} disabled={loading}>
+          <button className="btn" onClick={() => { refresh(); loadOverview(); }} disabled={loading}>
             <Icon.Refresh size={12} />{loading ? '加载中…' : '重新加载'}
           </button>
           {items ? (
@@ -272,10 +293,13 @@ export function ShotsScreen() {
           <div className="card-title">存储概览</div>
         </div>
         <div className="card-body compact">
-          {USERS.flatMap(u => [
-            { user: u.id, color: u.color, short: u.short, kind: 'punch_in', cnt: 3, latest: '2026-05-19 08:29' },
-            { user: u.id, color: u.color, short: u.short, kind: 'punch_out', cnt: 3, latest: '2026-05-18 17:03' },
-          ]).map((row, i, arr) => (
+          {USERS.flatMap(u => (['punch_in', 'punch_out'] as const).map(kindKey => {
+            const o = overview[`${u.id}|${kindKey}`];
+            return {
+              user: u.id, color: u.color, short: u.short, kind: kindKey,
+              cnt: o?.cnt ?? 0, latest: o?.latest ?? null,
+            };
+          })).map((row, i, arr) => (
             <div
               key={i}
               className="row spread"
@@ -303,7 +327,7 @@ export function ShotsScreen() {
                   className="mono"
                   style={{ fontSize: 11, color: 'var(--text-muted)', minWidth: 130, textAlign: 'right' }}
                 >
-                  最近 {row.latest}
+                  {row.latest ? `最近 ${row.latest}` : '暂无'}
                 </span>
               </div>
             </div>

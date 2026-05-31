@@ -20,7 +20,12 @@ const { spawn, execFileSync } = require('node:child_process');
 const PROJECT_ROOT = app.isPackaged
   ? path.join(process.resourcesPath, 'backend')
   : path.resolve(__dirname, '..', '..', '..');
-const TOKEN_PATH = path.join(PROJECT_ROOT, 'logs', '.gui_token');
+// 后端可写数据根：dev=项目根；打包=用户指定的现有数据目录（含真实记录/截图/配置）。
+// 可用环境变量 AAS_DATA_DIR 覆盖，便于将来切到 %APPDATA% 等。
+const LEGACY_DATA_DIR = 'C:\\auto_attendance_system';
+const DATA_DIR = process.env.AAS_DATA_DIR
+  || (app.isPackaged ? LEGACY_DATA_DIR : PROJECT_ROOT);
+const TOKEN_PATH = path.join(DATA_DIR, 'logs', '.gui_token');
 const DEV_SERVER_URL = process.env.AAS_DEV_SERVER || 'http://127.0.0.1:5173';
 const HTTP_PORT = parseInt(process.env.AAS_HTTP_PORT || '8765', 10);
 const WS_PORT = parseInt(process.env.AAS_WS_PORT || '8766', 10);
@@ -88,9 +93,11 @@ function spawnPython() {
   try { fs.unlinkSync(TOKEN_PATH); } catch { /* ignore */ }
 
   const pyCmd = process.env.AAS_PYTHON || (process.platform === 'win32' ? 'python' : 'python3');
-  console.info('[aas-electron] spawning:', pyCmd, 'main.py --gui');
-  pythonProc = spawn(pyCmd, ['main.py', '--gui'], {
-    cwd: PROJECT_ROOT,
+  console.info('[aas-electron] spawning:', pyCmd, mainPy, '--gui', '(cwd:', DATA_DIR + ')');
+  // 用绝对脚本路径运行打包内 main.py（sys.path[0]=resources/backend → 导入打包副本的 modules），
+  // 但 cwd 指向数据根 DATA_DIR，使后端所有相对路径（punch_records/screenshots/logs/.env 等）命中真实数据。
+  pythonProc = spawn(pyCmd, [mainPy, '--gui'], {
+    cwd: DATA_DIR,
     // 不用 'inherit'：Electron 主进程无 console，inherit 会让 python 自己开一个控制台窗口
     stdio: ['ignore', 'pipe', 'pipe'],
     // windowsHide → CREATE_NO_WINDOW，python.exe 不弹黑窗
@@ -264,8 +271,8 @@ function createTray() {
   const menu = Menu.buildFromTemplate([
     { label: '显示主窗口', click: () => { if (mainWindow) { mainWindow.show(); mainWindow.focus(); } } },
     { type: 'separator' },
-    { label: '打开日志目录', click: () => shell.openPath(path.join(PROJECT_ROOT, 'logs')) },
-    { label: '打开 punch_records', click: () => shell.openPath(path.join(PROJECT_ROOT, 'punch_records')) },
+    { label: '打开日志目录', click: () => shell.openPath(path.join(DATA_DIR, 'logs')) },
+    { label: '打开 punch_records', click: () => shell.openPath(path.join(DATA_DIR, 'punch_records')) },
     { type: 'separator' },
     { label: '退出（停止 Bot + GUI）', click: () => { appQuitting = true; app.quit(); } },
   ]);
@@ -296,10 +303,38 @@ ipcMain.handle('window:is-maximized', () => mainWindow?.isMaximized() ?? false);
 ipcMain.handle('backend:get-status', () => latestStatus);
 
 ipcMain.handle('system:open-logs', () => {
-  const dir = path.join(PROJECT_ROOT, 'logs');
+  const dir = path.join(DATA_DIR, 'logs');
   try { fs.mkdirSync(dir, { recursive: true }); } catch { /* ignore */ }
   return shell.openPath(dir); // 返回空串=成功，非空=错误信息
 });
+
+// ============================================================================
+// 一次性数据迁移（安全网，仅打包模式）
+//  - 仅当 DATA_DIR 改到「与现有目录不同的别处」（如 %APPDATA%）且尚未迁过时才执行；
+//  - 默认 DATA_DIR 即 LEGACY_DATA_DIR（C:\auto_attendance_system）时直接 return，为空操作；
+//  - 逐项拷贝，目标已存在则跳过，绝不覆盖；完成写 .migrated 标记，只迁一次。
+// ============================================================================
+function migrateLegacyDataIfNeeded() {
+  if (!app.isPackaged) return;
+  if (path.resolve(DATA_DIR) === path.resolve(LEGACY_DATA_DIR)) return; // 指向现有目录=无需迁移
+  if (!fs.existsSync(LEGACY_DATA_DIR)) return;                           // 没有旧数据可迁
+  const marker = path.join(DATA_DIR, '.migrated');
+  if (fs.existsSync(marker)) return;                                    // 只迁一次
+  try { fs.mkdirSync(DATA_DIR, { recursive: true }); } catch { /* ignore */ }
+  for (const name of ['punch_records', 'screenshots', '.env', 'dynamic_config.json', 'scheduled_tasks.json']) {
+    const src = path.join(LEGACY_DATA_DIR, name);
+    const dst = path.join(DATA_DIR, name);
+    if (fs.existsSync(src) && !fs.existsSync(dst)) {                     // 目标已存在则跳过，绝不覆盖
+      try {
+        fs.cpSync(src, dst, { recursive: true, force: false, errorOnExist: false });
+        console.info('[aas-electron] migrated', name, '->', dst);
+      } catch (e) {
+        console.warn('[aas-electron] migrate skip', name, e.message);
+      }
+    }
+  }
+  try { fs.writeFileSync(marker, new Date().toISOString()); } catch { /* ignore */ }
+}
 
 // ============================================================================
 // 生命周期
@@ -323,6 +358,7 @@ app.on('ready', async () => {
     }
   }
   // 窗口与后端并行：先拉起后端，再立刻建窗口（窗口不等 token）
+  migrateLegacyDataIfNeeded();
   spawnPython();
   await createWindow();
   createTray();

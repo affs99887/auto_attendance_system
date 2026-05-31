@@ -8,7 +8,6 @@ import {
   dateStr,
   fmtDuration,
   getUserRecords,
-  TODAY,
 } from '../lib/data';
 import type { PunchRec } from '../lib/types';
 import { api, ApiError } from '../lib/api';
@@ -120,7 +119,12 @@ function Legend({ tone, label }: { tone: string; label: string }) {
 
 export function RecordsScreen() {
   const { currentUser } = useApp();
-  const [ym, setYm] = React.useState('2026-05');
+  // 真实今天 / 真实当前月份（不再用 data.ts 写死的 mock TODAY）
+  const todayStr = React.useMemo(() => dateStr(new Date()), []);
+  const [ym, setYm] = React.useState(() => {
+    const d = new Date();
+    return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`;
+  });
   const [view, setView] = React.useState<'calendar' | 'table'>('calendar');
   const [apiRecs, setApiRecs] = React.useState<Record<string, PunchRec> | null>(null);
   const [loading, setLoading] = React.useState(false);
@@ -259,7 +263,7 @@ export function RecordsScreen() {
                   key={i}
                   d={d}
                   recs={recs}
-                  isToday={Boolean(d) && dateStr(d) === TODAY}
+                  isToday={Boolean(d) && dateStr(d) === todayStr}
                 />
               ))}
             </div>
