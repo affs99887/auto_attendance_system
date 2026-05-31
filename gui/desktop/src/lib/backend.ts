@@ -44,6 +44,8 @@ declare global {
     /** 系统能力桥（纯浏览器下为 undefined） */
     AAS_SYSTEM?: {
       openLogs: () => Promise<string>;
+      /** 用系统默认图片查看器打开本地截图原图。入参为后端返回的相对路径；resolve 空串=成功，非空=错误信息 */
+      openScreenshot: (path: string) => Promise<string>;
     };
     /** 文件选择桥（纯浏览器下为 undefined）：选本地 Clash 配置文件并读内容 */
     AAS_FILES?: {

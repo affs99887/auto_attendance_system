@@ -369,6 +369,22 @@ ipcMain.handle('system:open-logs', () => {
   return shell.openPath(dir); // 返回空串=成功，非空=错误信息
 });
 
+// 用系统默认图片查看器打开本地截图原图（入参为后端返回的相对路径，如 screenshots\user\punch_in\xxx.png）
+// 返回空串=成功，非空=错误信息（resolve 给渲染进程）
+ipcMain.handle('screenshot:open', (_e, relPath) => {
+  try {
+    if (typeof relPath !== 'string' || !relPath) return 'invalid path';
+    const root = path.resolve(DATA_DIR, 'screenshots');
+    const abs = path.resolve(DATA_DIR, relPath);
+    // 防目录穿越：必须落在 DATA_DIR/screenshots 之内
+    if (abs !== root && !abs.startsWith(root + path.sep)) return 'forbidden path';
+    if (!fs.existsSync(abs) || !fs.statSync(abs).isFile()) return 'file not found';
+    return shell.openPath(abs); // 调系统默认图片查看器
+  } catch (e) {
+    return String((e && e.message) || e);
+  }
+});
+
 // ============================================================================
 // 一次性数据迁移（安全网，仅打包模式）
 //  - 仅当 DATA_DIR 改到「与现有目录不同的别处」（如 %APPDATA%）且尚未迁过时才执行；

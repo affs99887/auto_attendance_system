@@ -3,6 +3,7 @@ import * as React from 'react';
 import { Icon } from '../lib/icons';
 import { USERS } from '../lib/data';
 import { api, ApiError, type ScreenshotItem } from '../lib/api';
+import { useToastStore } from '../store/toast';
 
 interface PlaceholderImgProps {
   kind: 'punch_in' | 'punch_out';
@@ -158,6 +159,19 @@ export function ShotsScreen() {
 
   React.useEffect(() => loadOverview(), [loadOverview]);
 
+  const pushToast = useToastStore(s => s.push);
+  // 「查看原图」：用系统默认图片查看器打开本地 PNG（不弹浏览器）。
+  // 纯浏览器/dev（无 Electron 桥）才回退到新标签页。
+  const openOriginal = (p: string) => {
+    if (!p) return;
+    const sys = window.AAS_SYSTEM;
+    if (sys?.openScreenshot) {
+      void sys.openScreenshot(p).then(err => { if (err) pushToast('err', `打开原图失败: ${err}`); });
+    } else {
+      window.open(api.screenshotFileUrl(p), '_blank', 'noreferrer');
+    }
+  };
+
   const apiSamples = items ?? [];
   // 兜底：API 空时显示三个占位
   const placeholderTs = ['20260519_082947', '20260518_084600', '20260517_085012'];
@@ -237,17 +251,20 @@ export function ShotsScreen() {
             {samples.map((s, i) => (
               <div className="col gap-2" key={i}>
                 {s.path ? (
-                  <a
-                    href={api.screenshotFileUrl(s.path)}
-                    target="_blank"
-                    rel="noreferrer"
+                  <button
+                    type="button"
+                    onClick={() => openOriginal(s.path)}
+                    title="用系统图片查看器打开原图"
                     style={{
                       display: 'block',
+                      width: '100%',
+                      padding: 0,
                       aspectRatio: '16 / 10',
                       borderRadius: 6,
                       overflow: 'hidden',
                       border: '1px solid var(--border)',
                       background: 'var(--bg-inset)',
+                      cursor: 'pointer',
                     }}
                   >
                     <img
@@ -255,7 +272,7 @@ export function ShotsScreen() {
                       alt={s.time_str || s.ts}
                       style={{ width: '100%', height: '100%', objectFit: 'cover', display: 'block' }}
                     />
-                  </a>
+                  </button>
                 ) : (
                   <PlaceholderImg kind={kind} ts={s.ts} user={user} success={s.success} />
                 )}
@@ -265,15 +282,14 @@ export function ShotsScreen() {
                 </div>
                 <div className="row gap-2">
                   {s.path && (
-                    <a
+                    <button
+                      type="button"
                       className="btn btn-sm"
-                      style={{ flex: 1, textDecoration: 'none' }}
-                      href={api.screenshotFileUrl(s.path)}
-                      target="_blank"
-                      rel="noreferrer"
+                      style={{ flex: 1 }}
+                      onClick={() => openOriginal(s.path)}
                     >
                       <Icon.Eye size={11} />查看原图
-                    </a>
+                    </button>
                   )}
                   {!s.path && (
                     <button className="btn btn-sm" style={{ flex: 1 }} disabled>

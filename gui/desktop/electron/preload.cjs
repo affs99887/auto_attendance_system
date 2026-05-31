@@ -39,6 +39,8 @@ contextBridge.exposeInMainWorld('AAS_STARTUP', {
 
 contextBridge.exposeInMainWorld('AAS_SYSTEM', {
   openLogs: () => ipcRenderer.invoke('system:open-logs'), // resolve 空串=成功，非空=错误
+  // 用系统默认图片查看器打开本地截图（不弹浏览器）；resolve 空串=成功，非空=错误信息
+  openScreenshot: (relPath) => ipcRenderer.invoke('screenshot:open', relPath),
 });
 
 contextBridge.exposeInMainWorld('AAS_FILES', {
