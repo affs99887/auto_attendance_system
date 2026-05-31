@@ -60,6 +60,19 @@ function StreamTab() {
     }
   }, [filtered.length, follow]);
 
+  // 列表高度自适应父容器（避免写死 400 导致大屏下底部行被裁、下方留白）
+  const listWrapRef = React.useRef<HTMLDivElement>(null);
+  const [listH, setListH] = React.useState(400);
+  React.useEffect(() => {
+    const el = listWrapRef.current;
+    if (!el) return;
+    const measure = () => setListH(el.clientHeight);
+    measure();
+    const ro = new ResizeObserver(measure);
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, []);
+
   return (
     <>
       <div className="row spread">
@@ -137,13 +150,13 @@ function StreamTab() {
             显示 {filtered.length} / {sourceLines.length} 行
           </div>
         </div>
-        <div style={{ flex: 1, background: 'var(--bg-inset)', minHeight: 300 }}>
+        <div ref={listWrapRef} style={{ flex: 1, background: 'var(--bg-inset)', minHeight: 300 }}>
           {filtered.length === 0 ? (
             <div className="empty-state">无匹配日志</div>
           ) : (
             <FixedSizeList
               ref={listRef}
-              height={400}
+              height={listH}
               width="100%"
               itemSize={ROW_HEIGHT}
               itemCount={filtered.length}
