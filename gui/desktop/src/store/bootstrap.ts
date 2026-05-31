@@ -15,6 +15,7 @@ import { usePunchStore } from './punch';
 import { useStartupStore } from './startup';
 import { useToastStore } from './toast';
 import { useProxyStore } from './proxy';
+import { useStartupLogStore } from './startupLog';
 
 const REFRESH_INTERVAL_MS = 15_000;
 const PING_INTERVAL_MS = 400;
@@ -61,7 +62,7 @@ export function useBackendBootstrap() {
     function handle(p: StartupPayload) {
       if (cancelled || !p) return;
       const st = useStartupStore.getState();
-      if (p.state === 'starting') { st.setStarting('正在启动后端服务…'); return; }
+      if (p.state === 'starting') { st.setStarting('正在启动后端服务…'); useStartupLogStore.getState().reset(); return; }
       if (p.state === 'failed') { st.setFailed(p.reason); return; }
       // p.state === 'token'
       setBackendOverride({ token: p.token, httpUrl: p.httpUrl, wsUrl: p.wsUrl });
@@ -82,10 +83,23 @@ export function useBackendBootstrap() {
     const off = startup.onStatus(handle);
     void startup.getStatus().then(handle).catch(() => { /* ignore */ });
 
+    // 启动日志：订阅 Electron 转发的 python stdout/stderr + 拉一次全量兜底（注册晚于早期日志）
+    const log = window.AAS_LOG;
+    let offLog: (() => void) | undefined;
+    if (log) {
+      offLog = log.onLog(p => {
+        if (!cancelled && p?.lines) useStartupLogStore.getState().append(p.lines);
+      });
+      void log.getBuffer()
+        .then(lines => { if (!cancelled && Array.isArray(lines)) useStartupLogStore.getState().reset(lines); })
+        .catch(() => { /* ignore */ });
+    }
+
     return () => {
       cancelled = true;
       if (pingTimer !== null) window.clearTimeout(pingTimer);
       off();
+      offLog?.();
     };
   }, []);
 

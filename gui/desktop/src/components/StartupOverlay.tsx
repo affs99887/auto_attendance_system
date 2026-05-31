@@ -7,6 +7,7 @@
 // 关键：容器 top:32px 不遮挡 32px 自绘标题栏，后端卡死时用户仍可最小化/关闭/拖窗。
 import * as React from 'react';
 import { useStartupStore } from '../store/startup';
+import { useStartupLogStore } from '../store/startupLog';
 import { useToastStore } from '../store/toast';
 
 export function StartupOverlay() {
@@ -16,6 +17,19 @@ export function StartupOverlay() {
   const overlayDismissed = useStartupStore(s => s.overlayDismissed);
   const setOverlayDismissed = useStartupStore(s => s.setOverlayDismissed);
   const setStarting = useStartupStore(s => s.setStarting);
+  const logLines = useStartupLogStore(s => s.lines);
+
+  const logBoxRef = React.useRef<HTMLDivElement>(null);
+  const [follow, setFollow] = React.useState(true);
+  const onLogScroll = () => {
+    const el = logBoxRef.current;
+    if (!el) return;
+    // 贴底则跟随，用户上滑则暂停自动锁底
+    setFollow(el.scrollHeight - el.scrollTop - el.clientHeight < 24);
+  };
+  React.useEffect(() => {
+    if (follow && logBoxRef.current) logBoxRef.current.scrollTop = logBoxRef.current.scrollHeight;
+  }, [logLines.length, follow]);
 
   if (status === 'ready') return null;
   if (status === 'starting' && overlayDismissed) return null;
@@ -51,8 +65,8 @@ export function StartupOverlay() {
     >
       <div
         style={{
-          width: 440,
-          maxWidth: 'calc(100% - 48px)',
+          width: 'min(900px, calc(100% - 64px))',
+          maxWidth: 'calc(100% - 64px)',
           background: 'var(--bg-card)',
           border: `1px solid var(--${tone}-border)`,
           borderTop: `4px solid var(--${tone})`,
@@ -74,6 +88,33 @@ export function StartupOverlay() {
         <div style={{ fontSize: 13, color: 'var(--text-secondary)', lineHeight: 1.6, minHeight: 22 }}>
           {failed ? reason : phase}
         </div>
+
+        {logLines.length > 0 && (
+          <div
+            ref={logBoxRef}
+            onScroll={onLogScroll}
+            className="mono"
+            style={{
+              marginTop: 16,
+              height: 360,
+              overflowY: 'auto',
+              textAlign: 'left',
+              background: 'var(--bg-inset)',
+              border: '1px solid var(--border)',
+              borderRadius: 'var(--radius)',
+              padding: '10px 12px',
+              fontSize: 12,
+              lineHeight: 1.5,
+              color: 'var(--text-secondary)',
+              whiteSpace: 'pre-wrap',
+              wordBreak: 'break-all',
+            }}
+          >
+            {logLines.map((ln, i) => (
+              <div key={i} style={failed ? { color: 'var(--text-primary)' } : undefined}>{ln}</div>
+            ))}
+          </div>
+        )}
 
         <div className="row gap-2" style={{ justifyContent: 'center', marginTop: 20 }}>
           <button className="btn" onClick={openLogs}>查看日志</button>

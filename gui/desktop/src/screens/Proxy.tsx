@@ -39,6 +39,8 @@ export function ProxyScreen() {
   const [cfgText, setCfgText] = React.useState('');
   const [busy, setBusy] = React.useState(false);
   const [testing, setTesting] = React.useState<string | null>(null);
+  const [dragOver, setDragOver] = React.useState(false);
+  const fileInputRef = React.useRef<HTMLInputElement>(null);
 
   React.useEffect(() => {
     void refreshConfig();
@@ -58,6 +60,10 @@ export function ProxyScreen() {
   }, [cfgSubUrl, cfgSource]);
 
   const toggleEnabled = async (v: boolean) => {
+    if (v && config && !config.binary_available) {
+      toast('err', '请先下载 mihomo 内核');
+      return;
+    }
     setBusy(true);
     try {
       const r = await api.setProxyConfig({ enabled: v });
@@ -125,6 +131,52 @@ export function ProxyScreen() {
     }
   };
 
+  // 读取本地 yaml 文本到 textarea（拖拽 / input 降级共用）：校验扩展名与大小
+  const readCfgFile = (file: File) => {
+    if (!/\.(ya?ml)$/i.test(file.name)) { toast('err', '仅支持 .yaml / .yml 文件'); return; }
+    if (file.size > 2 * 1024 * 1024) { toast('err', '配置文件过大（>2MB）'); return; }
+    const reader = new FileReader();
+    reader.onload = () => { setCfgText(String(reader.result || '')); toast('ok', `已读取 ${file.name}`); };
+    reader.onerror = () => toast('err', '读取文件失败');
+    reader.readAsText(file);
+  };
+
+  // 选择本地配置文件：Electron 走系统对话框，纯浏览器回退隐藏 <input type=file>
+  const pickConfigFile = async () => {
+    const bridge = window.AAS_FILES;
+    if (bridge) {
+      try {
+        const r = await bridge.pickConfigFile();
+        if (r) { setCfgText(r.content); toast('ok', `已读取 ${r.name}`); }
+      } catch (e) { toast('err', errText(e)); }
+    } else {
+      fileInputRef.current?.click();
+    }
+  };
+
+  // 下载 mihomo 内核（运行时缺内核时自助下载）
+  const downloadCore = async () => {
+    setBusy(true);
+    toast('ok', '正在下载内核，请稍候…（数十 MB，国内可能较慢）');
+    try {
+      const r = await api.fetchProxyCore();
+      if (r.success) { toast('ok', r.message || '内核已就绪'); await refreshConfig(); }
+      else toast('err', r.error || r.message || '下载失败');
+    } catch (e) { toast('err', errText(e)); }
+    finally { setBusy(false); }
+  };
+
+  // 刷新订阅 / 重载（运行中才有意义：重拉 proxy-provider 的最新节点）
+  const refreshSubscription = async () => {
+    setBusy(true);
+    try {
+      const r = await api.reloadProxy();
+      if (r.success) { toast('ok', '已刷新订阅'); await refreshConfig(); await refreshNodes(); }
+      else toast('err', r.error || '刷新失败');
+    } catch (e) { toast('err', errText(e)); }
+    finally { setBusy(false); }
+  };
+
   const enabled = !!config?.enabled;
 
   return (
@@ -136,12 +188,17 @@ export function ProxyScreen() {
             <div className="card-title">网络加速（仅本程序）</div>
             <div className="card-sub">内置 mihomo · 只代理本程序的 Telegram，不影响系统其它网络</div>
           </div>
-          <div className={`toggle ${enabled ? 'on' : ''}`} onClick={() => !busy && toggleEnabled(!enabled)} />
+          <div
+            className={`toggle ${enabled ? 'on' : ''}`}
+            style={config && !config.binary_available ? { opacity: 0.5 } : undefined}
+            onClick={() => !busy && toggleEnabled(!enabled)}
+          />
         </div>
         <div className="card-body">
           {config && !config.binary_available && (
-            <div className="pill pill-warning" style={{ marginBottom: 12 }}>
-              未找到 mihomo 内核（bin/mihomo.exe）— 请重新安装或放置内核
+            <div className="row gap-2" style={{ marginBottom: 12, alignItems: 'center' }}>
+              <span className="pill pill-warning">未找到 mihomo 内核（bin/mihomo.exe）</span>
+              <button className="btn btn-sm btn-primary" disabled={busy} onClick={downloadCore}>下载内核</button>
             </div>
           )}
           <div className="row gap-6">
@@ -185,20 +242,44 @@ export function ProxyScreen() {
               />
               <div className="row gap-2">
                 <button className="btn btn-primary" disabled={busy} onClick={saveSubscription}>保存并应用</button>
+                <button className="btn" disabled={busy || !running} onClick={refreshSubscription}>刷新订阅</button>
               </div>
             </div>
           ) : (
-            <div className="col gap-2">
+            <div
+              className="col gap-2"
+              onDragOver={e => { e.preventDefault(); setDragOver(true); }}
+              onDragLeave={() => setDragOver(false)}
+              onDrop={e => {
+                e.preventDefault();
+                setDragOver(false);
+                const f = e.dataTransfer.files?.[0];
+                if (f) readCfgFile(f);
+              }}
+              style={dragOver ? { outline: '2px dashed var(--accent)', outlineOffset: 4, borderRadius: 8 } : undefined}
+            >
               <div className="field-label">完整 Clash 配置（YAML，需后端安装 PyYAML）</div>
               <textarea
                 className="input mono"
                 style={{ minHeight: 160, fontFamily: 'var(--font-mono)' }}
                 value={cfgText}
                 onChange={e => setCfgText(e.target.value)}
-                placeholder={'proxies:\n  - name: ...\nproxy-groups:\n  - name: ...\n    type: select'}
+                placeholder={'proxies:\n  - name: ...\nproxy-groups:\n  - name: ...\n    type: select\n\n（可点「选择文件」或把 .yaml 文件拖到此处导入）'}
+              />
+              <input
+                ref={fileInputRef}
+                type="file"
+                accept=".yaml,.yml"
+                style={{ display: 'none' }}
+                onChange={e => {
+                  const f = e.target.files?.[0];
+                  if (f) readCfgFile(f);
+                  e.target.value = ''; // 允许重选同名文件
+                }}
               />
               <div className="row gap-2">
                 <button className="btn btn-primary" disabled={busy} onClick={saveConfigText}>保存并应用</button>
+                <button className="btn" disabled={busy} onClick={pickConfigFile}>选择文件</button>
                 {config?.has_config_text && <span className="kicker">已存在配置</span>}
               </div>
             </div>

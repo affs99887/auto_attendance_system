@@ -45,6 +45,15 @@ declare global {
     AAS_SYSTEM?: {
       openLogs: () => Promise<string>;
     };
+    /** 文件选择桥（纯浏览器下为 undefined）：选本地 Clash 配置文件并读内容 */
+    AAS_FILES?: {
+      pickConfigFile: () => Promise<{ name: string; content: string } | null>;
+    };
+    /** 启动日志桥（纯浏览器下为 undefined）：python stdout/stderr 原始行 */
+    AAS_LOG?: {
+      getBuffer: () => Promise<string[]>;
+      onLog: (cb: (p: { lines: string[] }) => void) => () => void;
+    };
   }
 }
 

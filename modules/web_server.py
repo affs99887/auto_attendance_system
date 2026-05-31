@@ -915,6 +915,23 @@ def _build_flask_app(attendance_system, bridge: AsyncioBridge,
             logging.exception("get_proxy_traffic failed")
             return jsonify({'error': str(e)}), 500
 
+    @app.post('/api/v1/proxy/fetch-core')
+    @require_token
+    def fetch_proxy_core():
+        pm = _pm()
+        if pm is None:
+            return jsonify({'success': False, 'error': '代理管理未初始化'}), 500
+        body = request.get_json(silent=True) or {}
+        mirror = (body.get('mirror') or '').strip() or None
+        try:
+            ok, msg = pm.fetch_core(mirror=mirror)
+            if ok:
+                event_bus.publish_threadsafe('proxy:status', pm.status())
+            return jsonify({'success': bool(ok), 'message': msg, 'config': pm.status()})
+        except Exception as e:
+            logging.exception("fetch_proxy_core failed")
+            return jsonify({'success': False, 'error': str(e)}), 500
+
     return app
 
 

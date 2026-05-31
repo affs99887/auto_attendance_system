@@ -16,6 +16,8 @@ import json
 import time
 import shutil
 import logging
+import zipfile
+import platform
 import subprocess
 
 import requests
@@ -403,3 +405,80 @@ class ProxyManager:
         with open(self._source_config_path(), 'w', encoding='utf-8') as f:
             f.write(text or '')
         config.set_proxy_config({'source': 'config'})
+
+    # ------------------------------------------------------------------ 内核下载
+    _MIHOMO_VERSION = 'v1.19.25'  # 与 scripts/fetch-mihomo.ps1 默认版本保持一致
+
+    def _core_asset(self):
+        """按当前平台返回 (release 资源名, 解压后可执行名)。"""
+        sysname = platform.system().lower()
+        machine = platform.machine().lower()
+        arch = 'arm64' if machine in ('arm64', 'aarch64') else 'amd64'
+        ver = self._MIHOMO_VERSION
+        if sysname == 'windows':
+            return f'mihomo-windows-{arch}-compatible-{ver}.zip', 'mihomo.exe'
+        if sysname == 'darwin':
+            return f'mihomo-darwin-{arch}-{ver}.gz', 'mihomo'
+        return f'mihomo-linux-{arch}-compatible-{ver}.gz', 'mihomo'
+
+    def fetch_core(self, mirror=None):
+        """下载 mihomo 内核到 bin/。返回 (ok, message)。同步阻塞。
+
+        与 scripts/fetch-mihomo.ps1 等价的运行时版本（打包后 scripts/ 不随包，
+        故用 requests 直接下载）。mirror 为 GitHub 加速前缀（拼在完整 URL 前），
+        中国网络无代理时可用；requests 默认 trust_env，机器配了系统代理会自动走。
+        """
+        if self.binary_available():
+            return True, '内核已存在'
+        asset, _exe = self._core_asset()
+        url = f'https://github.com/MetaCubeX/mihomo/releases/download/{self._MIHOMO_VERSION}/{asset}'
+        if mirror:
+            url = mirror.rstrip('/') + '/' + url
+        os.makedirs(self._bin_dir(), exist_ok=True)
+        dst = self.mihomo_path()
+        tmp = dst + '.download'
+        try:
+            logger.info('下载 mihomo 内核: %s', url)
+            with requests.get(url, stream=True, timeout=(10, 120)) as r:
+                r.raise_for_status()
+                if asset.endswith('.zip'):
+                    tmp_zip = os.path.join(self._bin_dir(), 'mihomo_dl.zip')
+                    with open(tmp_zip, 'wb') as f:
+                        for chunk in r.iter_content(65536):
+                            f.write(chunk)
+                    try:
+                        with zipfile.ZipFile(tmp_zip) as z:
+                            member = next(
+                                (n for n in z.namelist()
+                                 if not n.endswith('/')
+                                 and (n.lower().endswith('.exe') or os.path.basename(n).lower() == 'mihomo')),
+                                None,
+                            )
+                            if not member:
+                                raise RuntimeError('压缩包内未找到 mihomo 可执行文件')
+                            with z.open(member) as src, open(tmp, 'wb') as out:
+                                shutil.copyfileobj(src, out)
+                    finally:
+                        try:
+                            os.remove(tmp_zip)
+                        except OSError:
+                            pass
+                else:
+                    import gzip
+                    with gzip.GzipFile(fileobj=r.raw) as gz, open(tmp, 'wb') as out:
+                        shutil.copyfileobj(gz, out)
+            os.replace(tmp, dst)
+            if os.name != 'nt':
+                os.chmod(dst, 0o755)
+            logger.info('mihomo 内核已就绪: %s', dst)
+            return True, '内核下载完成'
+        except Exception as e:
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+            logger.error('下载 mihomo 内核失败: %s', e, exc_info=True)
+            msg = str(e)
+            if isinstance(e, requests.exceptions.RequestException):
+                msg = f'网络错误：{e}（中国网络可带 mirror 镜像前缀重试）'
+            return False, f'内核下载失败：{msg}'

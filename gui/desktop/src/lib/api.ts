@@ -284,6 +284,20 @@ export const api = {
     request<{ up: number; down: number; up_total: number; down_total: number }>(
       '/api/v1/proxy/traffic',
     ),
+
+  // 下载 mihomo 内核到 bin/（运行时缺内核时自助下载；mirror 为可选 GitHub 加速前缀）
+  fetchProxyCore: (mirror?: string) =>
+    request<{ success: boolean; message?: string; config?: ProxyStatus; error?: string }>(
+      '/api/v1/proxy/fetch-core',
+      { method: 'POST', body: mirror ? { mirror } : {} },
+    ),
+
+  // 刷新订阅 / 重载配置：复用 PUT /proxy/config 空 body（运行中走 reload，重拉 proxy-provider）
+  reloadProxy: () =>
+    request<{ success: boolean; config: ProxyStatus; note?: string | null; error?: string }>(
+      '/api/v1/proxy/config',
+      { method: 'PUT', body: {} },
+    ),
 };
 
 export interface ProxyNode {

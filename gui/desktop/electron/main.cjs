@@ -49,11 +49,40 @@ let restartHistory = [];
 let latestStatus = { state: 'starting', reason: null };
 let readyGen = 0;
 
+// 启动日志环形缓冲（最近 N 行 python stdout/stderr），供启动覆盖层实时展示
+const LOG_BUFFER_MAX = 300;
+let logBuffer = [];
+let logCarry = ''; // 跨 data 块的半行残留
+
 function pushStatus(payload) {
   latestStatus = payload;
   if (mainWindow && !mainWindow.isDestroyed() && !appQuitting) {
     try { mainWindow.webContents.send('backend:status', payload); } catch { /* ignore */ }
   }
+}
+
+// 启动日志：入环形缓冲并增量推给渲染进程
+function pushLogLines(lines) {
+  if (!lines.length) return;
+  for (const ln of lines) logBuffer.push(ln);
+  if (logBuffer.length > LOG_BUFFER_MAX) logBuffer.splice(0, logBuffer.length - LOG_BUFFER_MAX);
+  if (mainWindow && !mainWindow.isDestroyed() && !appQuitting) {
+    try { mainWindow.webContents.send('backend:log', { lines }); } catch { /* ignore */ }
+  }
+}
+
+// 把一块 stdout/stderr 文本解析成显示行：剥离 ANSI、处理 \r 同行刷新、半行跨块续接
+function ingestChunk(text) {
+  const cleaned = text.replace(/\x1b\[[0-9;?]*[A-Za-z]/g, ''); // 剥离 ANSI CSI 转义
+  const parts = (logCarry + cleaned).split('\n');
+  logCarry = parts.pop() ?? ''; // 末尾无换行的半行留到下一块
+  const out = [];
+  for (let seg of parts) {
+    seg = seg.replace(/\r+$/, '');                                      // 去 \r\n 行尾
+    if (seg.includes('\r')) seg = seg.slice(seg.lastIndexOf('\r') + 1); // 进度条同行刷新只留末帧
+    if (seg.length) out.push(seg);
+  }
+  pushLogLines(out);
 }
 
 // 每次 spawn 后重新 arm：等 token → 推给渲染进程；超时/失败 → 推 failed
@@ -91,6 +120,9 @@ function spawnPython() {
   }
   // 启动前清掉过期 token 文件，避免读到老 token
   try { fs.unlinkSync(TOKEN_PATH); } catch { /* ignore */ }
+  // 每轮启动从头展示日志：清空缓冲（崩溃重启时不残留上一轮 traceback）
+  logBuffer = [];
+  logCarry = '';
 
   const pyCmd = process.env.AAS_PYTHON || (process.platform === 'win32' ? 'python' : 'python3');
   console.info('[aas-electron] spawning:', pyCmd, mainPy, '--gui', '(cwd:', DATA_DIR + ')');
@@ -103,10 +135,13 @@ function spawnPython() {
     // windowsHide → CREATE_NO_WINDOW，python.exe 不弹黑窗
     windowsHide: true,
     detached: false,
+    // GUI/管道环境：朴素文本(去 ANSI/清屏) + 行不缓冲(实时) + 强制 UTF-8(中文不乱码)。
+    // configure_console_encoding 只设 errors=replace 不强制 utf-8，故 PYTHONIOENCODING 必须显式给。
+    env: { ...process.env, AAS_PLAIN_CONSOLE: '1', PYTHONUNBUFFERED: '1', PYTHONIOENCODING: 'utf-8' },
   });
-  // python 的 stdout/stderr 转发到 Electron 控制台便于调试（不再有独立窗口）
-  pythonProc.stdout?.on('data', d => process.stdout.write(`[py] ${d}`));
-  pythonProc.stderr?.on('data', d => process.stderr.write(`[py] ${d}`));
+  // python 的 stdout/stderr：转发到 Electron 控制台调试 + 解析进启动日志缓冲推给渲染进程
+  pythonProc.stdout?.on('data', d => { process.stdout.write(`[py] ${d}`); ingestChunk(d.toString('utf8')); });
+  pythonProc.stderr?.on('data', d => { process.stderr.write(`[py] ${d}`); ingestChunk(d.toString('utf8')); }); // traceback 在 stderr
 
   // spawn 失败（python 不在 PATH / 无法执行）只触发 'error' 不触发 'exit'——首装最高频故障
   pythonProc.on('error', err => {
@@ -231,8 +266,13 @@ async function createWindow() {
 
   win.once('ready-to-show', () => win.show());
 
-  // 渲染进程加载完成后补推一次最近状态（解决 push 早于渲染进程注册监听的竞态；HMR/重载也安全幂等）
-  win.webContents.on('did-finish-load', () => pushStatus(latestStatus));
+  // 渲染进程加载完成后补推一次最近状态 + 当前启动日志全量（解决 push 早于渲染进程注册监听的竞态；HMR/重载也安全幂等）
+  win.webContents.on('did-finish-load', () => {
+    pushStatus(latestStatus);
+    if (logBuffer.length) {
+      try { win.webContents.send('backend:log', { lines: logBuffer.slice() }); } catch { /* ignore */ }
+    }
+  });
 
   win.on('close', e => {
     if (!appQuitting) {
@@ -301,6 +341,27 @@ ipcMain.handle('window:is-maximized', () => mainWindow?.isMaximized() ?? false);
 // 后端状态拉取 + 打开日志（供"系统启动中"覆盖层使用）
 // ============================================================================
 ipcMain.handle('backend:get-status', () => latestStatus);
+
+// 启动日志全量拉取（渲染进程注册晚于早期日志时兜底）
+ipcMain.handle('backend:get-log', () => logBuffer.slice());
+
+// 选本地 Clash 配置文件，读内容回传渲染进程填入 textarea（dev/packaged 均可用）
+ipcMain.handle('proxy:pick-config-file', async () => {
+  const r = await dialog.showOpenDialog(mainWindow, {
+    title: '选择 Clash 配置文件',
+    properties: ['openFile'],
+    filters: [
+      { name: 'Clash 配置', extensions: ['yaml', 'yml'] },
+      { name: '所有文件', extensions: ['*'] },
+    ],
+  });
+  if (r.canceled || !r.filePaths || r.filePaths.length === 0) return null;
+  const fp = r.filePaths[0];
+  if (fs.statSync(fp).size > 2 * 1024 * 1024) {
+    throw new Error('配置文件过大（>2MB），请确认选对了文件');
+  }
+  return { name: path.basename(fp), content: fs.readFileSync(fp, 'utf-8') };
+});
 
 ipcMain.handle('system:open-logs', () => {
   const dir = path.join(DATA_DIR, 'logs');

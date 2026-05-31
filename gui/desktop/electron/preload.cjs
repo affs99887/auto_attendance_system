@@ -3,6 +3,8 @@
 //   window.AAS_WINDOW  — 窗口控制（最小化 / 最大化 / 关闭）
 //   window.AAS_STARTUP — 后端启动状态（拉取 + 订阅主进程推送）
 //   window.AAS_SYSTEM  — 系统能力（打开日志目录）
+//   window.AAS_FILES   — 文件选择（选本地 Clash 配置文件）
+//   window.AAS_LOG     — 启动日志（python stdout/stderr 原始行，供启动覆盖层展示）
 const { contextBridge, ipcRenderer } = require('electron');
 
 function readArg(key) {
@@ -37,4 +39,18 @@ contextBridge.exposeInMainWorld('AAS_STARTUP', {
 
 contextBridge.exposeInMainWorld('AAS_SYSTEM', {
   openLogs: () => ipcRenderer.invoke('system:open-logs'), // resolve 空串=成功，非空=错误
+});
+
+contextBridge.exposeInMainWorld('AAS_FILES', {
+  // 选本地 Clash 配置文件：resolve {name, content} 或 null（取消）；reject=读取失败
+  pickConfigFile: () => ipcRenderer.invoke('proxy:pick-config-file'),
+});
+
+contextBridge.exposeInMainWorld('AAS_LOG', {
+  getBuffer: () => ipcRenderer.invoke('backend:get-log'),
+  onLog: (cb) => {
+    const handler = (_e, payload) => cb(payload);
+    ipcRenderer.on('backend:log', handler);
+    return () => ipcRenderer.removeListener('backend:log', handler);
+  },
 });
