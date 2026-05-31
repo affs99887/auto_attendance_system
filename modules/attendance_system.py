@@ -169,6 +169,9 @@ class AttendanceSystem:
         import threading as _threading
         self._active_controllers = set()
         self._controllers_lock = _threading.Lock()
+        # 跨线程强停标志：Flask 请求线程可安全 set（asyncio.Event 跨线程不安全），
+        # 主循环里的同步检查点 / 可打断 sleep 都读它，配合 force_stop_operation 实现"真正能停"
+        self._cancel_flag = _threading.Event()
 
         # 启动时清理上次崩溃残留的孤儿 driver 进程（用户机器无手工 driver，无误杀风险）
         self._kill_orphan_msedgedrivers()
@@ -771,10 +774,12 @@ class AttendanceSystem:
             thresholds = [threshold]
 
         for attempt in range(self.max_retries):
+            if self._cancel_flag.is_set():  # 强停：中断图像识别重试循环
+                return None
             screen = self.take_screenshot()
             if screen is None:
                 print(f"截图失败，{attempt + 1} 次重试...")
-                time.sleep(self.retry_interval)
+                self._interruptible_sleep(self.retry_interval)
                 continue
 
             template = cv2.imread(template_path)
@@ -806,7 +811,7 @@ class AttendanceSystem:
 
             if attempt < self.max_retries - 1:
                 logging.info(f"未找到元素 {template_path}（最高匹配度：{max_val:.3f}），{attempt + 1} 次重试...")
-                time.sleep(self.retry_interval)
+                self._interruptible_sleep(self.retry_interval)
 
         # 记录最终匹配失败的详细信息
         if 'unable_escape.png' in template_path or 'left_time.png' in template_path:
@@ -817,10 +822,12 @@ class AttendanceSystem:
     def find_element_with_label(self, template_path, label_template_path, threshold=0.8):
         """通过标签和输入框的组合来定位元素"""
         for attempt in range(self.max_retries):
+            if self._cancel_flag.is_set():  # 强停：中断图像识别重试循环
+                return None
             screen = self.take_screenshot()
             if screen is None:
                 print(f"截图失败，{attempt + 1} 次重试...")
-                time.sleep(self.retry_interval)
+                self._interruptible_sleep(self.retry_interval)
                 continue
 
             # 先找标签位置
@@ -863,7 +870,7 @@ class AttendanceSystem:
 
             if attempt < self.max_retries - 1:
                 print(f"未找到元素组合（匹配度：{label_max_val:.2f}），{attempt + 1} 次重试...")
-                time.sleep(self.retry_interval)
+                self._interruptible_sleep(self.retry_interval)
 
         return None
 
@@ -2251,10 +2258,9 @@ class AttendanceSystem:
         selenium_controller = None
         screenshot_bytes = None
 
-        # 取消事件读取助手：从实例属性读，避免改函数签名
+        # 取消事件读取助手：统一判断（含 Flask 线程强停的 _cancel_flag）
         def _cancel_triggered():
-            ev = getattr(self, 'operation_cancel_event', None)
-            return ev is not None and ev.is_set()
+            return self._is_cancelled()
 
         try:
             # 取消检查点 1/4：进入 try 块即检查，driver 未启动可零成本短路
@@ -2585,14 +2591,14 @@ class AttendanceSystem:
         }
 
         # 提前短路：cancel_event 已触发就不再启动 driver
-        if cancel_event is not None and cancel_event.is_set():
+        if cancel_event is not None and self._is_cancelled(cancel_event):
             result['exception'] = asyncio.CancelledError("操作已被取消")
             return result
 
         try:
             async with semaphore:
                 # 进入信号量前再次确认 cancel 状态，避免排队等待期间被取消
-                if cancel_event is not None and cancel_event.is_set():
+                if cancel_event is not None and self._is_cancelled(cancel_event):
                     result['exception'] = asyncio.CancelledError("操作已被取消")
                     return result
 
@@ -2647,6 +2653,7 @@ class AttendanceSystem:
             self.current_operation = operation_type
             self.operation_start_time = datetime.now()
             self.operation_cancel_event = asyncio.Event()
+            self._cancel_flag.clear()  # 关键：清掉上次强停遗留状态，否则新操作会被秒退
 
             # 启动后台任务
             if operation_type == "punch_in":
@@ -2674,6 +2681,53 @@ class AttendanceSystem:
         self.operation_task = None
         self.operation_cancel_event = None
         self.operation_start_time = None
+
+    def _is_cancelled(self, cancel_event=None):
+        """统一取消判断：跨线程强停标志 / 传入的 cancel_event / 当前 operation_cancel_event 任一触发即取消。"""
+        if getattr(self, '_cancel_flag', None) is not None and self._cancel_flag.is_set():
+            return True
+        if cancel_event is not None and self._is_cancelled(cancel_event):
+            return True
+        ev = getattr(self, 'operation_cancel_event', None)
+        return ev is not None and ev.is_set()
+
+    def _interruptible_sleep(self, seconds):
+        """可被强停打断的同步 sleep：分片轮询 _cancel_flag（传统/PyAutoGUI 模式的阻塞等待用）。"""
+        remaining = max(0.0, float(seconds))
+        while remaining > 0:
+            if getattr(self, '_cancel_flag', None) is not None and self._cancel_flag.is_set():
+                return
+            chunk = 0.5 if remaining > 0.5 else remaining
+            time.sleep(chunk)
+            remaining -= chunk
+
+    def force_stop_operation(self):
+        """同步强制停止（可在任意线程调用，含 Flask 请求线程）。
+
+        立即 quit 所有活跃 selenium driver —— driver.quit() 会让主事件循环里阻塞的
+        WebDriverWait/命令立刻抛错中断，打破"selenium 同步阻塞循环 → 取消协程排不进来"的死结。
+        不 await、不直接操作 asyncio.Event（线程不安全，由调用方用 call_soon_threadsafe 兜底）。
+        返回 (had_operation, closed_count)。
+        """
+        had_op = self.current_operation
+        try:
+            self._cancel_flag.set()
+        except Exception:
+            logging.exception("设置 _cancel_flag 失败")
+        # 复制活跃集合后在锁外逐个关闭（_unregister_controller 自带加锁，避免重入死锁）
+        with self._controllers_lock:
+            controllers = list(self._active_controllers)
+        closed = 0
+        for ctrl in controllers:
+            try:
+                ctrl.close()
+                closed += 1
+            except Exception as e:
+                logging.error(f"force_stop 关闭 selenium driver 失败: {e}")
+            finally:
+                self._unregister_controller(ctrl)
+        logging.info(f"force_stop_operation: had_op={had_op}, quit {closed}/{len(controllers)} driver(s)")
+        return had_op, closed
 
     async def cancel_current_operation(self):
         """取消当前操作"""
@@ -2752,7 +2806,7 @@ class AttendanceSystem:
         """
         try:
             # 检查取消
-            if cancel_event.is_set():
+            if self._is_cancelled(cancel_event):
                 await self.send_notification("操作取消", "上班打卡操作已被取消")
                 return "cancelled"
 
@@ -2792,7 +2846,7 @@ class AttendanceSystem:
                     elif isinstance(r, BaseException):
                         normalized.append({'username': None, 'success': False, 'remaining_time': None, 'exception': r})
 
-                if cancel_event.is_set():
+                if self._is_cancelled(cancel_event):
                     await self.send_notification("操作取消", "并行上班打卡过程中被取消")
                     return "cancelled"
 
@@ -2807,7 +2861,7 @@ class AttendanceSystem:
             success_count = 0
             for i, user in enumerate(users_to_process):
                 # 检查取消
-                if cancel_event.is_set():
+                if self._is_cancelled(cancel_event):
                     await self.send_notification("操作取消", f"用户 {user.get('username')} 的上班打卡操作已被取消")
                     await self.cleanup_browser()
                     return "cancelled"
@@ -2822,7 +2876,7 @@ class AttendanceSystem:
                 result, _ = await self._do_punch("上班", username, password)
 
                 # 检查取消
-                if cancel_event.is_set():
+                if self._is_cancelled(cancel_event):
                     await self.send_notification("操作取消", f"用户 {username} 打卡完成后操作被取消")
                     await self.cleanup_browser()
                     return "cancelled"
@@ -2852,7 +2906,7 @@ class AttendanceSystem:
                     await self.send_notification("打卡流程", f"等待5秒后开始下一个用户的打卡...")
                     # 在等待期间也检查取消
                     for _ in range(5):
-                        if cancel_event.is_set():
+                        if self._is_cancelled(cancel_event):
                             await self.send_notification("操作取消", "在等待期间操作被取消")
                             await self.cleanup_browser()
                             return "cancelled"
@@ -2888,7 +2942,7 @@ class AttendanceSystem:
         """
         try:
             # 检查取消
-            if cancel_event.is_set():
+            if self._is_cancelled(cancel_event):
                 await self.send_notification("操作取消", "下班打卡操作已被取消")
                 return "cancelled"
 
@@ -2928,7 +2982,7 @@ class AttendanceSystem:
                     elif isinstance(r, BaseException):
                         normalized.append({'username': None, 'success': False, 'remaining_time': None, 'exception': r})
 
-                if cancel_event.is_set():
+                if self._is_cancelled(cancel_event):
                     await self.send_notification("操作取消", "并行下班打卡过程中被取消")
                     return "cancelled"
 
@@ -2953,7 +3007,7 @@ class AttendanceSystem:
 
             for i, user in enumerate(users_to_process):
                 # 检查取消
-                if cancel_event.is_set():
+                if self._is_cancelled(cancel_event):
                     await self.send_notification("操作取消", f"用户 {user.get('username')} 的下班打卡操作已被取消")
                     await self.cleanup_browser()
                     return "cancelled"
@@ -2968,7 +3022,7 @@ class AttendanceSystem:
                 result, remaining_time_info = await self._do_punch("下班", username, password, collect_remaining_time=True)
 
                 # 检查取消
-                if cancel_event.is_set():
+                if self._is_cancelled(cancel_event):
                     await self.send_notification("操作取消", f"用户 {username} 打卡完成后操作被取消")
                     await self.cleanup_browser()
                     return "cancelled"
@@ -3005,14 +3059,14 @@ class AttendanceSystem:
                     await self.send_notification("打卡流程", f"等待5秒后开始下一个用户的打卡...")
                     # 在等待期间也检查取消
                     for _ in range(5):
-                        if cancel_event.is_set():
+                        if self._is_cancelled(cancel_event):
                             await self.send_notification("操作取消", "在等待期间操作被取消")
                             await self.cleanup_browser()
                             return "cancelled"
                         await asyncio.sleep(1)
 
             # 检查取消
-            if cancel_event.is_set():
+            if self._is_cancelled(cancel_event):
                 await self.send_notification("操作取消", "在处理定时任务前操作被取消")
                 return "cancelled"
 

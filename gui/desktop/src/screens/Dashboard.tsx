@@ -2,7 +2,7 @@
 import * as React from 'react';
 import { useApp } from '../App';
 import { Icon } from '../lib/icons';
-import { RECENT_ACTIVITY, RECORDS, TODAY, USERS } from '../lib/data';
+import { RECENT_ACTIVITY, RECORDS, USERS } from '../lib/data';
 import type { RecentActivityEntry, User } from '../lib/types';
 import { useSystemStore } from '../store/system';
 import { usePunchStore } from '../store/punch';
@@ -79,11 +79,11 @@ function PunchUserCard({ user }: { user: User }) {
       void refreshStatus();
     }
   };
-  // 优先用后端 today_records；为空时回退 mock 以便开发模式可见
+  // 今日打卡仅取后端 today_records（不再回退到写死的 mock 5/19 数据）
   const apiRec = snapshot?.today_records?.[user.id];
   const today = apiRec
     ? { in: extractTime(apiRec.punch_in_time), out: extractTime(apiRec.punch_out_time) }
-    : RECORDS[user.id]?.['2026-05']?.[TODAY] ?? { in: null, out: null };
+    : { in: null, out: null };
   const punchedIn = Boolean(today.in);
   const punchedOut = Boolean(today.out);
   const estOut = punchedIn ? estimateOut(today.in) : null;
@@ -230,14 +230,10 @@ export function DashboardScreen() {
       : '图像识别 (PyAutoGUI)'
     : sysStatus.modeLabel;
 
-  // 当前用户今日打卡（来自后端，若空回退 mock）
+  // 当前用户今日打卡（仅来自后端 today_records）
   const apiToday = snapshot?.today_records?.[currentUser];
-  const todayIn = apiToday
-    ? extractTime(apiToday.punch_in_time)
-    : RECORDS[currentUser]?.['2026-05']?.[TODAY]?.in ?? null;
-  const todayOut = apiToday
-    ? extractTime(apiToday.punch_out_time)
-    : RECORDS[currentUser]?.['2026-05']?.[TODAY]?.out ?? null;
+  const todayIn = apiToday ? extractTime(apiToday.punch_in_time) : null;
+  const todayOut = apiToday ? extractTime(apiToday.punch_out_time) : null;
   const todayStatusLabel = todayOut ? '已下班' : todayIn ? '工作中' : '未打卡';
   const todayStatusTone = todayOut ? 'success' : todayIn ? 'success' : 'warning';
 
@@ -249,6 +245,10 @@ export function DashboardScreen() {
   // 资源
   const cpu = snapshot?.resources?.cpu_percent;
   const mem = snapshot?.resources?.memory_percent;
+
+  // 真实今日标签（不再用写死的 mock TODAY）
+  const _now = new Date();
+  const todayLabel = `${_now.getFullYear()}-${String(_now.getMonth() + 1).padStart(2, '0')}-${String(_now.getDate()).padStart(2, '0')} ${['周日', '周一', '周二', '周三', '周四', '周五', '周六'][_now.getDay()]}`;
 
   const monthRecs = RECORDS['邓蕴哲']['2026-05'];
   const onTimeCount = Object.values(monthRecs).filter(r => r.in && r.in <= '09:00:00').length;
@@ -321,7 +321,7 @@ export function DashboardScreen() {
       {/* Per-user punch cards */}
       <div className="col gap-2">
         <div className="row spread">
-          <div className="kicker">今日打卡 · {TODAY} 周二</div>
+          <div className="kicker">今日打卡 · {todayLabel}</div>
           <button className="btn btn-sm" onClick={() => setScreen('punch')}>
             打开打卡控制台 <Icon.ChevronRight size={10} />
           </button>

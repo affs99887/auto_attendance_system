@@ -387,10 +387,25 @@ def _build_flask_app(attendance_system, bridge: AsyncioBridge,
     @require_token
     def operation_stop():
         try:
-            ok, msg = bridge.call(
-                attendance_system.cancel_current_operation(), timeout=15
-            )
-            return jsonify({'success': bool(ok), 'message': msg})
+            # (1) Flask 线程内同步强停：立即 quit 活跃 driver，打断主循环里阻塞的 selenium 调用。
+            #     不再 bridge.call(cancel_current_operation(),15s) —— 那会把协程排进已被阻塞的循环，干等超时。
+            had_op, closed = attendance_system.force_stop_operation()
+            # (2) 兜底：用线程安全方式设 asyncio 取消事件，覆盖 driver 尚未创建的窗口。
+            ev = getattr(attendance_system, 'operation_cancel_event', None)
+            if ev is not None:
+                try:
+                    bridge._loop.call_soon_threadsafe(ev.set)
+                except Exception:
+                    logging.exception("call_soon_threadsafe(ev.set) 失败")
+            # (3) 排状态清理到主循环（driver quit 后循环很快解锁），不 .result() 干等。
+            try:
+                asyncio.run_coroutine_threadsafe(
+                    attendance_system._cleanup_operation_state(), bridge._loop
+                )
+            except Exception:
+                logging.exception("schedule _cleanup_operation_state 失败")
+            msg = (f"已强制停止（关闭 {closed} 个 driver）" if had_op else "当前没有进行中的操作")
+            return jsonify({'success': True, 'message': msg, 'closed': closed})
         except Exception as e:
             logging.exception("operation_stop failed")
             return jsonify({'success': False, 'error': str(e)}), 500

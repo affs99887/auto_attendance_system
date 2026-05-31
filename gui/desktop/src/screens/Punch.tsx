@@ -6,6 +6,7 @@ import { PUNCH_STEPS_IN, PUNCH_STEPS_OUT, RECORDS, USERS } from '../lib/data';
 import { api, ApiError } from '../lib/api';
 import { useSystemStore } from '../store/system';
 import { usePunchStore } from '../store/punch';
+import { ModeQuickToggle } from '../components/ModeQuickToggle';
 
 type StepState = 'pending' | 'active' | 'done' | 'error';
 
@@ -511,18 +512,23 @@ export function PunchScreen() {
   };
 
   const stopFlow = async () => {
+    // 立即停掉视觉动画序列；但不假装已停 —— 真正"已停"由 currentOp===null 的 effect(449) 统一收尾，
+    // 避免"前端显示停了、后端还在跑"的不一致。
     timersRef.current.forEach(t => clearTimeout(t));
     timersRef.current = [];
     try {
       const resp = await api.operationStop();
-      showToast(resp.success ? '已发送停止信号' : `停止失败: ${resp.message}`);
+      showToast(resp.success ? '停止信号已确认，正在收尾…' : `停止失败: ${resp.message}`);
     } catch (e) {
       const msg = e instanceof ApiError ? `${e.status}` : (e as Error).message;
       showToast(`停止异常: ${msg}`);
     }
-    setLocalRunning(false);
-    setOpState({ running: false, type: null, perUser: {} });
+    // 短间隔补刷 snapshot，待后端 current_operation 归 null 后由 effect 收尾 UI
     void refreshStatus();
+    [400, 900, 1500, 2500].forEach(ms => {
+      const t = window.setTimeout(() => void refreshStatus(), ms);
+      timersRef.current.push(t);
+    });
   };
 
   return (
@@ -549,11 +555,12 @@ export function PunchScreen() {
             marginLeft: 'auto',
             display: 'flex',
             alignItems: 'center',
-            gap: 6,
+            gap: 8,
             fontSize: 11,
             color: 'var(--text-muted)',
           }}
         >
+          <ModeQuickToggle />
           <span className={`pill ${running ? 'pill-info' : 'pill-neutral'}`}>
             <span className="dot" />
             当前操作: {currentOp ? `${currentOp === 'punch_in' ? '上班' : '下班'}打卡中` : (localRunning ? '启动中…' : '空闲')}

@@ -66,7 +66,6 @@ type TabKey =
 export function SettingsScreen() {
   const { seleniumOn, setSeleniumOn, headless, setHeadless } = useApp();
   const snapshot = useSystemStore(s => s.snapshot);
-  const refreshStatus = useSystemStore(s => s.refresh);
   const [tab, setTab] = React.useState<TabKey>('general');
 
   // Toast 状态
@@ -150,31 +149,14 @@ export function SettingsScreen() {
     }
   };
 
-  // mode 切换 — 接 setConfigMode 立即生效
-  const handleSelenium = async (v: boolean) => {
-    setSeleniumOn(v);
-    try {
-      await api.setConfigMode({ use_selenium_login: v });
-      showToast('ok', `已切换到 ${v ? 'Selenium' : '图像识别'} 模式`);
-      void refreshStatus();
-    } catch (e) {
-      showToast('err', `切换失败: ${e instanceof ApiError ? e.status : (e as Error).message}`);
-    }
-  };
+  // mode 切换 — setSeleniumOn/setHeadless 已走 store.setMode（乐观更新 + PUT /config/mode + refresh + 全局 toast/回滚）
+  const handleSelenium = (v: boolean) => { setSeleniumOn(v); };
 
-  const handleHeadless = async (v: boolean) => {
-    // headless 切换需提示 "下次打卡生效"
+  const handleHeadless = (v: boolean) => {
     if (snapshot?.current_operation) {
       showToast('err', '当前有打卡进行中，此设置仅对下次打卡生效');
     }
     setHeadless(v);
-    try {
-      await api.setConfigMode({ selenium_headless: v });
-      showToast('ok', `已切换到 ${v ? '无头' : '可见'} 模式（下次打卡生效）`);
-      void refreshStatus();
-    } catch (e) {
-      showToast('err', `切换失败: ${e instanceof ApiError ? e.status : (e as Error).message}`);
-    }
   };
 
   // 邮件测试

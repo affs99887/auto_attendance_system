@@ -16,6 +16,8 @@ import { ProgressDrawer } from './components/ProgressDrawer';
 import { LegacyModeOverlay } from './components/LegacyModeOverlay';
 import { StartupOverlay } from './components/StartupOverlay';
 import { ToastHost } from './components/ToastHost';
+import { ModeQuickToggle } from './components/ModeQuickToggle';
+import { useSystemStore } from './store/system';
 
 type ScreenComponent = React.ComponentType;
 
@@ -227,8 +229,13 @@ export function App() {
   const [screen, setScreen] = React.useState<ScreenId>('dashboard');
   const [currentUser, setCurrentUser] = React.useState<string>('邓蕴哲');
   const clock = useClock();
-  const [seleniumOn, setSeleniumOn] = React.useState(true);
-  const [headless, setHeadless] = React.useState(true);
+  // 模式状态来自后端真实配置（单一事实源 = snapshot.config）；切换走 setMode（乐观更新+持久化+失败回滚）
+  const cfg = useSystemStore(s => s.snapshot?.config);
+  const setMode = useSystemStore(s => s.setMode);
+  const seleniumOn = cfg?.use_selenium_login ?? true;
+  const headless = cfg?.selenium_headless ?? true;
+  const setSeleniumOn = (v: boolean) => { void setMode({ use_selenium_login: v }); };
+  const setHeadless = (v: boolean) => { void setMode({ selenium_headless: v }); };
   const [opState, setOpState] = React.useState<OpState>({ running: false, type: null, perUser: {} });
 
   const sysStatus: SysStatus = {
@@ -264,7 +271,7 @@ export function App() {
               sysStatus={sysStatus}
             />
             <main className="main">
-              <Toolbar title={screenTitle} sub={screenSub} actions={null} clock={clock} />
+              <Toolbar title={screenTitle} sub={screenSub} actions={<ModeQuickToggle />} clock={clock} />
               <div className="content scroll-area" key={screen}>
                 {ScreenCmp ? <ScreenCmp /> : <div className="empty-state">未知页面: {screen}</div>}
               </div>
