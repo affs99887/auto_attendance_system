@@ -1,6 +1,7 @@
 # electron-builder 配置 — 打包 Windows NSIS 安装包
 #
-# 输出：release/AutoAttendance-Setup-<version>.exe
+# 输出：<项目根>/release/AutoAttendance-Setup-<version>.exe
+#       （output 相对于本配置文件所在的 gui/desktop/，用 ../../ 指向项目根）
 # 安装后目录结构：
 #   <Install>\AutoAttendance.exe
 #   <Install>\resources\app\                     # Electron 应用（asar 已关闭，见下方 asar: false）
@@ -14,7 +15,7 @@ productName: AutoAttendance
 copyright: Copyright © 2026 自动打卡系统
 
 directories:
-  output: release
+  output: ../../release
   buildResources: electron
 
 # Electron 内打包的文件（asar 中）
