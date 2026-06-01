@@ -6,7 +6,7 @@ import { PUNCH_STEPS_IN, PUNCH_STEPS_OUT, RECORDS, USERS } from '../lib/data';
 import { api, ApiError } from '../lib/api';
 import { useSystemStore } from '../store/system';
 import { usePunchStore } from '../store/punch';
-import { ModeQuickToggle } from '../components/ModeQuickToggle';
+import { wsClient } from '../lib/ws';
 
 type StepState = 'pending' | 'active' | 'done' | 'error';
 
@@ -37,7 +37,47 @@ function OpStep({ state, title, meta }: OpStepProps) {
   );
 }
 
-type PunchKind = 'punch_in' | 'punch_out' | 'auto' | 'parallel';
+type PunchKind = 'punch_in' | 'punch_out' | 'auto' | 'fetch';
+
+// 真实进度映射：把后端 punch:progress 的「content」匹配到「已完成步骤数」(0..10)。
+// 仅匹配 content，不含 title —— title 恒为「完整上班/下班流程」等，匹配会误判。
+// 取所有命中里的最大值，配合 setProgress 的单调推进(只增不减)，后端卡住即停在当前步。
+const STEP_RULES_IN: Array<[RegExp, number]> = [
+  [/开始执行完整|步骤1|执行登录/, 1],
+  [/frameset|登录frame|切换到.*frame/, 1],
+  [/用户名|密码/, 2],
+  [/登录按钮|点击登录/, 3],
+  [/登录成功/, 4],
+  [/步骤3|检查上班按钮|按钮状态/, 4],
+  [/步骤4|执行上班打卡|点击上班|找到上班按钮/, 5],
+  [/验证打卡结果|已变为不可用/, 6],
+  [/上班打卡成功/, 7],
+  [/步骤5|获取今日考勤|今日状态|状态解析/, 8],
+  [/记录已保存/, 9],
+  [/成功完成/, 10],
+];
+const STEP_RULES_OUT: Array<[RegExp, number]> = [
+  [/开始执行完整|步骤1|执行登录/, 1],
+  [/frameset|登录frame|切换到.*frame|用户名|密码|登录按钮/, 2],
+  [/登录成功/, 3],
+  [/步骤3|检查下班按钮|按钮状态/, 3],
+  [/步骤4|执行下班打卡|点击下班|找到下班按钮/, 5],
+  [/下班打卡成功|已变为不可用|验证打卡结果/, 6],
+  [/步骤5|检查mainFrame变化|Frame变化检测|时间警告|工作时间|时间解析|剩余|未到下班时间|返回/, 6],
+  [/步骤8|获取今日考勤|今日状态|状态解析/, 7],
+  [/记录已保存/, 8],
+  [/调度.*重试|按剩余时间|重试/, 9],
+  [/成功完成/, 10],
+];
+
+function mapContentToStep(kind: 'punch_in' | 'punch_out', content: string): number {
+  const rules = kind === 'punch_in' ? STEP_RULES_IN : STEP_RULES_OUT;
+  let best = -1;
+  for (const [re, idx] of rules) {
+    if (idx > best && re.test(content)) best = idx;
+  }
+  return best;
+}
 
 interface PunchFlowCardProps {
   userId: string;
@@ -311,25 +351,26 @@ function AutoByeByePanel() {
   );
 }
 
-function ParallelTestPanel() {
+function FetchStatusPanel() {
+  const refreshStatus = useSystemStore(s => s.refresh);
   const [busy, setBusy] = React.useState(false);
-  const [results, setResults] = React.useState<Record<string, { success: boolean; message: string }> | null>(null);
+  const [results, setResults] = React.useState<
+    Record<string, { success: boolean; punch_in_time: string | null; punch_out_time: string | null; message: string }> | null
+  >(null);
   const [errorMsg, setErrorMsg] = React.useState<string | null>(null);
-  const [elapsedMs, setElapsedMs] = React.useState<number | null>(null);
 
   const run = async () => {
     setBusy(true);
     setErrorMsg(null);
-    const t0 = Date.now();
     try {
-      const r = await api.parallelLoginTest();
-      setElapsedMs(Date.now() - t0);
+      const r = await api.fetchPunchStatus();
       if (!r.success) {
-        setErrorMsg(r.error ?? '测试失败');
+        setErrorMsg(r.error ?? '获取失败');
         setResults(null);
         return;
       }
       setResults(r.results ?? {});
+      void refreshStatus(); // 回写记录后同步概览/自动下班
     } catch (e) {
       const msg = e instanceof ApiError ? `${e.status} ${e.message}` : (e as Error).message;
       setErrorMsg(msg);
@@ -338,23 +379,22 @@ function ParallelTestPanel() {
     }
   };
 
-  const totalCount = results ? Object.keys(results).length : USERS.length;
-  const successCount = results ? Object.values(results).filter(v => v.success).length : 0;
+  const okCount = results ? Object.values(results).filter(v => v.success).length : 0;
 
   return (
     <div className="card">
       <div className="card-header">
         <div>
-          <div className="card-title">并行登录测试</div>
+          <div className="card-title">登录系统获取今日打卡情况</div>
           <div className="card-sub">
             {results
-              ? `共 ${totalCount} 个用户，${successCount} 成功${elapsedMs ? ` · 用时 ${(elapsedMs / 1000).toFixed(1)}s` : ''}`
-              : '仅验证多用户能否并发登录，不会触发打卡按钮'}
+              ? `已读取 ${Object.keys(results).length} 个用户，${okCount} 成功`
+              : '登录考勤系统，从页面读取所有用户今日上/下班时间（不触发打卡，结果回写今日记录）'}
           </div>
         </div>
         <button className="btn btn-primary" onClick={run} disabled={busy}>
-          {busy ? <div className="spinner" /> : <Icon.Zap size={12} />}
-          {busy ? '运行中（最多 2 分钟）' : '运行测试'}
+          {busy ? <div className="spinner" /> : <Icon.Clock size={12} />}
+          {busy ? '读取中（最多 3 分钟）' : '登录并读取'}
         </button>
       </div>
       <div className="card-body">
@@ -377,8 +417,10 @@ function ParallelTestPanel() {
           <thead>
             <tr>
               <th>用户</th>
-              <th>登录结果</th>
-              <th>返回消息</th>
+              <th>结果</th>
+              <th>今日上班</th>
+              <th>今日下班</th>
+              <th>消息</th>
             </tr>
           </thead>
           <tbody>
@@ -399,17 +441,19 @@ function ParallelTestPanel() {
                   </td>
                   <td>
                     {busy ? (
-                      <span className="pill pill-info"><span className="dot" />运行中</span>
+                      <span className="pill pill-info"><span className="dot" />读取中</span>
                     ) : r ? (
                       r.success ? (
-                        <span className="pill pill-success"><span className="dot" />success</span>
+                        <span className="pill pill-success"><span className="dot" />成功</span>
                       ) : (
-                        <span className="pill pill-danger"><span className="dot" />failed</span>
+                        <span className="pill pill-danger"><span className="dot" />失败</span>
                       )
                     ) : (
-                      <span className="pill pill-neutral"><span className="dot" />未运行</span>
+                      <span className="pill pill-neutral"><span className="dot" />未读取</span>
                     )}
                   </td>
+                  <td className="mono" style={{ fontSize: 13 }}>{r?.punch_in_time ?? '—'}</td>
+                  <td className="mono" style={{ fontSize: 13 }}>{r?.punch_out_time ?? '—'}</td>
                   <td className="mono" style={{ fontSize: 11, color: 'var(--text-secondary)' }}>
                     {r?.message ?? '—'}
                   </td>
@@ -426,6 +470,7 @@ function ParallelTestPanel() {
 interface UserProgress {
   idx: number;
   error: string | null;
+  done?: boolean;
 }
 
 export function PunchScreen() {
@@ -438,51 +483,81 @@ export function PunchScreen() {
 
   // 真实运行状态来源：后端 snapshot.current_operation；本地态用于"已启动但 snapshot 还没刷"的过渡
   const currentOp = useSystemStore(s => s.snapshot?.current_operation ?? null);
+  const snapshot = useSystemStore(s => s.snapshot);
   const refreshStatus = useSystemStore(s => s.refresh);
   const clearProgress = usePunchStore(s => s.clear);
   const running = localRunning || currentOp !== null;
+  const prevOpRef = React.useRef<typeof currentOp>(null);
 
   React.useEffect(() => () => {
     timersRef.current.forEach(t => clearTimeout(t));
   }, []);
 
-  // 当后端 current_operation 清空时，停掉 UI 动画
+  // 真实进度：订阅 WS punch:progress，按「用户名」把后端每步通知映射到步骤并单调推进。
+  // 后端卡住 → 收不到新事件 → 步骤停在当前位置，不再有假定时器自顾自往下流转。
   React.useEffect(() => {
-    if (currentOp === null && localRunning) {
-      // 后端已结束 → 推进所有步骤到完成
+    if (kind !== 'punch_in' && kind !== 'punch_out') return;
+    const steps = kind === 'punch_in' ? PUNCH_STEPS_IN : PUNCH_STEPS_OUT;
+    const unsub = wsClient.subscribe('punch:progress', data => {
+      const d = data as { user?: string; content?: string; done?: boolean; success?: boolean };
+      const uid = d?.user;
+      if (!uid || !USERS.some(u => u.id === uid)) return; // 仅处理带用户名的事件
+      if (d.done) {
+        // 终态事件：权威定稿该用户成功/失败（已打卡 already_punched 也算成功）
+        setProgress(p => {
+          const cur = p[uid] ?? { idx: 0, error: null };
+          return {
+            ...p,
+            [uid]: d.success
+              ? { idx: steps.length, error: null, done: true }
+              : { idx: cur.idx, error: '打卡失败', done: true },
+          };
+        });
+        return;
+      }
+      const mapped = mapContentToStep(kind, String(d.content ?? ''));
+      if (mapped < 0) return;
+      setProgress(p => {
+        const cur = p[uid] ?? { idx: 0, error: null };
+        if (cur.done || mapped <= cur.idx) return p; // 已定稿或不前进则忽略（单调）
+        return { ...p, [uid]: { idx: mapped, error: cur.error, done: cur.done } };
+      });
+    });
+    return unsub;
+  }, [kind]);
+
+  // 后端 current_operation 由有值变 null（操作真正结束）→ 按「今日真实记录」定稿每用户结果：
+  // 有打卡时间 = 成功(填满)；无 = 失败(停在最后真实步并标错)。不再无条件假装全部完成。
+  React.useEffect(() => {
+    const was = prevOpRef.current;
+    prevOpRef.current = currentOp;
+    if (was !== null && currentOp === null && localRunning) {
       timersRef.current.forEach(t => clearTimeout(t));
       timersRef.current = [];
       const steps = kind === 'punch_in' ? PUNCH_STEPS_IN : PUNCH_STEPS_OUT;
-      const final: Record<string, UserProgress> = {};
-      USERS.forEach(u => { final[u.id] = { idx: steps.length, error: null }; });
-      setProgress(final);
+      const recs = snapshot?.today_records ?? {};
+      setProgress(prev => {
+        const final: Record<string, UserProgress> = {};
+        USERS.forEach(u => {
+          const cur = prev[u.id] ?? { idx: 0, error: null };
+          if (cur.done) { final[u.id] = cur; return; } // 已被终态事件定稿，保留
+          // 兜底：未收到终态事件时按今日真实记录判定
+          const rec = recs[u.id];
+          const t = kind === 'punch_in' ? rec?.punch_in_time : rec?.punch_out_time;
+          final[u.id] = t
+            ? { idx: steps.length, error: null, done: true }
+            : { idx: cur.idx, error: '未获取到打卡时间，可能失败', done: true };
+        });
+        return final;
+      });
       setLocalRunning(false);
       setOpState({ running: false, type: null, perUser: {} });
     }
-  }, [currentOp, localRunning, kind, setOpState]);
+  }, [currentOp, localRunning, kind, snapshot, setOpState]);
 
   const showToast = (msg: string) => {
     setToast(msg);
     window.setTimeout(() => setToast(null), 4000);
-  };
-
-  // UI 动画：在 API 返回成功后启动 setTimeout 序列（步骤索引仅作视觉反馈，真实进度走 ProgressDrawer/WS）
-  const startStepAnimation = () => {
-    const steps = kind === 'punch_in' ? PUNCH_STEPS_IN : PUNCH_STEPS_OUT;
-    const initial: Record<string, UserProgress> = {};
-    USERS.forEach(u => { initial[u.id] = { idx: 0, error: null }; });
-    setProgress(initial);
-
-    timersRef.current = [];
-    USERS.forEach((u, ui) => {
-      const offset = ui * 200;
-      for (let i = 1; i <= steps.length; i++) {
-        const t = window.setTimeout(() => {
-          setProgress(p => ({ ...p, [u.id]: { ...(p[u.id] ?? { idx: 0, error: null }), idx: i } }));
-        }, offset + i * 1500); // 真实 selenium 节奏 ~1.5s/step
-        timersRef.current.push(t);
-      }
-    });
   };
 
   const startFlow = async () => {
@@ -490,6 +565,10 @@ export function PunchScreen() {
     if (kind !== 'punch_in' && kind !== 'punch_out') return;
     setLocalRunning(true);
     clearProgress();
+    // 步骤归零：真实进度由 WS punch:progress 按用户推进，不再启动假定时器
+    const initial: Record<string, UserProgress> = {};
+    USERS.forEach(u => { initial[u.id] = { idx: 0, error: null }; });
+    setProgress(initial);
     setOpState({ running: true, type: kind, perUser: {} });
     try {
       const resp = kind === 'punch_in' ? await api.punchIn() : await api.punchOut();
@@ -500,7 +579,6 @@ export function PunchScreen() {
         return;
       }
       showToast(`${kind === 'punch_in' ? '上班' : '下班'}打卡已启动 — 进度推送中`);
-      startStepAnimation();
       // 立即刷新一次 snapshot，让 current_operation 出现
       void refreshStatus();
     } catch (e) {
@@ -512,8 +590,8 @@ export function PunchScreen() {
   };
 
   const stopFlow = async () => {
-    // 立即停掉视觉动画序列；但不假装已停 —— 真正"已停"由 currentOp===null 的 effect(449) 统一收尾，
-    // 避免"前端显示停了、后端还在跑"的不一致。
+    // 不假装已停 —— 真正"已停"由 currentOp===null 的定稿 effect 统一收尾（按今日记录判定成功/失败），
+    // 避免"前端显示停了、后端还在跑"的不一致。清掉可能在跑的刷新补丁定时器。
     timersRef.current.forEach(t => clearTimeout(t));
     timersRef.current = [];
     try {
@@ -539,7 +617,7 @@ export function PunchScreen() {
             { id: 'punch_in', l: '上班打卡' },
             { id: 'punch_out', l: '下班打卡' },
             { id: 'auto', l: '自动下班' },
-            { id: 'parallel', l: '并行登录测试' },
+            { id: 'fetch', l: '获取打卡情况' },
           ] as const).map(t => (
             <button
               key={t.id}
@@ -560,7 +638,6 @@ export function PunchScreen() {
             color: 'var(--text-muted)',
           }}
         >
-          <ModeQuickToggle />
           <span className={`pill ${running ? 'pill-info' : 'pill-neutral'}`}>
             <span className="dot" />
             当前操作: {currentOp ? `${currentOp === 'punch_in' ? '上班' : '下班'}打卡中` : (localRunning ? '启动中…' : '空闲')}
@@ -612,7 +689,7 @@ export function PunchScreen() {
 
       {kind === 'auto' && <AutoByeByePanel />}
 
-      {kind === 'parallel' && <ParallelTestPanel />}
+      {kind === 'fetch' && <FetchStatusPanel />}
     </div>
   );
 }

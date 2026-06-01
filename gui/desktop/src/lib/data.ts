@@ -1,9 +1,8 @@
 // Mock 数据 — 与设计稿 data.jsx 对齐。阶段 2c 后 RECORDS / RECENT_ACTIVITY /
-// SAMPLE_LOGS / SCHEDULED_TASKS 将被后端 API 数据替代；USERS / COMMANDS / PUNCH_STEPS_*
+// SCHEDULED_TASKS 将被后端 API 数据替代；USERS / COMMANDS / PUNCH_STEPS_*
 // 保持本地常量。
 import type {
   CommandEntry,
-  LogEntry,
   RecentActivityEntry,
   RecordsByUser,
   ScheduledTask,
@@ -108,29 +107,6 @@ export const RECENT_ACTIVITY: RecentActivityEntry[] = [
   { ts: '00:01:13', user: 'system', type: 'log_rotate', status: 'ok', method: 'system', detail: 'attendance_system.log 已轮转' },
   { ts: '2026-05-18 17:03:00', user: '邓蕴哲', type: 'punch_out', status: 'ok', method: 'Selenium', detail: '工作时长 8h17m' },
   { ts: '2026-05-18 17:14:00', user: '赖得鑫', type: 'punch_out', status: 'ok', method: 'Selenium', detail: '工作时长 8h23m' },
-];
-
-export const SAMPLE_LOGS: LogEntry[] = [
-  { ts: '2026-05-19 08:29:47', lvl: 'INFO', msg: '邓蕴哲 上班打卡 - 登录成功' },
-  { ts: '2026-05-19 08:29:47', lvl: 'INFO', msg: '邓蕴哲 上班打卡 - 已点击打卡按钮，按钮状态: gotowork=False, offwork=True' },
-  { ts: '2026-05-19 08:29:48', lvl: 'INFO', msg: '邓蕴哲 上班打卡 - 打卡成功（08:29:47）' },
-  { ts: '2026-05-19 08:30:02', lvl: 'INFO', msg: '赖得鑫 上班打卡 - 登录成功' },
-  { ts: '2026-05-19 08:30:02', lvl: 'INFO', msg: '赖得鑫 上班打卡 - 打卡成功（08:30:02）' },
-  { ts: '2026-05-19 08:30:05', lvl: 'INFO', msg: '并行打卡完成: 2/2 成功，用时 22.4s' },
-  { ts: '2026-05-19 08:30:06', lvl: 'INFO', msg: '调度自动下班任务：邓蕴哲 @ 16:44:47' },
-  { ts: '2026-05-19 08:30:06', lvl: 'INFO', msg: '调度自动下班任务：赖得鑫 @ 16:46:12' },
-  { ts: '2026-05-19 08:20:00', lvl: 'INFO', msg: 'send_daily_status: 已推送每日状态到 chat_id' },
-  { ts: '2026-05-19 08:15:00', lvl: 'INFO', msg: 'daily_reminder_job: 已发送 8:15 每日提醒' },
-  { ts: '2026-05-19 08:00:13', lvl: 'INFO', msg: '当前定时任务数量: 4' },
-  { ts: '2026-05-19 08:00:01', lvl: 'INFO', msg: '启动时未发现残留 driver 进程' },
-  { ts: '2026-05-19 08:00:00', lvl: 'INFO', msg: 'Telegram Bot Application 初始化完成' },
-  { ts: '2026-05-18 17:14:00', lvl: 'INFO', msg: '赖得鑫 下班打卡成功 - 工作时长 8h23m' },
-  { ts: '2026-05-18 17:03:00', lvl: 'INFO', msg: '邓蕴哲 下班打卡成功 - 工作时长 8h17m' },
-  { ts: '2026-05-18 14:23:05', lvl: 'ERROR', msg: 'Task was destroyed but it is pending! (Application:7595..:update_fetcher)' },
-  { ts: '2026-05-18 14:22:50', lvl: 'WARN', msg: 'Telegram 轮询超时，触发重连' },
-  { ts: '2026-05-18 14:17:02', lvl: 'INFO', msg: 'Telegram Bot 轮询重启完成' },
-  { ts: '2026-05-18 08:46:00', lvl: 'WARN', msg: '邓蕴哲 上班打卡：图像识别匹配度 0.72（低于阈值 0.8），已用备选模板' },
-  { ts: '2026-05-18 08:46:00', lvl: 'INFO', msg: '邓蕴哲 上班打卡成功（08:46:00）' },
 ];
 
 export const COMMANDS: CommandEntry[] = [

@@ -16,6 +16,7 @@ import { useStartupStore } from './startup';
 import { useToastStore } from './toast';
 import { useProxyStore } from './proxy';
 import { useStartupLogStore } from './startupLog';
+import { useServiceStore } from './service';
 
 const REFRESH_INTERVAL_MS = 15_000;
 const PING_INTERVAL_MS = 400;
@@ -24,6 +25,26 @@ const READY_TIMEOUT_MS = 35_000;
 export function useBackendBootstrap() {
   const status = useStartupStore(s => s.status);
   const overlayDismissed = useStartupStore(s => s.overlayDismissed);
+  // 服务运行状态：用于暂停/恢复 effect2 的 WS + 15s 轮询（running 翻 false 自动 cleanup，翻 true 自动重建）
+  const serviceRunning = useServiceStore(s => s.running);
+
+  // effect0：监听后端服务（main.py）运行状态
+  //  - 有桥（Electron）：标记 available，补拉一次 getStatus，并订阅 onStatus 推送驱动 running。
+  //  - 无桥（纯浏览器 / dev）：available=false，running 恒 true（降级，正常路径行为不变）。
+  useEffect(() => {
+    const service = window.AAS_SERVICE;
+    if (!service) {
+      useServiceStore.getState().setAvailable(false);
+      useServiceStore.getState().setRunning(true);
+      return;
+    }
+    useServiceStore.getState().setAvailable(true);
+    void service.getStatus()
+      .then(p => useServiceStore.getState().setRunning(!!p?.running))
+      .catch(() => { /* ignore */ });
+    const off = service.onStatus(p => useServiceStore.getState().setRunning(!!p?.running));
+    return off; // StrictMode 安全：cleanup 即取消订阅
+  }, []);
 
   // effect1：监听启动状态 + ping/status 探活
   useEffect(() => {
@@ -104,8 +125,10 @@ export function useBackendBootstrap() {
   }, []);
 
   // effect2：就绪后才拉数据 + 订阅 WS（去掉原 if(cfg.token) 守卫——ready 必有有效 token）
+  // 同时依赖 serviceRunning：服务停止时 cleanup（clearInterval + unsubs + wsClient.stop()），
+  // 恢复运行时自动重建。serviceRunning 初值 true，正常路径行为不变。
   useEffect(() => {
-    if (status !== 'ready') return;
+    if (status !== 'ready' || !serviceRunning) return;
 
     void useSystemStore.getState().refresh();
     void useLogsStore.getState().loadTail(500);
@@ -143,6 +166,7 @@ export function useBackendBootstrap() {
 
     unsubs.push(wsClient.subscribe('proxy:status', () => {
       void useProxyStore.getState().refreshConfig();
+      void useProxyStore.getState().refreshProfiles();
     }));
 
     return () => {
@@ -150,7 +174,7 @@ export function useBackendBootstrap() {
       unsubs.forEach(fn => fn());
       wsClient.stop();
     };
-  }, [status]);
+  }, [status, serviceRunning]);
 
   // effect3：成功 / 失败 toast 边沿
   useEffect(() => {

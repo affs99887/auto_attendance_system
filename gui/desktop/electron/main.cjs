@@ -42,6 +42,16 @@ const RESTART_MAX = 5;
 let restartHistory = [];
 
 // ============================================================================
+// 服务控制状态机标志（供 service:* IPC 区分「手动停止 / 重启 / 崩溃」三种 exit）
+//  - manualStop:        true 表示本次 exit 是用户主动停止（service:stop），不自动重启
+//  - restarting:        true 表示本次 exit 是用户主动重启（service:restart），exit 后再 spawn
+//  - lastServiceRunning:最近一次推给渲染进程的运行状态，供 did-finish-load 补推
+// ============================================================================
+let manualStop = false;
+let restarting = false;
+let lastServiceRunning = true;
+
+// ============================================================================
 // 后端启动状态（推给渲染进程的 backend:status）
 //  - latestStatus: 最近一次状态，供 backend:get-status 拉取 + did-finish-load 补推
 //  - readyGen:     代际计数，每次（重）spawn 自增，作废旧的 waitForToken 结果
@@ -58,6 +68,16 @@ function pushStatus(payload) {
   latestStatus = payload;
   if (mainWindow && !mainWindow.isDestroyed() && !appQuitting) {
     try { mainWindow.webContents.send('backend:status', payload); } catch { /* ignore */ }
+  }
+}
+
+// 推送「服务运行状态」给渲染进程（独立通道 service:status）
+//  - 绝不复用 backend:status：那条通道会触发 StartupOverlay 的全屏 failed/启动中遮罩，
+//    服务停止/重启不应弹启动遮罩，故单独走 service:status 只带 { running }。
+function pushServiceStatus(running) {
+  lastServiceRunning = running;
+  if (mainWindow && !mainWindow.isDestroyed() && !appQuitting) {
+    try { mainWindow.webContents.send('service:status', { running }); } catch { /* ignore */ }
   }
 }
 
@@ -150,12 +170,20 @@ function spawnPython() {
       state: 'failed',
       reason: `无法启动 Python（${err.message}）。请确认已安装 Python 并加入 PATH。`,
     });
+    pushServiceStatus(false); // spawn 失败：服务未运行
   });
 
   pythonProc.on('exit', (code, signal) => {
     console.warn(`[aas-electron] python exited code=${code} signal=${signal}`);
     pythonProc = null;
     if (appQuitting) return;
+
+    // —— 服务控制三分支：手动停止 / 主动重启 / 崩溃 ——
+    // 1) 用户主动停止：清标志、推 running=false，不自动重启
+    if (manualStop) { manualStop = false; pushServiceStatus(false); return; }
+    // 2) 用户主动重启：清标志，延迟 300ms 后重新 spawn（spawn 成功会推 running=true）
+    if (restarting) { restarting = false; setTimeout(() => { if (!appQuitting) spawnPython(); }, 300); return; }
+    // 3) 其余为崩溃：进入下方原有限频自动重启逻辑
 
     // 检查重启频率
     const now = Date.now();
@@ -169,6 +197,7 @@ function spawnPython() {
           `过去 1 小时内已重启 ${restartHistory.length} 次，已停止自动重启。\n请检查 logs/attendance_system.log 后手动重启程序。`,
         );
       }
+      pushServiceStatus(false); // 彻底放弃自动重启：服务已停止
       return;
     }
     restartHistory.push(now);
@@ -178,6 +207,7 @@ function spawnPython() {
 
   // 拉起后开始侦测就绪（重启也会重新 arm，旧代际自动作废）
   armReadiness();
+  pushServiceStatus(true); // spawn 成功：服务已在运行
 }
 
 // ============================================================================
@@ -269,6 +299,7 @@ async function createWindow() {
   // 渲染进程加载完成后补推一次最近状态 + 当前启动日志全量（解决 push 早于渲染进程注册监听的竞态；HMR/重载也安全幂等）
   win.webContents.on('did-finish-load', () => {
     pushStatus(latestStatus);
+    pushServiceStatus(lastServiceRunning); // 补推服务运行状态（解决 push 早于渲染进程注册监听的竞态）
     if (logBuffer.length) {
       try { win.webContents.send('backend:log', { lines: logBuffer.slice() }); } catch { /* ignore */ }
     }
@@ -383,6 +414,37 @@ ipcMain.handle('screenshot:open', (_e, relPath) => {
   } catch (e) {
     return String((e && e.message) || e);
   }
+});
+
+// ============================================================================
+// 服务控制 IPC（启动 / 停止 / 重启 后端 Python 进程）
+//  - 运行状态以 pythonProc != null 为准
+//  - manualStop / restarting 标志告诉 exit handler 本次退出该如何处理
+// ============================================================================
+ipcMain.handle('service:get-status', () => {
+  return { running: pythonProc != null };
+});
+
+ipcMain.handle('service:start', () => {
+  if (pythonProc) return { success: true, message: '已在运行' };
+  manualStop = false;
+  restarting = false;
+  spawnPython(); // 成功会在 spawnPython 末尾推 service:status running=true
+  return { success: true };
+});
+
+ipcMain.handle('service:stop', () => {
+  if (!pythonProc) { pushServiceStatus(false); return { success: true, message: '未在运行' }; }
+  manualStop = true; // 标记为主动停止：exit handler 不会自动重启
+  killPython();
+  return { success: true };
+});
+
+ipcMain.handle('service:restart', () => {
+  if (!pythonProc) { manualStop = false; spawnPython(); return { success: true }; }
+  restarting = true; // 标记为主动重启：exit handler 退出后会再 spawn（这里不二次 spawn，避免双进程竞态）
+  killPython();
+  return { success: true };
 });
 
 // ============================================================================

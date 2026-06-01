@@ -250,9 +250,16 @@ async def initialize_system(fast_boot=False):
                 await _tick(0.5)
             elif current_step == 5:  # 初始化Telegram机器人
                 await _tick(0.3)  # 显示进度
-                await attendance_system.bot._ensure_app_initialized()
-                if not attendance_system.bot.app:
-                    raise Exception("Telegram Bot 初始化失败")
+                # bot 初始化失败不应再让整个程序启动崩溃（否则 web_server 没机会启动、GUI 进不去）。
+                # 仅在本分支内吞掉异常并降级：记录原因到 attendance_system，后续可经 GUI 重连端点恢复。
+                try:
+                    await attendance_system.bot._ensure_app_initialized()
+                    if not attendance_system.bot.app:
+                        raise Exception("Telegram Bot 初始化失败")
+                except Exception as e:
+                    logging.warning(f"Telegram Bot 初始化失败，转为降级运行（GUI 仍可启动）: {e!r}")
+                    attendance_system.bot_available = False
+                    attendance_system.bot_error = str(e)[:500]
                 await _tick(0.4)
             elif current_step == 6:  # 连接Telegram API服务
                 await _tick(0.7)
@@ -266,12 +273,16 @@ async def initialize_system(fast_boot=False):
                 await _tick(0.5)
             elif current_step == 9:  # 启动机器人应用
                 await _tick(0.3)  # 显示进度
-                await attendance_system.bot.app.start()
+                # bot 降级时 app 为 None，跳过启动（避免 NoneType 崩溃）
+                if attendance_system.bot.app is not None:
+                    await attendance_system.bot.app.start()
                 await _tick(0.4)
             elif current_step == 10:  # 启动连接监控
                 await _tick(0.3)  # 显示进度
-                await attendance_system.bot.start_polling()
-                monitor_task = asyncio.create_task(attendance_system.bot.monitor_connection())
+                # 同样在 bot 可用时才启动轮询与连接监控；降级时 monitor_task 保持为 None
+                if attendance_system.bot.app is not None:
+                    await attendance_system.bot.start_polling()
+                    monitor_task = asyncio.create_task(attendance_system.bot.monitor_connection())
                 await _tick(0.3)
         
         except Exception as e:
@@ -354,24 +365,26 @@ async def main(args=None):
             except Exception as e:
                 logging.error(f"GUI 后端启动失败，bot 主流程不受影响: {e}", exc_info=True)
 
-        # 等待5秒后验证8:15提醒任务设置
+        # 等待5秒后验证8:15提醒任务设置（bot 降级时跳过，避免对未初始化的 app 操作）
         await asyncio.sleep(5)
-        logging.info("验证8:15提醒任务设置...")
-        reminder_status = attendance_system.bot.verify_daily_reminder_setup()
-        if reminder_status:
-            logging.info("✅ 8:15提醒任务验证成功")
+        if getattr(attendance_system, 'bot_available', True):
+            logging.info("验证8:15提醒任务设置...")
+            reminder_status = attendance_system.bot.verify_daily_reminder_setup()
+            if reminder_status:
+                logging.info("✅ 8:15提醒任务验证成功")
+            else:
+                logging.warning("⚠️ 8:15提醒任务验证失败，可能需要手动检查")
         else:
-            logging.warning("⚠️ 8:15提醒任务验证失败，可能需要手动检查")
+            logging.info("Telegram Bot 处于降级状态，跳过 8:15 提醒任务验证")
 
         logging.info("所有服务已启动，系统运行中...")
 
         try:
-            # 保持程序运行
-            await asyncio.gather(
-                asyncio.Event().wait(),
-                monitor_task,
-                return_exceptions=True
-            )
+            # 保持程序运行；bot 降级时 monitor_task 为 None，仅 await 永久事件即可
+            awaitables = [asyncio.Event().wait()]
+            if monitor_task is not None:
+                awaitables.append(monitor_task)
+            await asyncio.gather(*awaitables, return_exceptions=True)
         finally:
             # 清理资源
             print("\n[>>] 正在关闭系统...")

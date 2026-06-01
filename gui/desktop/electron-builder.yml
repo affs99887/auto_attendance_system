@@ -42,6 +42,7 @@ extraResources:
       - modules/**/*
       - templates/**/*
       - bin/**/*            # 内置网络加速：mihomo 内核 + geo 数据（由 scripts/fetch-mihomo.ps1 准备）
+      - msedgedriver.exe    # 离线场景下 Selenium 回退用的本地 Edge 驱动（对应 selenium_login.py 的回退路径）
       - "!**/__pycache__/**"
       - "!**/*.pyc"
       - "!**/venv/**"

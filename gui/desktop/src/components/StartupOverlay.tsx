@@ -89,32 +89,35 @@ export function StartupOverlay() {
           {failed ? reason : phase}
         </div>
 
-        {logLines.length > 0 && (
-          <div
-            ref={logBoxRef}
-            onScroll={onLogScroll}
-            className="mono"
-            style={{
-              marginTop: 16,
-              height: 360,
-              overflowY: 'auto',
-              textAlign: 'left',
-              background: 'var(--bg-inset)',
-              border: '1px solid var(--border)',
-              borderRadius: 'var(--radius)',
-              padding: '10px 12px',
-              fontSize: 12,
-              lineHeight: 1.5,
-              color: 'var(--text-secondary)',
-              whiteSpace: 'pre-wrap',
-              wordBreak: 'break-all',
-            }}
-          >
-            {logLines.map((ln, i) => (
+        {/* 日志框随弹窗立即渲染（不再等首条日志才出现）；日志未到时显示占位提示 */}
+        <div
+          ref={logBoxRef}
+          onScroll={onLogScroll}
+          className="mono"
+          style={{
+            marginTop: 16,
+            height: 360,
+            overflowY: 'auto',
+            textAlign: 'left',
+            background: 'var(--bg-inset)',
+            border: '1px solid var(--border)',
+            borderRadius: 'var(--radius)',
+            padding: '10px 12px',
+            fontSize: 12,
+            lineHeight: 1.5,
+            color: 'var(--text-secondary)',
+            whiteSpace: 'pre-wrap',
+            wordBreak: 'break-all',
+          }}
+        >
+          {logLines.length > 0 ? (
+            logLines.map((ln, i) => (
               <div key={i} style={failed ? { color: 'var(--text-primary)' } : undefined}>{ln}</div>
-            ))}
-          </div>
-        )}
+            ))
+          ) : (
+            <div style={{ color: 'var(--text-muted)' }}>正在收集启动日志…</div>
+          )}
+        </div>
 
         <div className="row gap-2" style={{ justifyContent: 'center', marginTop: 20 }}>
           <button className="btn" onClick={openLogs}>查看日志</button>

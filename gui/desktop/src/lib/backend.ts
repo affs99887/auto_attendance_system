@@ -41,6 +41,15 @@ declare global {
       getStatus: () => Promise<StartupPayload>;
       onStatus: (cb: (p: StartupPayload) => void) => () => void;
     };
+    /** 后端服务（main.py）进程控制桥（纯浏览器下为 undefined） */
+    AAS_SERVICE?: {
+      getStatus: () => Promise<{ running: boolean }>;
+      start: () => Promise<{ success: boolean; message?: string }>;
+      stop: () => Promise<{ success: boolean; message?: string }>;
+      restart: () => Promise<{ success: boolean; message?: string }>;
+      /** 订阅服务运行状态推送，返回取消订阅函数 */
+      onStatus: (cb: (p: { running: boolean }) => void) => () => void;
+    };
     /** 系统能力桥（纯浏览器下为 undefined） */
     AAS_SYSTEM?: {
       openLogs: () => Promise<string>;

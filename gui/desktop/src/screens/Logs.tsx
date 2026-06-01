@@ -2,7 +2,6 @@
 import * as React from 'react';
 import { FixedSizeList, type ListChildComponentProps } from 'react-window';
 import { Icon } from '../lib/icons';
-import { SAMPLE_LOGS } from '../lib/data';
 import { useLogsStore } from '../store/logs';
 import { wsClient } from '../lib/ws';
 import { api, ApiError, type ErrorGroup } from '../lib/api';
@@ -30,11 +29,13 @@ function StreamTab() {
   const [follow, setFollow] = React.useState(true);
 
   const storeLines = useLogsStore(s => s.lines);
+  const loading = useLogsStore(s => s.loading);
   const clearStore = useLogsStore(s => s.clear);
   const [wsStatus, setWsStatus] = React.useState(wsClient.getStatus());
   React.useEffect(() => wsClient.onStatus(setWsStatus), []);
 
-  const sourceLines = storeLines.length > 0 ? storeLines : SAMPLE_LOGS;
+  // 仅使用 store 中的真实日志（loadTail 拉取的 logs/attendance_system.log + WS log:stream 增量），不回退假数据
+  const sourceLines = storeLines;
 
   const filtered = React.useMemo(() => {
     return sourceLines.filter(l => {
@@ -142,8 +143,6 @@ function StreamTab() {
               <span className="pill pill-success"><span className="dot" />WS 已连接</span>
             ) : wsStatus === 'connecting' ? (
               <span className="pill pill-info"><span className="dot" />连接中</span>
-            ) : storeLines.length === 0 ? (
-              <span className="pill pill-warning"><span className="dot" />Mock 数据</span>
             ) : (
               <span className="pill pill-warning"><span className="dot" />WS 断开</span>
             )}
@@ -152,7 +151,11 @@ function StreamTab() {
         </div>
         <div ref={listWrapRef} style={{ flex: 1, background: 'var(--bg-inset)', minHeight: 300 }}>
           {filtered.length === 0 ? (
-            <div className="empty-state">无匹配日志</div>
+            <div className="empty-state">
+              {sourceLines.length === 0
+                ? (loading ? '加载中…' : '暂无日志')
+                : '无匹配日志'}
+            </div>
           ) : (
             <FixedSizeList
               ref={listRef}

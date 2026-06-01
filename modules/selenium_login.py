@@ -316,7 +316,8 @@ class SeleniumLoginController:
     
     async def start_browser(self) -> bool:
         """启动浏览器并导航到登录页面"""
-        browsers_to_try = ["edge", "chrome"] if self.browser_type == "edge" else ["chrome", "edge"]
+        # 仅允许 Edge 登录：禁用 Chrome 回退（Chrome 会抢占默认用户数据目录，与用户已开的 Chrome 冲突）
+        browsers_to_try = ["edge"]
         
         for browser in browsers_to_try:
             try:
@@ -349,6 +350,13 @@ class SeleniumLoginController:
                         self.driver = webdriver.Edge(service=self.service, options=edge_options)
                     except Exception as wdm_err:
                         # 兜底：回退到项目目录中的 msedgedriver.exe（offline 场景）
+                        # 先确认文件存在，否则 Service 指向空路径时 Selenium 会静默改用 Selenium Manager 联网下载，
+                        # 离线下抛出误导性的 "Unable to obtain driver for MicrosoftEdge"
+                        if not os.path.exists(project_driver_path):
+                            raise WebDriverException(
+                                f"离线回退失败：未找到本地 Edge 驱动 {project_driver_path}，"
+                                f"请确认 msedgedriver.exe 已随程序打包"
+                            )
                         await self.send_notification(
                             "Selenium登录",
                             f"webdriver-manager 获取 Edge 驱动失败({str(wdm_err)[:80]})，回退到项目目录WebDriver: {project_driver_path}"
@@ -748,14 +756,19 @@ class SeleniumLoginController:
             finally:
                 self.driver = None
                 self.wait = None
-        # 兜底：driver 创建失败但 Service 已启动（msedgedriver.exe 进程仍在），显式 stop
+        # 兜底：driver 创建失败但 Service 已启动（msedgedriver.exe 进程仍在），显式 stop。
+        # 注意：driver.quit() 成功时已停掉 service，此处会重复 stop —— selenium 4.x 的
+        # Service.stop() 在进程已停止/未真正启动时访问 self.process 会抛 AttributeError（良性）。
+        # 故仅在进程确实存活时才 stop，并把异常降级为 debug，避免刷 ERROR 噪声。
         service = getattr(self, 'service', None)
         if service is not None:
             try:
-                service.stop()
-                self.logger.info("Selenium Service 进程已停止")
+                proc = getattr(service, 'process', None)
+                if proc is not None and proc.poll() is None:
+                    service.stop()
+                    self.logger.info("Selenium Service 进程已停止")
             except Exception as e:
-                self.logger.error(f"停止 Selenium Service 时发生错误: {e}")
+                self.logger.debug(f"停止 Selenium Service 跳过（多为已停止）: {e}")
             finally:
                 self.service = None
     

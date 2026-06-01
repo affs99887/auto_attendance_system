@@ -20,6 +20,7 @@ import secrets
 import functools
 import tempfile
 import re
+from concurrent.futures import TimeoutError as FuturesTimeoutError
 from typing import Any, Optional, Set
 
 from flask import Flask, request, jsonify, send_file
@@ -526,6 +527,39 @@ def _build_flask_app(attendance_system, bridge: AsyncioBridge,
             logging.exception("auto_byebye_confirm failed")
             return jsonify({'success': False, 'error': str(e)}), 500
 
+    # ----- 登录系统获取今日打卡情况 -----
+    @app.post('/api/v1/punch/fetch_status')
+    @require_token
+    def fetch_punch_status():
+        """登录考勤系统，读取所有已配置用户的今日上/下班时间（不触发打卡）。
+
+        识别结果会回写今日记录，因此读取后推送一次 status:update 让概览/自动下班同步刷新。
+        """
+        try:
+            if attendance_system.current_operation is not None:
+                return jsonify({
+                    'success': False,
+                    'error': f'当前有 {attendance_system.current_operation} 操作进行中，请等待完成后再读取',
+                }), 409
+            results = bridge.call(attendance_system.fetch_today_punch_status(), timeout=180)
+            try:
+                event_bus.publish_threadsafe('status:update', {'reason': 'fetch_punch_status'})
+            except Exception:
+                logging.exception("publish status:update after fetch_punch_status failed")
+            normalized = {}
+            for uid, val in (results or {}).items():
+                v = val if isinstance(val, dict) else {}
+                normalized[uid] = {
+                    'success': bool(v.get('success')),
+                    'punch_in_time': v.get('punch_in_time'),
+                    'punch_out_time': v.get('punch_out_time'),
+                    'message': str(v.get('message', '')),
+                }
+            return jsonify({'success': True, 'count': len(normalized), 'results': normalized})
+        except Exception as e:
+            logging.exception("fetch_punch_status failed")
+            return jsonify({'success': False, 'error': str(e)}), 500
+
     # ----- Tasks (create) -----
     @app.post('/api/v1/tasks')
     @require_token
@@ -708,6 +742,31 @@ def _build_flask_app(attendance_system, bridge: AsyncioBridge,
         """请求重启 main.py — 当前仅记录意图并响应；真正重启由 Electron 主进程负责。"""
         event_bus.publish_threadsafe('system:restart_requested', {'ts': time.time()})
         return jsonify({'success': True, 'note': '已发出重启信号；Electron 主进程将在收到 system:restart_requested 时执行'})
+
+    # ----- Bot reconnect -----
+    @app.post('/api/v1/bot/reconnect')
+    @require_token
+    def bot_reconnect():
+        """主动重连 Telegram Bot，并据结果回写 bot_available/bot_error、广播状态更新。"""
+        try:
+            ok, msg = bridge.call(attendance_system.bot.reconnect(), timeout=90)
+            attendance_system.bot_available = bool(ok)
+            attendance_system.bot_error = None if ok else msg
+            event_bus.publish_threadsafe('status:update', {'reason': 'bot_reconnect', 'bot_available': bool(ok)})
+            if ok:
+                return jsonify({'success': True, 'message': msg})
+            return jsonify({'success': False, 'error': msg}), 503
+        except FuturesTimeoutError:
+            attendance_system.bot_available = False
+            attendance_system.bot_error = '重连超时'
+            event_bus.publish_threadsafe('status:update', {'reason': 'bot_reconnect', 'bot_available': False})
+            return jsonify({'success': False, 'error': '重连超时'}), 504
+        except Exception as e:
+            logging.exception("bot_reconnect failed")
+            attendance_system.bot_available = False
+            attendance_system.bot_error = str(e)
+            event_bus.publish_threadsafe('status:update', {'reason': 'bot_reconnect', 'bot_available': False})
+            return jsonify({'success': False, 'error': str(e)}), 500
 
     # ----- Daily reminder test -----
     @app.post('/api/v1/test/reminder')
@@ -930,6 +989,120 @@ def _build_flask_app(attendance_system, bridge: AsyncioBridge,
             return jsonify({'success': bool(ok), 'message': msg, 'config': pm.status()})
         except Exception as e:
             logging.exception("fetch_proxy_core failed")
+            return jsonify({'success': False, 'error': str(e)}), 500
+
+    # ----- 内置网络加速：多配置文件管理 -----
+    @app.get('/api/v1/proxy/profiles')
+    @require_token
+    def list_proxy_profiles():
+        pm = _pm()
+        if pm is None:
+            return jsonify({'error': '代理管理未初始化'}), 500
+        try:
+            return jsonify(pm.list_profiles())
+        except Exception as e:
+            logging.exception("list_proxy_profiles failed")
+            return jsonify({'error': str(e)}), 500
+
+    @app.post('/api/v1/proxy/profiles')
+    @require_token
+    def add_proxy_profile():
+        pm = _pm()
+        if pm is None:
+            return jsonify({'success': False, 'error': '代理管理未初始化'}), 500
+        body = request.get_json(silent=True) or {}
+        type_ = (body.get('type') or '').strip()
+        name = body.get('name')
+        url = body.get('url')
+        content = body.get('content')
+        try:
+            ok, prof, msg = pm.add_profile(type_, name=name, url=url, content=content)
+            if not ok:
+                return jsonify({'success': False, 'error': msg}), 400
+            event_bus.publish_threadsafe('proxy:status', pm.status())
+            return jsonify({'success': True, 'profile': prof})
+        except Exception as e:
+            logging.exception("add_proxy_profile failed")
+            return jsonify({'success': False, 'error': str(e)}), 500
+
+    @app.post('/api/v1/proxy/profiles/<pid>/refresh')
+    @require_token
+    def refresh_proxy_profile(pid):
+        pm = _pm()
+        if pm is None:
+            return jsonify({'success': False, 'error': '代理管理未初始化'}), 500
+        try:
+            ok, prof, msg = pm.refresh_profile(pid)
+            if not ok:
+                return jsonify({'success': False, 'error': msg}), 400
+            event_bus.publish_threadsafe('proxy:status', pm.status())
+            return jsonify({'success': True, 'profile': prof})
+        except Exception as e:
+            logging.exception("refresh_proxy_profile failed")
+            return jsonify({'success': False, 'error': str(e)}), 500
+
+    @app.post('/api/v1/proxy/profiles/<pid>/select')
+    @require_token
+    def select_proxy_profile(pid):
+        pm = _pm()
+        if pm is None:
+            return jsonify({'success': False, 'error': '代理管理未初始化'}), 500
+        try:
+            ok, msg = pm.select_profile(pid)
+            if not ok:
+                return jsonify({'success': False, 'error': msg}), 400
+            event_bus.publish_threadsafe('proxy:status', pm.status())
+            return jsonify({'success': True, 'active_id': pid})
+        except Exception as e:
+            logging.exception("select_proxy_profile failed")
+            return jsonify({'success': False, 'error': str(e)}), 500
+
+    @app.delete('/api/v1/proxy/profiles/<pid>')
+    @require_token
+    def delete_proxy_profile(pid):
+        pm = _pm()
+        if pm is None:
+            return jsonify({'success': False, 'error': '代理管理未初始化'}), 500
+        try:
+            ok, msg = pm.delete_profile(pid)
+            if not ok:
+                return jsonify({'success': False, 'error': msg}), 400
+            event_bus.publish_threadsafe('proxy:status', pm.status())
+            return jsonify({'success': True})
+        except Exception as e:
+            logging.exception("delete_proxy_profile failed")
+            return jsonify({'success': False, 'error': str(e)}), 500
+
+    @app.get('/api/v1/proxy/profiles/<pid>/content')
+    @require_token
+    def get_proxy_profile_content(pid):
+        pm = _pm()
+        if pm is None:
+            return jsonify({'error': '代理管理未初始化'}), 500
+        try:
+            content = pm.get_profile_content(pid)
+            return jsonify({'content': content})
+        except Exception as e:
+            logging.exception("get_proxy_profile_content failed")
+            return jsonify({'content': '', 'error': str(e)}), 500
+
+    @app.put('/api/v1/proxy/profiles/<pid>')
+    @require_token
+    def update_proxy_profile(pid):
+        pm = _pm()
+        if pm is None:
+            return jsonify({'success': False, 'error': '代理管理未初始化'}), 500
+        body = request.get_json(silent=True) or {}
+        name = body.get('name')
+        content = body.get('content')
+        try:
+            ok, prof, msg = pm.update_profile(pid, name=name, content=content)
+            if not ok:
+                return jsonify({'success': False, 'error': msg}), 400
+            event_bus.publish_threadsafe('proxy:status', pm.status())
+            return jsonify({'success': True, 'profile': prof})
+        except Exception as e:
+            logging.exception("update_proxy_profile failed")
             return jsonify({'success': False, 'error': str(e)}), 500
 
     return app

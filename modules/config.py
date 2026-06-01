@@ -162,23 +162,94 @@ class Config:
         'local_port': 7899,          # mixed-port（http+socks5），本程序 Telegram 走这里
         'api_port': 9899,            # mihomo external-controller（本地 RESTful API）
         'secret': '',                # external-controller 鉴权（首次随机生成并持久化）
-        'source': 'subscription',    # 'subscription' | 'config'
-        'subscription_url': '',
+        'source': 'subscription',    # 'subscription' | 'config'（旧字段，仅用于迁移）
+        'subscription_url': '',      # 旧字段，仅用于迁移
         'selected_node': '',
         'group': 'AAS-Proxy',        # select 分组名（供 GUI 切换节点）
+        'profiles': [],              # 多配置文件列表（见 _migrate_proxy_profiles 注释）
+        'active_profile_id': '',     # 当前激活的 profile id
     }
 
     @classmethod
+    def _migrate_proxy_profiles(cls, cfg):
+        """向后兼容：profiles 为空但旧字段有值时，迁移成 1 个 profile 并设为 active。
+
+        每个 profile = {
+            'id': str,                # secrets.token_hex(4) 生成的稳定短 id
+            'name': str,              # 展示名
+            'type': 'subscription' | 'local',
+            'url': str,               # 订阅 URL；local 为 ''
+            'content': str,           # local 配置原文（持久化，跨重装不丢）；subscription 为 ''
+            'updated_at': int|None,   # 最近抓取/导入的 epoch 秒
+            'traffic': {...}|None,    # 仅订阅，来自 subscription-userinfo 头
+            'node_count': int|None,
+        }
+        返回 (cfg, changed)；changed 为 True 表示需要持久化。
+        """
+        profiles = cfg.get('profiles')
+        if isinstance(profiles, list) and profiles:
+            return cfg, False  # 已有 profiles，无需迁移
+
+        source = cfg.get('source', 'subscription')
+        sub_url = (cfg.get('subscription_url') or '').strip()
+        prof = None
+        if source == 'subscription' and sub_url:
+            prof = {
+                'id': secrets.token_hex(4),
+                'name': '订阅配置',
+                'type': 'subscription',
+                'url': sub_url,
+                'content': '',
+                'updated_at': None,
+                'traffic': None,
+                'node_count': None,
+            }
+        elif source == 'config':
+            # 旧的粘贴配置原文存于 proxy_runtime/source_config.yaml，读出落入 content
+            content = ''
+            try:
+                src_path = os.path.join('proxy_runtime', 'source_config.yaml')
+                if os.path.isfile(src_path):
+                    with open(src_path, 'r', encoding='utf-8') as f:
+                        content = f.read()
+            except Exception as e:
+                print(f"迁移本地代理配置原文失败: {e}")
+            if content.strip():
+                prof = {
+                    'id': secrets.token_hex(4),
+                    'name': '本地配置',
+                    'type': 'local',
+                    'url': '',
+                    'content': content,
+                    'updated_at': None,
+                    'traffic': None,
+                    'node_count': None,
+                }
+
+        if prof is None:
+            return cfg, False
+        cfg['profiles'] = [prof]
+        cfg['active_profile_id'] = prof['id']
+        return cfg, True
+
+    @classmethod
     def get_proxy_config(cls):
-        """获取内置加速配置（补默认值；secret 缺失则生成并持久化）。"""
+        """获取内置加速配置（补默认值；secret 缺失则生成并持久化；首次迁移旧字段为 profiles）。"""
         dynamic = cls._load_dynamic_config()
         cfg = dict(cls.PROXY_DEFAULTS)
         stored = dynamic.get('PROXY')
         if isinstance(stored, dict):
             cfg.update(stored)
+        patch = {}
         if not cfg.get('secret'):
             cfg['secret'] = secrets.token_hex(16)
-            cls.set_proxy_config({'secret': cfg['secret']})
+            patch['secret'] = cfg['secret']
+        cfg, migrated = cls._migrate_proxy_profiles(cfg)
+        if migrated:
+            patch['profiles'] = cfg['profiles']
+            patch['active_profile_id'] = cfg['active_profile_id']
+        if patch:
+            cls.set_proxy_config(patch)
         return cfg
 
     @classmethod
@@ -217,21 +288,23 @@ class Config:
     def get_telegram_proxy(cls):
         """返回 Telegram 使用的代理 URL。
 
-        - 启用内置加速：直连本程序自管理的 mihomo 本地端口（确定性，与系统 VPN/代理无关）。
+        - 启用内置加速：**始终**直连本程序自管理的 mihomo 本地端口，完全不依赖系统代理。
+          端口暂未就绪时仍返回内置 URL（由 Telegram 初始化的有限次重试等待 mihomo 启动完成），
+          **绝不回退**到系统 Clash/VPN 端口（7897 等）——避免误用与本程序无关的系统代理。
         - 未启用：按顺序探测 TELEGRAM_PROXY_PORTS（系统 Clash 等），返回首个可连通的；都不通则 None。
         """
         if cls.get_proxy_enabled():
             port = cls.get_proxy_local_port()
+            url = f"http://127.0.0.1:{port}"
             try:
                 with socket.create_connection(('127.0.0.1', port), timeout=1.0):
-                    url = f"http://127.0.0.1:{port}"
-                    logging.info(f"使用内置网络加速代理: {url}")
-                    return url
+                    pass
+                logging.info(f"使用内置网络加速代理: {url}")
             except (OSError, socket.timeout):
                 logging.warning(
-                    f"内置加速端口 127.0.0.1:{port} 未就绪，回退系统代理探测"
+                    f"内置加速端口 127.0.0.1:{port} 未就绪，等待 mihomo 启动（不回退系统代理）"
                 )
-                # 落到下方系统端口探测
+            return url
         host = cls.TELEGRAM_PROXY_HOST
         scheme = cls.TELEGRAM_PROXY_SCHEME
         timeout = cls.TELEGRAM_PROXY_PROBE_TIMEOUT

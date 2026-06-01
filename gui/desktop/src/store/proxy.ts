@@ -1,6 +1,6 @@
-// 内置网络加速 store —— 配置 / 节点 / 实时流量
+// 内置网络加速 store —— 配置文件 / 节点 / 实时流量
 import { create } from 'zustand';
-import { api, type ProxyNode, type ProxyStatus } from '../lib/api';
+import { api, type ProxyNode, type ProxyProfile, type ProxyStatus } from '../lib/api';
 
 interface ProxyState {
   config: ProxyStatus | null;
@@ -8,10 +8,13 @@ interface ProxyState {
   selected: string | null;
   running: boolean;
   traffic: { up: number; down: number; up_total: number; down_total: number };
+  profiles: ProxyProfile[];
+  activeProfileId: string | null;
 
   refreshConfig: () => Promise<void>;
   refreshNodes: () => Promise<void>;
   refreshTraffic: () => Promise<void>;
+  refreshProfiles: () => Promise<void>;
 }
 
 export const useProxyStore = create<ProxyState>((set) => ({
@@ -20,6 +23,8 @@ export const useProxyStore = create<ProxyState>((set) => ({
   selected: null,
   running: false,
   traffic: { up: 0, down: 0, up_total: 0, down_total: 0 },
+  profiles: [],
+  activeProfileId: null,
 
   async refreshConfig() {
     try {
@@ -37,6 +42,12 @@ export const useProxyStore = create<ProxyState>((set) => ({
     try {
       const t = await api.getProxyTraffic();
       set({ traffic: t });
+    } catch { /* ignore */ }
+  },
+  async refreshProfiles() {
+    try {
+      const r = await api.listProxyProfiles();
+      set({ profiles: r.profiles || [], activeProfileId: r.active_id });
     } catch { /* ignore */ }
   },
 }));

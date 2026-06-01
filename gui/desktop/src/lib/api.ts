@@ -55,6 +55,10 @@ export interface StatusSnapshot {
     last: string | null;
     miss_count: number;
   };
+  /** Telegram bot 是否已连接（旧后端为 undefined） */
+  bot_available?: boolean;
+  /** Telegram bot 连接错误信息（无错误为 null；旧后端为 undefined） */
+  bot_error?: string | null;
   active_controllers?: number;
   users?: string[];
   resources?: {
@@ -180,6 +184,18 @@ export const api = {
       error?: string;
     }>('/api/v1/test/parallel_login', { method: 'POST' }),
 
+  // 登录系统读取所有用户今日上/下班时间（不触发打卡），结果回写今日记录
+  fetchPunchStatus: () =>
+    request<{
+      success: boolean;
+      count?: number;
+      results?: Record<
+        string,
+        { success: boolean; punch_in_time: string | null; punch_out_time: string | null; message: string }
+      >;
+      error?: string;
+    }>('/api/v1/punch/fetch_status', { method: 'POST' }),
+
   createTask: (body: {
     type: 'punch_in' | 'punch_out';
     mode: 'absolute' | 'delay';
@@ -236,6 +252,12 @@ export const api = {
 
   systemRestart: () =>
     request<{ success: boolean; note?: string }>('/api/v1/system/restart', { method: 'POST' }),
+
+  // 重连 Telegram bot（不重启进程）
+  botReconnect: () =>
+    request<{ success: boolean; message?: string; error?: string }>('/api/v1/bot/reconnect', {
+      method: 'POST',
+    }),
 
   testReminder: () =>
     request<{ success: boolean; message?: string; error?: string }>('/api/v1/test/reminder', {
@@ -298,6 +320,53 @@ export const api = {
       '/api/v1/proxy/config',
       { method: 'PUT', body: {} },
     ),
+
+  // ===== 多配置文件管理（订阅 / 本地，仿 Clash「配置」页）=====
+  // 列出全部配置文件 + 当前激活 id
+  listProxyProfiles: () =>
+    request<{ profiles: ProxyProfile[]; active_id: string | null }>('/api/v1/proxy/profiles'),
+
+  // 新增配置：订阅 {type:'subscription', name?, url}；本地 {type:'local', name, content}
+  addProxyProfile: (
+    body:
+      | { type: 'subscription'; name?: string; url: string }
+      | { type: 'local'; name: string; content: string },
+  ) =>
+    request<{ success: boolean; profile?: ProxyProfile; error?: string }>('/api/v1/proxy/profiles', {
+      method: 'POST',
+      body,
+    }),
+
+  // 刷新订阅配置（重拉远端、更新流量/节点数）
+  refreshProxyProfile: (id: string) =>
+    request<{ success: boolean; profile?: ProxyProfile; error?: string }>(
+      `/api/v1/proxy/profiles/${id}/refresh`,
+      { method: 'POST' },
+    ),
+
+  // 切换激活配置
+  selectProxyProfile: (id: string) =>
+    request<{ success: boolean; active_id?: string; error?: string }>(
+      `/api/v1/proxy/profiles/${id}/select`,
+      { method: 'POST' },
+    ),
+
+  // 删除配置
+  deleteProxyProfile: (id: string) =>
+    request<{ success: boolean; error?: string }>(`/api/v1/proxy/profiles/${id}`, {
+      method: 'DELETE',
+    }),
+
+  // 读取本地配置原文（编辑用）
+  getProxyProfileContent: (id: string) =>
+    request<{ content: string; error?: string }>(`/api/v1/proxy/profiles/${id}/content`),
+
+  // 更新本地配置（改名 / 改内容）
+  updateProxyProfile: (id: string, body: { name?: string; content?: string }) =>
+    request<{ success: boolean; profile?: ProxyProfile; error?: string }>(
+      `/api/v1/proxy/profiles/${id}`,
+      { method: 'PUT', body },
+    ),
 };
 
 export interface ProxyNode {
@@ -317,6 +386,20 @@ export interface ProxyStatus {
   selected_node: string | null;
   subscription_url: string;
   has_config_text: boolean;
+  active_profile_id?: string | null; // 当前激活的配置文件 id（多配置管理）
+}
+
+// 配置文件（订阅 / 本地），仿 Clash「配置」页的卡片数据
+export interface ProxyProfile {
+  id: string;
+  name: string;
+  type: 'subscription' | 'local';
+  url: string;
+  updated_at: number | null; // epoch 秒
+  // 流量信息：仅订阅可能有；字节 / expire 为 epoch 秒
+  traffic: { upload: number; download: number; total: number; expire: number | null } | null;
+  node_count: number | null;
+  active: boolean;
 }
 
 export type Api = typeof api;

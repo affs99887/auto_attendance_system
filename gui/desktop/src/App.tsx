@@ -17,6 +17,7 @@ import { LegacyModeOverlay } from './components/LegacyModeOverlay';
 import { StartupOverlay } from './components/StartupOverlay';
 import { ToastHost } from './components/ToastHost';
 import { ModeQuickToggle } from './components/ModeQuickToggle';
+import { SystemBanners } from './components/SystemBanners';
 import { useSystemStore } from './store/system';
 
 type ScreenComponent = React.ComponentType;
@@ -272,6 +273,7 @@ export function App() {
             />
             <main className="main">
               <Toolbar title={screenTitle} sub={screenSub} actions={<ModeQuickToggle />} clock={clock} />
+              <SystemBanners />
               <div className="content scroll-area" key={screen}>
                 {ScreenCmp ? <ScreenCmp /> : <div className="empty-state">未知页面: {screen}</div>}
               </div>

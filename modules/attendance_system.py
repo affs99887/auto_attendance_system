@@ -62,6 +62,9 @@ class AttendanceSystem:
         self.bot = TelegramBot(config.TELEGRAM_CHAT_ID)
         # 设置bot的attendance_system引用
         self.bot.attendance_system = self
+        # bot 可用性标记：初始化失败时降级，由 GUI 重连端点恢复（供 snapshot 暴露给前端）
+        self.bot_available = True
+        self.bot_error = None
 
         # 截图保存路径
         self.screenshot_path = 'logs/temp_screenshot.png'
@@ -2280,6 +2283,19 @@ class AttendanceSystem:
             async def enhanced_notification_callback(context: str, msg: str):
                 nonlocal message_content
                 message_content += f"[{context}] {msg}\n"
+                # 把"带用户名"的逐步进度独立补推到 GUI（WS punch:progress）。
+                # 原因：默认逐步通知只 edit Telegram 的 status_message、不进 WS，且不带用户名，
+                # 导致前端按用户的步骤卡片无法还原真实进度（只能靠假定时器流转）。这里按真实事件
+                # 推送，前端据此推进步骤、后端卡住即停。与下面的 status_message 编辑互不影响。
+                if self._event_bus is not None:
+                    try:
+                        await self._event_bus.publish('punch:progress', {
+                            'user': effective_username,
+                            'title': context,
+                            'content': msg,
+                        })
+                    except Exception:
+                        logging.exception("event_bus publish failed for punch:progress (per-user)")
                 try:
                     if status_message:
                         await status_message.edit_text(_safe_message(message_content))
@@ -2590,36 +2606,56 @@ class AttendanceSystem:
             'exception': None,
         }
 
-        # 提前短路：cancel_event 已触发就不再启动 driver
-        if cancel_event is not None and self._is_cancelled(cancel_event):
-            result['exception'] = asyncio.CancelledError("操作已被取消")
-            return result
+        # 把"每用户终态"补推到 GUI（WS punch:progress, done=True）。这是前端给步骤卡片定稿
+        # 成功/失败的权威信号——比"今日是否有本地记录"更可靠（already_punched 也算成功，但未必
+        # 回写本地记录）。无论正常完成 / 取消 / 异常，都在退出前推一次。
+        async def _publish_terminal():
+            if self._event_bus is None or not username:
+                return
+            try:
+                await self._event_bus.publish('punch:progress', {
+                    'user': username,
+                    'title': '打卡结果',
+                    'content': '成功' if result['success'] else '失败',
+                    'done': True,
+                    'success': bool(result['success']),
+                })
+            except Exception:
+                logging.exception("event_bus publish failed for punch:progress (terminal)")
 
         try:
-            async with semaphore:
-                # 进入信号量前再次确认 cancel 状态，避免排队等待期间被取消
-                if cancel_event is not None and self._is_cancelled(cancel_event):
-                    result['exception'] = asyncio.CancelledError("操作已被取消")
-                    return result
+            # 提前短路：cancel_event 已触发就不再启动 driver
+            if cancel_event is not None and self._is_cancelled(cancel_event):
+                result['exception'] = asyncio.CancelledError("操作已被取消")
+                return result
 
-                await self.send_notification(
-                    "并行打卡",
-                    f"[{username}] 开始 {punch_type} 流程"
-                )
-                success, remaining_time_info = await self._do_selenium_punch(
-                    punch_type, username, password, collect_remaining_time
-                )
-                result['success'] = bool(success)
-                result['remaining_time'] = remaining_time_info
-        except asyncio.CancelledError as ce:
-            result['exception'] = ce
-            await self.send_notification("并行打卡", f"[{username}] 任务被取消")
-        except Exception as e:
-            result['exception'] = e
-            logging.error(f"并行打卡用户 {username} 异常: {e}", exc_info=True)
-            await self.send_notification("并行打卡", f"[{username}] 任务异常: {str(e)}")
+            try:
+                async with semaphore:
+                    # 进入信号量前再次确认 cancel 状态，避免排队等待期间被取消
+                    if cancel_event is not None and self._is_cancelled(cancel_event):
+                        result['exception'] = asyncio.CancelledError("操作已被取消")
+                        return result
 
-        return result
+                    await self.send_notification(
+                        "并行打卡",
+                        f"[{username}] 开始 {punch_type} 流程"
+                    )
+                    success, remaining_time_info = await self._do_selenium_punch(
+                        punch_type, username, password, collect_remaining_time
+                    )
+                    result['success'] = bool(success)
+                    result['remaining_time'] = remaining_time_info
+            except asyncio.CancelledError as ce:
+                result['exception'] = ce
+                await self.send_notification("并行打卡", f"[{username}] 任务被取消")
+            except Exception as e:
+                result['exception'] = e
+                logging.error(f"并行打卡用户 {username} 异常: {e}", exc_info=True)
+                await self.send_notification("并行打卡", f"[{username}] 任务异常: {str(e)}")
+
+            return result
+        finally:
+            await _publish_terminal()
 
     async def _display_punch_out_time_info(self, message_content: str, flow_data: dict) -> str:
         """显示下班打卡的时间信息（基于selenium_login的计算结果）"""
@@ -3573,6 +3609,95 @@ class AttendanceSystem:
                     logging.warning(f"关闭 Selenium 控制器失败: {close_err}")
                 self._unregister_controller(controller)
 
+    async def fetch_today_punch_status(self, max_concurrent: int = 3) -> Dict[str, Dict]:
+        """登录考勤系统，读取**所有已配置用户**的今日上/下班打卡时间（强制访问系统页面，不读本地缓存）。
+
+        与 ``get_today_punch_in_time_via_selenium`` 的区别：覆盖全部用户、强制从系统页面读取、
+        同时返回上/下班时间。复用 SeleniumLoginController.login + get_today_punch_times_from_page，
+        识别成功后回写 today_punch_records / 全局月度记录 / Selenium 用户隔离记录，供概览和自动下班复用。
+        不点击任何打卡按钮。
+
+        Returns:
+            Dict[username, {'success': bool, 'punch_in_time': str|None, 'punch_out_time': str|None, 'message': str}]
+        """
+        from modules.selenium_login import SeleniumLoginController
+        users = [u for u in (self.users or []) if u.get('username') and u.get('password')]
+        if not users:
+            return {}
+
+        semaphore = asyncio.Semaphore(max_concurrent)
+        today_str = datetime.now().strftime('%Y-%m-%d')
+
+        async def _fetch_one(user):
+            username = user.get('username')
+            password = user.get('password')
+            async with semaphore:
+                controller = None
+                try:
+                    await self.send_notification("获取打卡情况", f"{username}：登录系统读取今日打卡...")
+                    controller = SeleniumLoginController(
+                        login_url=self.login_url,
+                        headless=self.selenium_headless,
+                        notification_callback=None,
+                        username=username or "default"
+                    )
+                    self._register_controller(controller)
+
+                    login_ok, login_msg = await controller.login(username, password)
+                    if not login_ok:
+                        return username, {
+                            'success': False, 'punch_in_time': None, 'punch_out_time': None,
+                            'message': f'登录失败: {login_msg}'
+                        }
+
+                    # 登录提交后页面已导航，需重新切 mainFrame，故 skip_frame_switch=False
+                    page_times = await controller.get_today_punch_times_from_page(skip_frame_switch=False)
+                    pin = (page_times or {}).get('punch_in_time')
+                    pout = (page_times or {}).get('punch_out_time')
+
+                    # 回写记录（与 get_today_punch_in_time_via_selenium 对齐：内存分桶 + 全局月度 + Selenium 月度）
+                    try:
+                        if pin:
+                            self._set_user_punch_time(username, 'punch_in_time', datetime.strptime(pin, '%H:%M:%S'))
+                            self.punch_record_manager.update_record(today_str, "上班", pin)
+                            controller.record_manager.update_punch_record('punch_in', pin)
+                        if pout:
+                            self._set_user_punch_time(username, 'punch_out_time', datetime.strptime(pout, '%H:%M:%S'))
+                            self.punch_record_manager.update_record(today_str, "下班", pout)
+                            controller.record_manager.update_punch_record('punch_out', pout)
+                    except Exception as wb_err:
+                        logging.warning(f"回写今日打卡记录失败({username}): {wb_err}")
+
+                    return username, {
+                        'success': True,
+                        'punch_in_time': pin,
+                        'punch_out_time': pout,
+                        'message': f"上班={pin or '未识别'} 下班={pout or '未识别'}"
+                    }
+                except Exception as e:
+                    logging.error(f"获取今日打卡情况失败({username}): {str(e)}")
+                    return username, {
+                        'success': False, 'punch_in_time': None, 'punch_out_time': None,
+                        'message': str(e)
+                    }
+                finally:
+                    if controller is not None:
+                        try:
+                            controller.close()
+                        except Exception as close_err:
+                            logging.warning(f"关闭 Selenium 控制器失败({username}): {close_err}")
+                        self._unregister_controller(controller)
+
+        pairs = await asyncio.gather(*[_fetch_one(u) for u in users], return_exceptions=True)
+        results: Dict[str, Dict] = {}
+        for p in pairs:
+            if isinstance(p, Exception):
+                logging.error(f"fetch_today_punch_status 子任务异常: {p}")
+                continue
+            uid, val = p
+            results[uid] = val
+        return results
+
     def calculate_punch_out_time(self, punch_in_time_str):
         """根据上班时间计算下班时间（8小时15分钟后 + 1-3分钟随机延迟）
 
@@ -3787,6 +3912,8 @@ class AttendanceSystem:
                 'miss_count': self.heartbeat_miss_count,
             },
             'active_controllers': len(self._active_controllers),
+            'bot_available': bool(getattr(self, 'bot_available', True)),
+            'bot_error': getattr(self, 'bot_error', None),
             'users': [u.get('username') for u in self.users if u.get('username')],
             'resources': resources,
         }

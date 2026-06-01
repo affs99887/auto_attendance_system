@@ -2,6 +2,7 @@
 //   window.AAS_BACKEND — 后端连接配置（http / ws；token 现由 AAS_STARTUP 异步送达）
 //   window.AAS_WINDOW  — 窗口控制（最小化 / 最大化 / 关闭）
 //   window.AAS_STARTUP — 后端启动状态（拉取 + 订阅主进程推送）
+//   window.AAS_SERVICE — 服务控制（启动/停止/重启后端 + 订阅运行状态推送）
 //   window.AAS_SYSTEM  — 系统能力（打开日志目录）
 //   window.AAS_FILES   — 文件选择（选本地 Clash 配置文件）
 //   window.AAS_LOG     — 启动日志（python stdout/stderr 原始行，供启动覆盖层展示）
@@ -34,6 +35,21 @@ contextBridge.exposeInMainWorld('AAS_STARTUP', {
     const handler = (_e, payload) => cb(payload);
     ipcRenderer.on('backend:status', handler);
     return () => ipcRenderer.removeListener('backend:status', handler);
+  },
+});
+
+contextBridge.exposeInMainWorld('AAS_SERVICE', {
+  // 拉取当前运行状态：Promise<{ running:boolean }>
+  getStatus: () => ipcRenderer.invoke('service:get-status'),
+  // 启动 / 停止 / 重启后端：Promise<{ success:boolean, message?:string }>
+  start:   () => ipcRenderer.invoke('service:start'),
+  stop:    () => ipcRenderer.invoke('service:stop'),
+  restart: () => ipcRenderer.invoke('service:restart'),
+  // 订阅服务运行状态推送（service:status），返回注销函数
+  onStatus: (cb) => {
+    const handler = (_e, payload) => cb(payload);
+    ipcRenderer.on('service:status', handler);
+    return () => ipcRenderer.removeListener('service:status', handler);
   },
 });
 

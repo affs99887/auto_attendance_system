@@ -71,6 +71,8 @@ class TelegramBot:
         # 添加初始化状态跟踪
         self._is_initialized = False
         self._initialization_lock = asyncio.Lock()
+        # 重连/重启串行化锁（与 monitor_connection 自愈互斥；获取顺序：_reconnect_lock 在外、_initialization_lock 在内）
+        self._reconnect_lock = asyncio.Lock()
         # settime配置持久化文件路径
         self.settime_history_file = 'settime_history.json'
         # 每日8:15提醒任务状态
@@ -171,6 +173,9 @@ class TelegramBot:
                             self.connection_error_count = 0  # 重置错误计数
 
                         self.app.add_handler(MessageHandler(filters.ALL, update_handler))
+
+                        # 注册全局错误处理器，统一记录 Telegram 更新处理过程中的未捕获异常
+                        self.app.add_error_handler(self._on_error)
 
                         # 初始化每日提醒任务
                         self._setup_daily_reminder()
@@ -1005,6 +1010,9 @@ class TelegramBot:
             # 发送图片
             await update.message.reply_text(f"📸 正在发送 {username} 的最新打卡图片...")
 
+            # bot 降级/未初始化时 app 为 None，提前返回避免 NoneType 崩溃
+            if not self.app:
+                return
             for i, image_info in enumerate(images_to_send):
                 try:
                     with open(image_info['path'], 'rb') as photo:
@@ -1190,6 +1198,9 @@ class TelegramBot:
             # 更新消息显示找到的图片数量
             await query.message.edit_text(f"📸 找到 {len(all_images)} 张{type_name}打卡图片，正在发送...")
 
+            # bot 降级/未初始化时 app 为 None，提前返回避免 NoneType 崩溃
+            if not self.app:
+                return
             # 发送图片
             for i, image_info in enumerate(all_images):
                 try:
@@ -1993,32 +2004,77 @@ class TelegramBot:
 
     async def restart_polling(self):
         """重启消息轮询"""
-        logging.info("正在重启 Telegram Bot 轮询...")
-        await self.stop_polling()
+        # 与 reconnect 共用 _reconnect_lock，确保重启与重连互斥，避免并发清理同一 app
+        async with self._reconnect_lock:
+            logging.info("正在重启 Telegram Bot 轮询...")
+            await self.stop_polling()
 
-        # 标记需要重新初始化
-        self._is_initialized = False
-        self.app = None
-        # 重置每日提醒任务标志，确保重新初始化时会重新设置任务
-        self.daily_reminder_task_set = False
-
-        await asyncio.sleep(5)  # 等待5秒后重启
-
-        try:
-            # 使用_ensure_app_initialized来重新创建应用
-            await self._ensure_app_initialized()
-
+            # 置空前先停止并关闭旧应用，避免 update_fetcher 后台任务泄漏
             if self.app:
+                try:
+                    await self.app.stop()
+                    await self.app.shutdown()
+                except Exception as e:
+                    logging.warning(f"重启前停止旧应用失败: {e!r}")
+
+            # 标记需要重新初始化
+            self._is_initialized = False
+            self.app = None
+            # 重置每日提醒任务标志，确保重新初始化时会重新设置任务
+            self.daily_reminder_task_set = False
+
+            await asyncio.sleep(5)  # 等待5秒后重启
+
+            try:
+                # 使用_ensure_app_initialized来重新创建应用
+                await self._ensure_app_initialized()
+
+                if self.app:
+                    await self.app.start()
+                    await self.start_polling()
+                else:
+                    logging.error("重启轮询失败：应用初始化失败")
+
+            except Exception as e:
+                logging.error(f"重启轮询失败: {str(e)}")
+
+            self.last_update_time = datetime.now()
+            logging.info("Telegram Bot 轮询重启完成")
+
+    async def _on_error(self, update, context):
+        """Telegram 全局错误处理器：统一记录更新处理过程中的未捕获异常"""
+        logging.error("Telegram 更新处理异常", exc_info=getattr(context, 'error', None))
+
+    async def reconnect(self) -> tuple[bool, str]:
+        """主动重连 Telegram Bot：停止旧轮询/应用，彻底重建后重新启动。
+
+        供 GUI 重连端点调用；与 restart_polling 共用 _reconnect_lock 串行化，避免并发清理。
+        注意：本方法不直接写 attendance_system.bot_available（由端点层根据返回值统一回写）。
+        """
+        async with self._reconnect_lock:
+            try:
+                await self.stop_polling()
+                if self.app:
+                    try:
+                        await self.app.stop()
+                        await self.app.shutdown()
+                    except Exception as e:
+                        logging.warning(f"重连：清理旧 app 失败 {e!r}")
+                self._is_initialized = False
+                self.app = None
+                self.daily_reminder_task_set = False
+                await self._ensure_app_initialized()
+                if not self.app:
+                    return False, "Bot 初始化失败：应用未创建"
                 await self.app.start()
                 await self.start_polling()
-            else:
-                logging.error("重启轮询失败：应用初始化失败")
-
-        except Exception as e:
-            logging.error(f"重启轮询失败: {str(e)}")
-
-        self.last_update_time = datetime.now()
-        logging.info("Telegram Bot 轮询重启完成")
+                self.last_update_time = datetime.now()
+                logging.info("Telegram Bot 重连成功")
+                return True, "Bot 重连成功"
+            except Exception as e:
+                logging.error(f"Bot 重连失败: {e!r}", exc_info=True)
+                self._is_initialized = False
+                return False, f"Bot 重连失败: {e}"
 
     async def monitor_connection(self):
         """监控连接状态"""
@@ -3333,6 +3389,10 @@ class TelegramBot:
     async def send_message_with_reply_markup(self, title, content, reply_markup):
         """发送带有回复标记的消息"""
         try:
+            # 确保应用已初始化；仍不可用则降级为不带按钮的普通消息（避免 NoneType 崩溃）
+            await self._ensure_app_initialized()
+            if not self.app:
+                return await self.send_message(title, content)
             await self.app.bot.send_message(
                 chat_id=self.chat_id,
                 text=f"**{title}**\n\n{content}",
