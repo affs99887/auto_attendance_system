@@ -2686,7 +2686,7 @@ class AttendanceSystem:
         """统一取消判断：跨线程强停标志 / 传入的 cancel_event / 当前 operation_cancel_event 任一触发即取消。"""
         if getattr(self, '_cancel_flag', None) is not None and self._cancel_flag.is_set():
             return True
-        if cancel_event is not None and self._is_cancelled(cancel_event):
+        if cancel_event is not None and cancel_event.is_set():
             return True
         ev = getattr(self, 'operation_cancel_event', None)
         return ev is not None and ev.is_set()
