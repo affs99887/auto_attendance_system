@@ -56,9 +56,17 @@ punch_records/
 screenshots/
 scheduled_tasks.json
 dynamic_config.json
+settime_history.json
 
 # 桌面端打包产物（electron-builder 输出到项目根 release/）
 /release/
+
+# 桌面端 Node 依赖与构建缓存（package-lock.json 入库，其余产物不入库）
+gui/desktop/node_modules/
+gui/desktop/.vite/
+gui/desktop/*.tsbuildinfo
+gui/desktop/vite.config.d.ts
+gui/desktop/node.exe.stackdump
 
 # 内置网络加速：二进制随安装包打包（由 scripts/fetch-mihomo.ps1 准备，不入库）
 bin/

@@ -51,6 +51,108 @@ _HEALTH_URL = 'https://www.gstatic.com/generate_204'
 _SUB_USER_AGENT = 'clash.meta'
 
 
+# ---------------------------------------------------------------------------
+# Windows Job Object（KILL_ON_JOB_CLOSE）——让 mihomo 随 Python 进程"任意方式"退出
+# 被 OS 当场连带回收（含硬杀 taskkill /F、任务管理器结束、崩溃、os._exit、os.execl）。
+# 纯 ctypes 实现，不引入 pywin32 依赖；非 Windows 全部跳过。
+# ---------------------------------------------------------------------------
+_JOB_SUPPORTED = (os.name == 'nt')
+
+if _JOB_SUPPORTED:
+    import ctypes
+    from ctypes import wintypes
+
+    JobObjectExtendedLimitInformation = 9          # JOBOBJECTINFOCLASS
+    JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x00002000
+
+    class JOBOBJECT_BASIC_LIMIT_INFORMATION(ctypes.Structure):
+        _fields_ = [
+            ("PerProcessUserTimeLimit", wintypes.LARGE_INTEGER),
+            ("PerJobUserTimeLimit",     wintypes.LARGE_INTEGER),
+            ("LimitFlags",              wintypes.DWORD),
+            ("MinimumWorkingSetSize",   ctypes.c_size_t),
+            ("MaximumWorkingSetSize",   ctypes.c_size_t),
+            ("ActiveProcessLimit",      wintypes.DWORD),
+            ("Affinity",                ctypes.c_size_t),   # ULONG_PTR
+            ("PriorityClass",           wintypes.DWORD),
+            ("SchedulingClass",         wintypes.DWORD),
+        ]
+
+    class IO_COUNTERS(ctypes.Structure):
+        _fields_ = [
+            ("ReadOperationCount",  ctypes.c_ulonglong),
+            ("WriteOperationCount", ctypes.c_ulonglong),
+            ("OtherOperationCount", ctypes.c_ulonglong),
+            ("ReadTransferCount",   ctypes.c_ulonglong),
+            ("WriteTransferCount",  ctypes.c_ulonglong),
+            ("OtherTransferCount",  ctypes.c_ulonglong),
+        ]
+
+    class JOBOBJECT_EXTENDED_LIMIT_INFORMATION(ctypes.Structure):
+        _fields_ = [
+            ("BasicLimitInformation", JOBOBJECT_BASIC_LIMIT_INFORMATION),
+            ("IoInfo",                IO_COUNTERS),
+            ("ProcessMemoryLimit",    ctypes.c_size_t),
+            ("JobMemoryLimit",        ctypes.c_size_t),
+            ("PeakProcessMemoryUsed", ctypes.c_size_t),
+            ("PeakJobMemoryUsed",     ctypes.c_size_t),
+        ]
+
+    _kernel32 = ctypes.WinDLL('kernel32', use_last_error=True)
+    _kernel32.CreateJobObjectW.restype = wintypes.HANDLE
+    _kernel32.CreateJobObjectW.argtypes = [wintypes.LPVOID, wintypes.LPCWSTR]
+    _kernel32.SetInformationJobObject.restype = wintypes.BOOL
+    _kernel32.SetInformationJobObject.argtypes = [
+        wintypes.HANDLE, ctypes.c_int, wintypes.LPVOID, wintypes.DWORD]
+    _kernel32.AssignProcessToJobObject.restype = wintypes.BOOL
+    _kernel32.AssignProcessToJobObject.argtypes = [wintypes.HANDLE, wintypes.HANDLE]
+    _kernel32.CloseHandle.restype = wintypes.BOOL
+    _kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+
+
+def _create_kill_on_close_job():
+    """创建设置了 KILL_ON_JOB_CLOSE 的匿名 Job。成功返回 job 句柄(int)，失败返回 None（记日志不抛）。"""
+    if not _JOB_SUPPORTED:
+        return None
+    try:
+        job = _kernel32.CreateJobObjectW(None, None)
+        if not job:
+            logger.warning('CreateJobObjectW 失败 (err=%s)，跳过 Job 防护', ctypes.get_last_error())
+            return None
+        info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION()
+        info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+        ok = _kernel32.SetInformationJobObject(
+            job, JobObjectExtendedLimitInformation, ctypes.byref(info), ctypes.sizeof(info))
+        if not ok:
+            logger.warning('SetInformationJobObject 失败 (err=%s)，关闭 Job 并降级', ctypes.get_last_error())
+            _kernel32.CloseHandle(job)
+            return None
+        return job
+    except Exception:
+        logger.warning('创建 Job 对象异常，降级到 pidfile/stop 兜底', exc_info=True)
+        return None
+
+
+def _assign_proc_to_job(job, proc):
+    """把 Popen 子进程加入 Job。成功 True；失败 False（调用方据此降级）。借用 _handle 句柄值，不接管所有权。"""
+    if not _JOB_SUPPORTED or not job or proc is None:
+        return False
+    try:
+        handle = int(proc._handle)   # Windows 下 Popen._handle 即进程 HANDLE
+    except Exception:
+        logger.warning('获取 mihomo 进程句柄失败，跳过 Job 赋值', exc_info=True)
+        return False
+    try:
+        ok = _kernel32.AssignProcessToJobObject(wintypes.HANDLE(job), wintypes.HANDLE(handle))
+    except Exception:
+        logger.warning('AssignProcessToJobObject 异常，降级', exc_info=True)
+        return False
+    if not ok:
+        logger.warning('AssignProcessToJobObject 失败 (err=%s)，降级到 pidfile/stop 兜底', ctypes.get_last_error())
+        return False
+    return True
+
+
 class ProxyManager:
     """mihomo 子进程 + external-controller API 客户端。"""
 
@@ -59,6 +161,7 @@ class ProxyManager:
         self.project_root = project_root or os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
         self.runtime_dir = os.path.join(self.project_root, 'proxy_runtime')
         self.proc = None
+        self._job = None  # Windows Job Object 句柄（KILL_ON_JOB_CLOSE）；非 Windows/降级时为 None
         self._last_traffic = None  # (ts, up_total, down_total)
 
     # ------------------------------------------------------------------ 路径
@@ -338,6 +441,9 @@ class ProxyManager:
         同步方法（subprocess 即时 + time.sleep 轮询）；从 async 处调用建议 asyncio.to_thread。
         """
         if not config.get_proxy_enabled():
+            # 即便本次禁用代理，也清掉上次启用时遗留的孤儿 mihomo + 陈旧 pidfile
+            # （覆盖"上次启用留孤儿 → 这次禁用 → start 提前 return 永不清理"的盲区）
+            self._kill_orphan()
             return False, '内置加速未启用'
         if not self.binary_available():
             return False, f'未找到 mihomo 二进制：{self.mihomo_path()}（请确认 bin/ 已打包）'
@@ -372,6 +478,22 @@ class ProxyManager:
                 f.write(str(self.proc.pid))
         except OSError:
             pass
+
+        # 套 Windows Job Object（KILL_ON_JOB_CLOSE）：Python 进程以任意方式消失时 OS 连带杀 mihomo。
+        # 失败（旧系统/权限/取句柄失败）只记日志、不影响 mihomo 运行，退回 pidfile/stop 兜底。
+        if getattr(self, '_job', None):                       # 防御：先关掉残留旧 job
+            try:
+                _kernel32.CloseHandle(wintypes.HANDLE(self._job))
+            except Exception:
+                pass
+            self._job = None
+        self._job = _create_kill_on_close_job()
+        if self._job and not _assign_proc_to_job(self._job, self.proc):
+            try:
+                _kernel32.CloseHandle(wintypes.HANDLE(self._job))  # 赋值失败：关空 job，避免句柄长期悬挂
+            except Exception:
+                pass
+            self._job = None
 
         # 等 external-controller 就绪
         deadline = time.time() + ready_timeout
@@ -430,6 +552,13 @@ class ProxyManager:
             except Exception:
                 logger.warning('停止 mihomo 失败', exc_info=True)
             self.proc = None
+        # 关闭 Job 句柄（释放 KILL_ON_JOB_CLOSE 持有；mihomo 已被 taskkill，这里仅清理资源）
+        if getattr(self, '_job', None):
+            try:
+                _kernel32.CloseHandle(wintypes.HANDLE(self._job))
+            except Exception:
+                logger.warning('关闭 Job 句柄失败', exc_info=True)
+            self._job = None
         try:
             os.remove(self._pid_path())
         except OSError:

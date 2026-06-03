@@ -714,12 +714,17 @@ html, body {
   padding: 4px 12px;
   border-bottom: 1px solid var(--border-soft);
   display: grid;
-  grid-template-columns: 140px 60px 1fr;
+  grid-template-columns: 172px 56px 1fr;
   gap: 12px;
   align-items: baseline;
 }
 .log-line:hover { background: var(--bg-inset); }
-.log-line .ts { color: var(--text-muted); }
+.log-line .ts {
+  color: var(--text-muted);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
 .log-line .lvl { font-weight: 600; }
 .log-line .lvl.INFO { color: var(--accent); }
 .log-line .lvl.WARN { color: var(--warning); }

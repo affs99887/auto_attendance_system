@@ -12,7 +12,9 @@
     "electron": "electron .",
     "electron:dev": "cross-env AAS_DEV=1 electron .",
     "start": "npm run build && electron .",
+    "predist:exe": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/kill-orphan-mihomo.ps1",
     "dist:exe": "npm run build && electron-builder --win --x64",
+    "predist:dir": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/kill-orphan-mihomo.ps1",
     "dist:dir": "npm run build && electron-builder --dir"
   },
   "dependencies": {

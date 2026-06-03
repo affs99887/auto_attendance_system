@@ -144,7 +144,7 @@ function PunchUserCard({ user }: { user: User }) {
           </button>
           <button
             className="btn"
-            disabled={!punchedIn || punchedOut || busy !== null}
+            disabled={busy !== null}
             onClick={() => doPunch('out')}
           >
             <Icon.Power size={12} /> {busy === 'out' ? '打卡中…' : '下班打卡'}

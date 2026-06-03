@@ -164,6 +164,7 @@ export const api = {
       punch_in_time?: string | null;
       punch_out_time?: string | null;
       message?: string;
+      fallback_used?: boolean;
     }>('/api/v1/punch/auto_byebye/calc', {
       method: 'POST',
       body: username ? { username } : {},

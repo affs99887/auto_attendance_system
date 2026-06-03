@@ -300,9 +300,13 @@ class TelegramBot:
             # 获取当日上班打卡时间
             success, punch_in_time, message = await self.attendance_system.get_today_punch_in_time_auto()
 
-            if not success:
-                await update.message.reply_text(f"❌ 获取上班时间失败：{message}")
-                return
+            # 兜底：识别不到今日上班时间时，用配置上班时间 WORK_START_TIME 推算下班，
+            # 使「即便没有上班记录也能自动下班」可用（仅作用于 /auto_byebye，不影响 16:35 自动触发的获取/手动输入交互）
+            fallback_used = False
+            if not success or not punch_in_time:
+                punch_in_time = self.attendance_system.work_start_time
+                fallback_used = True
+                message = f"今日无上班打卡记录，已使用配置上班时间 {punch_in_time} 兜底计算下班时间"
 
             # 计算下班时间
             calc_success, punch_out_time, calc_message = self.attendance_system.calculate_punch_out_time(punch_in_time)
@@ -321,9 +325,14 @@ class TelegramBot:
             reply_markup = InlineKeyboardMarkup(keyboard)
 
             # 发送确认消息
+            punch_in_line = (
+                f"📍 上班时间：{punch_in_time}（⚠️ 今日无上班记录，按配置上班时间兜底）\n"
+                if fallback_used else
+                f"📍 上班时间：{punch_in_time}\n"
+            )
             confirm_message = (
                 f"🎯 自动下班打卡设置\n\n"
-                f"📍 上班时间：{punch_in_time}\n"
+                f"{punch_in_line}"
                 f"🕐 {calc_message}\n"
                 f"⏰ 工作时长：8小时15分钟 + 1-3分钟随机延迟\n\n"
                 f"💡 确认后将自动设置定时任务，到时间后自动执行下班打卡。\n\n"

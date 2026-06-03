@@ -485,24 +485,45 @@ def _build_flask_app(attendance_system, bridge: AsyncioBridge,
                     target_in = t
                     target_user = u
 
-        if not target_in:
-            return jsonify({
-                'success': False,
-                'message': f'{target_user or "所有用户"} 今日尚未上班打卡，无法计算下班时间',
-            })
-
-        in_str = target_in.strftime('%H:%M:%S') if hasattr(target_in, 'strftime') else str(target_in)
+        from modules.config import config as cfg
+        fallback_used = False
+        if target_in:
+            # 内存(today_punch_records)已有今日上班时间，直接用
+            in_str = target_in.strftime('%H:%M:%S') if hasattr(target_in, 'strftime') else str(target_in)
+        else:
+            # 内存无记录 → 登录系统识别真实上班时间（对齐 Telegram /auto_byebye：Selenium 模式走
+            # get_today_punch_in_time_via_selenium 的 DOM 解析、仅识别首个用户 users[0]；传统模式走 OCR）。
+            # 登录识别耗时较长（与「获取打卡情况」量级一致），给足超时；超时/异常都不阻断，转兜底。
+            ok_id, pin = False, None
+            try:
+                ok_id, pin, _id_msg = bridge.call(
+                    attendance_system.get_today_punch_in_time_auto(),
+                    timeout=240,
+                )
+            except Exception:
+                logging.exception("auto_byebye_calc 登录识别上班时间失败")
+            if ok_id and pin:
+                in_str = pin
+                if not target_user and attendance_system.users:
+                    target_user = attendance_system.users[0].get('username')
+            else:
+                # 仍识别不到 → 用配置上班时间 WORK_START_TIME 兜底，保证「无上班记录也能自动下班」
+                in_str = cfg.WORK_START_TIME
+                fallback_used = True
         try:
             ok, out_str, msg = attendance_system.calculate_punch_out_time(in_str)
         except Exception as e:
             logging.exception("auto_byebye_calc failed")
             return jsonify({'success': False, 'error': str(e)}), 500
+        if fallback_used:
+            msg = f"今日无上班打卡记录、且登录识别未取到上班时间，已使用配置上班时间 {in_str} 兜底计算。{msg}"
         return jsonify({
             'success': bool(ok),
             'username': target_user,
             'punch_in_time': in_str,
             'punch_out_time': out_str,
             'message': msg,
+            'fallback_used': fallback_used,
         })
 
     @app.post('/api/v1/punch/auto_byebye/confirm')

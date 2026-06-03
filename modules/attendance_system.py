@@ -230,6 +230,14 @@ class AttendanceSystem:
 
     def _sync_cleanup_on_exit(self):
         """同步清理所有活跃 driver（atexit/signal 路径用，event loop 可能已关）"""
+        # 退出钩子先停内置网络加速（mihomo）——必须放在下方 driver early-return 之前，
+        # 否则无活跃 driver 时这段不会执行。仅覆盖优雅落幕/SIGINT/SIGTERM；硬杀由 Job Object 兜底。
+        pm = getattr(self, 'proxy_manager', None)
+        if pm is not None:
+            try:
+                pm.stop()
+            except Exception:
+                logging.error("退出钩子停止内置网络加速失败", exc_info=True)
         if not getattr(self, '_active_controllers', None):
             return
         with self._controllers_lock:

@@ -366,7 +366,19 @@ class SeleniumLoginController:
                 
                 await self.send_notification("Selenium登录", f"{browser_name} WebDriver实例创建成功")
                 self.wait = WebDriverWait(self.driver, 10)
-                
+
+                # 设置页面加载 / 底层命令超时：登录页不可达(离线或不在公司内网)时，
+                # 避免 driver.get() 无限阻塞，以及 WebDriver 命令默认 120s read-timeout +
+                # urllib3 三次重试导致单次登录卡死十几分钟、进而阻塞事件循环拖垮 Telegram 轮询
+                try:
+                    self.driver.set_page_load_timeout(30)
+                except Exception as to_err:
+                    self.logger.warning(f"[Selenium登录] 设置页面加载超时失败: {to_err}")
+                try:
+                    self.driver.command_executor.set_timeout(45)
+                except Exception as ce_err:
+                    self.logger.warning(f"[Selenium登录] 设置命令执行超时失败: {ce_err}")
+
                 await self.send_notification("Selenium登录", f"正在访问登录页面: {self.login_url}")
                 
                 # 导航到登录页面

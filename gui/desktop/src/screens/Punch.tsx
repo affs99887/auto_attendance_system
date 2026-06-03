@@ -191,6 +191,7 @@ interface CalcResult {
   message: string;
   scheduled: boolean;
   error: string | null;
+  fallbackUsed: boolean;
 }
 
 function AutoByeByePanel() {
@@ -211,8 +212,11 @@ function AutoByeByePanel() {
           message: r.message ?? '',
           scheduled: false,
           error: r.success ? null : (r.message ?? '计算失败'),
+          fallbackUsed: r.fallback_used ?? false,
         },
       }));
+      // 计算时若内存无记录会触发登录识别并回写今日上班时间，刷新让卡片「今日上班」同步显示
+      if (r.success) void refreshStatus();
     } catch (e) {
       const msg = e instanceof ApiError ? `${e.status}` : (e as Error).message;
       setCalc(prev => ({
@@ -223,6 +227,7 @@ function AutoByeByePanel() {
           message: '',
           scheduled: false,
           error: msg,
+          fallbackUsed: false,
         },
       }));
     } finally {
@@ -312,6 +317,21 @@ function AutoByeByePanel() {
                   }}
                 >
                   {c.error}
+                </div>
+              )}
+              {c?.fallbackUsed && c?.punch_out_time && (
+                <div
+                  style={{
+                    marginTop: 8,
+                    padding: '6px 10px',
+                    background: 'var(--warning-bg)',
+                    border: '1px solid var(--warning-border)',
+                    borderRadius: 'var(--radius)',
+                    fontSize: 11,
+                    color: 'var(--warning)',
+                  }}
+                >
+                  今日无上班记录，已按配置上班时间 {c.punch_in_time ?? '—'} 兜底推算下班时间
                 </div>
               )}
               <div className="divider" />
