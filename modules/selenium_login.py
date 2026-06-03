@@ -6,6 +6,7 @@ Selenium登录控制器
 
 import asyncio
 import logging
+import threading
 import time
 import json
 import os
@@ -184,7 +185,12 @@ class SeleniumRecordManager:
 
 class SeleniumLoginController:
     """Selenium登录控制器"""
-    
+
+    # 后台驱动更新的类级去重标志：控制器每次打卡新建实例，双用户并行时
+    # 避免重复下载 / 多个 Timer 同时写 ~/.wdm 缓存冲突。
+    _bg_update_lock = threading.Lock()
+    _bg_update_pending = False
+
     def __init__(self, login_url: str, headless: bool = False, notification_callback=None, browser_type: str = "edge", username: str = "default"):
         """
         初始化登录控制器
@@ -342,27 +348,21 @@ class SeleniumLoginController:
                     edge_options = self._setup_edge_options()
                     import os
                     project_driver_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'msedgedriver.exe')
-                    try:
-                        # 优先用 webdriver-manager 自动下载匹配本地 Edge 版本的 driver
-                        driver_path = EdgeChromiumDriverManager().install()
-                        await self.send_notification("Selenium登录", f"使用 webdriver-manager 管理的Edge驱动: {driver_path}")
-                        self.service = Service(driver_path)
-                        self.driver = webdriver.Edge(service=self.service, options=edge_options)
-                    except Exception as wdm_err:
-                        # 兜底：回退到项目目录中的 msedgedriver.exe（offline 场景）
-                        # 先确认文件存在，否则 Service 指向空路径时 Selenium 会静默改用 Selenium Manager 联网下载，
-                        # 离线下抛出误导性的 "Unable to obtain driver for MicrosoftEdge"
-                        if not os.path.exists(project_driver_path):
-                            raise WebDriverException(
-                                f"离线回退失败：未找到本地 Edge 驱动 {project_driver_path}，"
-                                f"请确认 msedgedriver.exe 已随程序打包"
-                            )
-                        await self.send_notification(
-                            "Selenium登录",
-                            f"webdriver-manager 获取 Edge 驱动失败({str(wdm_err)[:80]})，回退到项目目录WebDriver: {project_driver_path}"
-                        )
-                        self.service = Service(project_driver_path)
-                        self.driver = webdriver.Edge(service=self.service, options=edge_options)
+                    # 打卡路径不联网下载驱动：先用本地已有驱动(优先 webdriver-manager 缓存里版本最高者，
+                    # 否则项目自带的 msedgedriver.exe)立即启动。即便本地驱动版本低于当前 Edge 也先用旧的，
+                    # 避免每次打卡前白等十几秒下载、且离线时也能照常打卡。
+                    # 真正的驱动更新放到打卡执行完毕(close)后、延迟 10 分钟在后台进行(见 _run_bg_driver_update)。
+                    local_driver_path = self._resolve_local_edge_driver(project_driver_path)
+                    if not local_driver_path:
+                        # 本地完全没有驱动(首次部署且未随程序打包驱动)→ 只能在打卡路径上同步联网下载一次兜底
+                        await self.send_notification("Selenium登录", "本地无可用Edge驱动，正在联网下载...")
+                        local_driver_path = EdgeChromiumDriverManager(
+                            url="https://msedgedriver.microsoft.com",
+                            latest_release_url="https://msedgedriver.microsoft.com/LATEST_RELEASE",
+                        ).install()
+                    await self.send_notification("Selenium登录", f"使用本地Edge驱动启动: {local_driver_path}")
+                    self.service = Service(local_driver_path)
+                    self.driver = webdriver.Edge(service=self.service, options=edge_options)
                 
                 await self.send_notification("Selenium登录", f"{browser_name} WebDriver实例创建成功")
                 self.wait = WebDriverWait(self.driver, 10)
@@ -756,6 +756,64 @@ class SeleniumLoginController:
             self.logger.error(f"截图失败: {e}")
             return None
     
+    def _resolve_local_edge_driver(self, project_driver_path):
+        """返回本地可用的 Edge 驱动路径（不联网）。
+
+        优先选 webdriver-manager 缓存(~/.wdm/drivers/edgedriver)里版本号最高的，
+        其次项目目录自带的 msedgedriver.exe；都没有则返回 None(由调用方决定是否联网兜底)。
+        """
+        import os, re
+        candidates = []
+        wdm_dir = os.path.join(os.path.expanduser("~"), ".wdm", "drivers", "edgedriver")
+        if os.path.isdir(wdm_dir):
+            for root, _dirs, files in os.walk(wdm_dir):
+                for f in files:
+                    if f.lower() == "msedgedriver.exe":
+                        candidates.append(os.path.join(root, f))
+
+        def _ver_key(p):
+            m = re.search(r'(\d+(?:\.\d+)*)', os.path.basename(os.path.dirname(p)))
+            return tuple(int(x) for x in m.group(1).split('.')) if m else (0,)
+
+        if candidates:
+            candidates.sort(key=_ver_key, reverse=True)
+            return candidates[0]
+        if project_driver_path and os.path.exists(project_driver_path):
+            return project_driver_path
+        return None
+
+    @classmethod
+    def _schedule_delayed_driver_update(cls, delay: int = 600):
+        """打卡执行完毕后，延迟 delay 秒(默认10分钟)在后台线程把 Edge 驱动更新到 ~/.wdm 缓存，
+        供下次启动使用。下载全程不阻塞打卡；类级去重确保同一时间只有一个待执行/进行中的更新。
+        """
+        with cls._bg_update_lock:
+            if cls._bg_update_pending:
+                return
+            cls._bg_update_pending = True
+        timer = threading.Timer(delay, cls._run_bg_driver_update)
+        timer.daemon = True
+        timer.start()
+        logging.getLogger(__name__).info(
+            f"[Selenium登录] 已安排 {delay} 秒后在后台更新 Edge 驱动(不影响打卡)"
+        )
+
+    @classmethod
+    def _run_bg_driver_update(cls):
+        """后台下载/更新匹配当前 Edge 的最新驱动（在独立线程中执行，不阻塞主流程）。"""
+        logger = logging.getLogger(__name__)
+        try:
+            path = EdgeChromiumDriverManager(
+                url="https://msedgedriver.microsoft.com",
+                latest_release_url="https://msedgedriver.microsoft.com/LATEST_RELEASE",
+            ).install()
+            logger.info(f"[Selenium登录] 后台驱动更新完成，下次启动将优先使用: {path}")
+        except Exception as e:
+            logger.warning(f"[Selenium登录] 后台驱动更新失败(不影响打卡，下次仍用本地驱动): {str(e)[:120]}")
+        finally:
+            with cls._bg_update_lock:
+                cls._bg_update_pending = False
+
     def close(self):
         """关闭浏览器 + 兜底清理 Service 进程"""
         # 正常路径：driver.quit() 会自动停 service
@@ -768,6 +826,8 @@ class SeleniumLoginController:
             finally:
                 self.driver = None
                 self.wait = None
+            # 浏览器确实启动过并已关闭(=本次打卡执行完毕)：延迟 10 分钟在后台更新驱动，供下次启动使用
+            self._schedule_delayed_driver_update()
         # 兜底：driver 创建失败但 Service 已启动（msedgedriver.exe 进程仍在），显式 stop。
         # 注意：driver.quit() 成功时已停掉 service，此处会重复 stop —— selenium 4.x 的
         # Service.stop() 在进程已停止/未真正启动时访问 self.process 会抛 AttributeError（良性）。
