@@ -15,6 +15,7 @@ from typing import Optional, List, Dict
 # Telegram相关
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, CallbackQueryHandler
+from telegram.error import RetryAfter
 
 # 图像处理
 import cv2
@@ -799,6 +800,17 @@ class TelegramBot:
                 error_type = type(e).__name__
                 error_msg = str(e)
 
+                # Flood control：服务器已明确告知需等待的秒数，遵从 retry_after（而非固定短延迟反复撞限流）
+                if isinstance(e, RetryAfter):
+                    wait = getattr(e, 'retry_after', self.retry_delay) + 1
+                    logging.warning(
+                        f"发送Telegram消息触发限流 (尝试 {retry + 1}/{self.max_retries})，{wait}秒后重试"
+                    )
+                    if retry < self.max_retries - 1:
+                        await asyncio.sleep(wait)
+                        continue
+                    return False
+
                 # 检查是否是HTTPXRequest初始化错误
                 if "HTTPXRequest" in error_msg and "not initialized" in error_msg:
                     self._is_initialized = False  # 标记需要重新初始化
@@ -919,11 +931,11 @@ class TelegramBot:
                 if saved_task['type'] == 'punch_out':
                     async def retry_punch_out_job():
                         await self.attendance_system.punch_out()
-                    schedule.every().day.at(saved_task['scheduled_time']).do(retry_punch_out_job)
+                    schedule.every().day.at(saved_task['scheduled_time']).do(lambda: asyncio.create_task(retry_punch_out_job()))
                 elif saved_task['type'] == 'punch_in':
                     async def retry_punch_in_job():
                         await self.attendance_system.punch_in()
-                    schedule.every().day.at(saved_task['scheduled_time']).do(retry_punch_in_job)
+                    schedule.every().day.at(saved_task['scheduled_time']).do(lambda: asyncio.create_task(retry_punch_in_job()))
 
             await message.reply_text(
                 f"已删除任务:\n"
@@ -1268,11 +1280,11 @@ class TelegramBot:
                         if saved_task['type'] == 'punch_out':
                             async def retry_punch_out_job():
                                 await self.attendance_system.punch_out()
-                            schedule.every().day.at(saved_task['scheduled_time']).do(retry_punch_out_job)
+                            schedule.every().day.at(saved_task['scheduled_time']).do(lambda: asyncio.create_task(retry_punch_out_job()))
                         elif saved_task['type'] == 'punch_in':
                             async def retry_punch_in_job():
                                 await self.attendance_system.punch_in()
-                            schedule.every().day.at(saved_task['scheduled_time']).do(retry_punch_in_job)
+                            schedule.every().day.at(saved_task['scheduled_time']).do(lambda: asyncio.create_task(retry_punch_in_job()))
 
                     # 发送删除成功的消息
                     await query.message.reply_text(
@@ -1435,15 +1447,18 @@ class TelegramBot:
 
                             try:
                                 # 根据打卡类型执行相应的操作
+                                # punch_in/out 返回单值(True/False/'cancelled')，不能按二元组解包
                                 if punch_type == 'in':
-                                    success, message = await self.attendance_system.punch_in()
+                                    result = await self.attendance_system.punch_in()
                                 else:
-                                    success, message = await self.attendance_system.punch_out()
+                                    result = await self.attendance_system.punch_out()
 
-                                if success:
-                                    await query.message.edit_text(f"✅ {punch_type}打卡执行完成：{message}")
+                                if result == 'cancelled':
+                                    await query.message.edit_text(f"⚠️ {punch_type}打卡已被取消")
+                                elif result is True:
+                                    await query.message.edit_text(f"✅ {punch_type}打卡执行完成")
                                 else:
-                                    await query.message.edit_text(f"❌ {punch_type}打卡执行失败：{message}")
+                                    await query.message.edit_text(f"❌ {punch_type}打卡执行失败")
 
                                 # 保存配置
                                 config_data = {
@@ -1924,13 +1939,15 @@ class TelegramBot:
                 await asyncio.sleep(10)
                 
                 try:
-                    # 直接执行下班打卡
-                    success, message = await self.attendance_system.punch_out()
+                    # 直接执行下班打卡；punch_out 返回单值(True/False/'cancelled')，不能按二元组解包
+                    result = await self.attendance_system.punch_out()
 
-                    if success:
-                        await query.message.edit_text(f"✅ 16:35自动下班打卡执行完成：{message}")
+                    if result == 'cancelled':
+                        await query.message.edit_text("⚠️ 16:35自动下班打卡已被取消")
+                    elif result is True:
+                        await query.message.edit_text("✅ 16:35自动下班打卡执行完成")
                     else:
-                        await query.message.edit_text(f"❌ 16:35自动下班打卡执行失败：{message}")
+                        await query.message.edit_text("❌ 16:35自动下班打卡执行失败")
 
                 except Exception as e:
                     error_msg = f"执行16:35自动下班打卡时发生错误: {str(e)}"
@@ -2086,26 +2103,44 @@ class TelegramBot:
                 return False, f"Bot 重连失败: {e}"
 
     async def monitor_connection(self):
-        """监控连接状态"""
+        """监控连接状态。
+
+        超时（update_timeout）只代表"长时间没有 incoming 更新"，单用户长时间不发命令时这属正常空闲，
+        不能据此直接重启。故先用 get_me() 主动探测：探测成功=连接健康（仅刷新计时、不重启）；探测失败
+        才重启轮询，并对连续失败做指数退避，避免代理(mihomo)抖动时高频重启刷屏。
+        """
+        monitor_fail_count = 0  # 连续探测/重启失败计数，用于指数退避
         while True:
             try:
-                current_time = datetime.now()
-
-                # 检查最后更新时间
-                if self.last_update_time:
-                    time_since_last_update = (current_time - self.last_update_time).total_seconds()
+                # 仅在 bot 可用且 app 存在时自愈，避免与 GUI 重连端点(reconnect)抢同一 app
+                if getattr(self.attendance_system, 'bot_available', True) and self.app is not None and self.last_update_time:
+                    time_since_last_update = (datetime.now() - self.last_update_time).total_seconds()
 
                     if time_since_last_update > self.update_timeout:
-                        logging.warning(f"已经 {time_since_last_update:.0f} 秒没有收到更新，尝试重启轮询...")
-
-                        # 尝试重启轮询
+                        # 主动健康探测：区分"空闲但健康"与"连接已断"
                         try:
-                            await self.restart_polling()
-                        except Exception as e:
-                            logging.error(f"重启轮询失败: {str(e)}")
-                            # 如果重启失败，标记需要重新初始化
-                            self._is_initialized = False
-                            self.app = None
+                            await self.app.bot.get_me()
+                            # 探测成功说明连接健康，只是单用户长时间没发消息——刷新计时，不重启
+                            self.last_update_time = datetime.now()
+                            monitor_fail_count = 0
+                        except Exception as probe_err:
+                            monitor_fail_count += 1
+                            logging.warning(
+                                f"已经 {time_since_last_update:.0f} 秒没有收到更新且健康探测失败"
+                                f"(第 {monitor_fail_count} 次): {probe_err!r}，尝试重启轮询..."
+                            )
+                            try:
+                                await self.restart_polling()
+                                monitor_fail_count = 0
+                            except Exception as e:
+                                logging.error(f"重启轮询失败: {str(e)}")
+                                # 如果重启失败，标记需要重新初始化
+                                self._is_initialized = False
+                                self.app = None
+                            # 连续失败时退避，最长 600 秒，避免代理未就绪时刷屏
+                            backoff = min(60 * (2 ** monitor_fail_count), 600)
+                            await asyncio.sleep(backoff)
+                            continue
 
                 await asyncio.sleep(60)
             except Exception as e:

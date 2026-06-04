@@ -514,6 +514,7 @@ class AttendanceSystem:
             punch_type: 打卡类型 "上班" 或 "下班"
             error_msg: 错误消息
         """
+        screenshot_path = None  # Telegram 临时截图，发送异常时也要在 finally 清理
         try:
             # 保存并发送当前的浏览器窗口截图
             screenshot_path = f'punch_{punch_type}_fail_uncertain.png'
@@ -542,13 +543,8 @@ class AttendanceSystem:
                 with open(email_screenshot_path, 'wb') as f_out:
                     f_out.write(img_data)
 
-            # 发送邮件
+            # 发送邮件（email_screenshot_path 的删除已交给后台发送线程 cleanup_path，主流程不再删）
             await self.send_email_with_attachment(email_subject, email_body, email_screenshot_path, f"{punch_type}(失败)")
-
-            # 删除临时文件
-            os.remove(screenshot_path)
-            if os.path.exists(email_screenshot_path):
-                os.remove(email_screenshot_path)
 
         except Exception as e:
             error_type = type(e).__name__
@@ -560,6 +556,13 @@ class AttendanceSystem:
                 await self.send_notification("打卡流程", f"通知发送失败 (HTTPXRequest错误): {error_msg_detail}")
             else:
                 await self.send_notification("打卡流程", f"通知发送失败: {error_msg_detail}")
+        finally:
+            # Telegram 临时截图不传后台线程，主流程删除无竞态；放 finally 保证发送异常也清理
+            if screenshot_path and os.path.exists(screenshot_path):
+                try:
+                    os.remove(screenshot_path)
+                except Exception:
+                    pass
 
     def setup_logging(self):
         """配置日志记录"""
@@ -1287,6 +1290,9 @@ class AttendanceSystem:
         """
         try:
             logging.info(f"开始设置定时下班打卡，延迟{delay_minutes}分钟")
+            # 下限保护：delay_minutes 可能被钳为 0（is_overtime 但 confirmation_needed 仍 True），
+            # 此时 now+0 取整到 HH:MM:00 通常 <= now，schedule 会把任务排到次日，当天重试落空。
+            delay_minutes = max(1, int(delay_minutes))
             retry_time = datetime.now() + timedelta(minutes=delay_minutes)
             time_str = retry_time.strftime("%H:%M")
 
@@ -1607,11 +1613,15 @@ class AttendanceSystem:
             )
 
             # 添加每个用户的打卡记录
+            # 读取运行态打卡桶 today_punch_records（由 _set_user_punch_time 写入），而非
+            # config 静态 user['punch_records']（恒为 None、从无写入），否则日报永远显示"未打卡"。
             status_text += "📍 今日打卡记录\n"
-            for user in self.users:
-                status_text += f"\n用户: {user['username']}\n"
-                status_text += f"上班打卡：{'✅ ' + user['punch_records']['punch_in_time'].strftime('%H:%M:%S') if user['punch_records']['punch_in_time'] else '❌ 未打卡'}\n"
-                status_text += f"下班打卡：{'✅ ' + user['punch_records']['punch_out_time'].strftime('%H:%M:%S') if user['punch_records']['punch_out_time'] else '❌ 未打卡'}\n"
+            for uname, record in self.today_punch_records.items():
+                in_t = record.get('punch_in_time')
+                out_t = record.get('punch_out_time')
+                status_text += f"\n用户: {uname}\n"
+                status_text += f"上班打卡：{'✅ ' + in_t.strftime('%H:%M:%S') if in_t else '❌ 未打卡'}\n"
+                status_text += f"下班打卡：{'✅ ' + out_t.strftime('%H:%M:%S') if out_t else '❌ 未打卡'}\n"
 
             status_text += (
                 "\n⚙️ 系统信息\n"
@@ -1720,10 +1730,8 @@ class AttendanceSystem:
                         # 发送邮件
                         await self.send_email_with_attachment(email_subject, email_body, email_screenshot_path, f"{punch_type}(登录失败)")
 
-                        # 删除临时文件
+                        # 删除临时文件（邮件截图由后台发送线程清理，主流程仅删 Telegram 临时截图）
                         os.remove(screenshot_path)
-                        if os.path.exists(email_screenshot_path):
-                            os.remove(email_screenshot_path)
                     except Exception as e:
                         await self.send_notification("打卡流程", f"通知发送失败: {str(e)}")
 
@@ -1847,10 +1855,8 @@ class AttendanceSystem:
                             # 发送邮件
                             await self.send_email_with_attachment(email_subject, email_body, email_screenshot_path, f"{punch_type}(失败)")
 
-                            # 删除临时文件
+                            # 删除临时文件（邮件截图由后台发送线程清理，主流程仅删 Telegram 临时截图）
                             os.remove(screenshot_path)
-                            if os.path.exists(email_screenshot_path):
-                                os.remove(email_screenshot_path)
 
                         except Exception as e:
                             error_type = type(e).__name__
@@ -2003,11 +2009,7 @@ class AttendanceSystem:
                                 # 发送邮件
                                 await self.send_email_with_attachment(subject, body, email_screenshot_path, punch_type)
 
-                                os.remove(screenshot_path)  # 删除Telegram发送的临时截图
-
-                                # 邮件发送完成后删除邮件截图
-                                if os.path.exists(email_screenshot_path):
-                                    os.remove(email_screenshot_path)
+                                os.remove(screenshot_path)  # 删除Telegram发送的临时截图（邮件截图由后台发送线程清理）
                                 break
                             else:
                                 await self.send_notification("打卡流程", f"截图文件不存在: {screenshot_path}")
@@ -2115,10 +2117,8 @@ class AttendanceSystem:
                         # 发送邮件
                         await self.send_email_with_attachment(email_subject, email_body, email_screenshot_path, f"{punch_type}(登录失败)")
 
-                        # 删除临时文件
+                        # 删除临时文件（邮件截图由后台发送线程清理，主流程仅删 Telegram 临时截图）
                         os.remove(screenshot_path)
-                        if os.path.exists(email_screenshot_path):
-                            os.remove(email_screenshot_path)
                     except Exception as e:
                         await self.send_notification("打卡流程", f"通知发送失败: {str(e)}")
 
@@ -2164,10 +2164,8 @@ class AttendanceSystem:
                     # 发送邮件
                     await self.send_email_with_attachment(email_subject, email_body, email_screenshot_path, f"{punch_type}(系统错误)")
 
-                    # 删除临时文件
+                    # 删除临时文件（邮件截图由后台发送线程清理，主流程仅删 Telegram 临时截图）
                     os.remove(screenshot_path)
-                    if os.path.exists(email_screenshot_path):
-                        os.remove(email_screenshot_path)
                 except Exception as e:
                     await self.send_notification("打卡流程", f"通知发送失败: {str(e)}")
 
@@ -2193,8 +2191,10 @@ class AttendanceSystem:
 
         flow_type = "punch_in" if punch_type == "上班" else "punch_out"
         flow_name = punch_type
-        effective_username = username or self.login_username
-        effective_password = password or self.login_password
+        # 兜底来源用 self.users 首元素（与 3478/3550 等处一致），而非从未赋值的
+        # self.login_username/self.login_password（会抛 AttributeError）。用 .get 防缺键。
+        effective_username = username or (self.users[0].get('username') if self.users else None)
+        effective_password = password or (self.users[0].get('password') if self.users else None)
 
         def _decode_screenshot_bytes(b):
             """selenium 截图 bytes → numpy 数组，供 cv2.imwrite 使用"""
@@ -2268,6 +2268,11 @@ class AttendanceSystem:
         status_message = None
         selenium_controller = None
         screenshot_bytes = None
+        # 逐步进度编辑节流：同一条 status_message 在 _STEP_EDIT_MIN_INTERVAL 秒内最多编辑一次，
+        # 防止 Selenium 流程数秒内数十次 edit_text 触发 Telegram Flood control。被跳过的步骤内容
+        # 已累积在 message_content 里，流程结束时的无条件 edit（2493/2555）会带出全文，不丢信息。
+        last_step_edit_ts = 0.0
+        _STEP_EDIT_MIN_INTERVAL = 2.0
 
         # 取消事件读取助手：统一判断（含 Flask 线程强停的 _cancel_flag）
         def _cancel_triggered():
@@ -2289,7 +2294,7 @@ class AttendanceSystem:
                 await self.send_notification("Selenium打卡", f"开始{flow_name}流程...")
 
             async def enhanced_notification_callback(context: str, msg: str):
-                nonlocal message_content
+                nonlocal message_content, last_step_edit_ts
                 message_content += f"[{context}] {msg}\n"
                 # 把"带用户名"的逐步进度独立补推到 GUI（WS punch:progress）。
                 # 原因：默认逐步通知只 edit Telegram 的 status_message、不进 WS，且不带用户名，
@@ -2306,7 +2311,12 @@ class AttendanceSystem:
                         logging.exception("event_bus publish failed for punch:progress (per-user)")
                 try:
                     if status_message:
-                        await status_message.edit_text(_safe_message(message_content))
+                        # 节流：距上次编辑不足最小间隔则跳过本次 edit（内容已进 message_content，
+                        # 由流程结束时的无条件 edit 收尾带出），避免高频编辑触发 Flood control。
+                        now_ts = time.monotonic()
+                        if now_ts - last_step_edit_ts >= _STEP_EDIT_MIN_INTERVAL:
+                            await status_message.edit_text(_safe_message(message_content))
+                            last_step_edit_ts = now_ts
                     else:
                         await self.send_notification(context, msg)
                 except Exception:
@@ -2464,12 +2474,11 @@ class AttendanceSystem:
                             with open(email_screenshot_path, 'wb') as f:
                                 f.write(screenshot_bytes)
 
+                            # 邮件截图由后台发送线程读取后清理（cleanup_path），主流程不再提前删除，
+                            # 避免与后台读取竞争导致 WinError 32（即日志中"发送成功邮件失败"的根因）。
                             await self.send_email_with_attachment(
                                 subject, body, email_screenshot_path, punch_type
                             )
-
-                            if os.path.exists(email_screenshot_path):
-                                os.remove(email_screenshot_path)
                         except Exception as email_err:
                             logging.error(f"发送{punch_type}成功邮件失败: {email_err}")
 
@@ -2717,10 +2726,17 @@ class AttendanceSystem:
 
     def _operation_completed_callback(self, task):
         """操作完成时的回调函数"""
-        asyncio.create_task(self._cleanup_operation_state())
+        asyncio.create_task(self._cleanup_operation_state(task))
 
-    async def _cleanup_operation_state(self):
-        """清理操作状态"""
+    async def _cleanup_operation_state(self, task=None):
+        """清理操作状态。
+
+        task 非 None 时做归属校验：若它已不是当前 self.operation_task，说明已有新一轮操作
+        覆盖（或已被清空），跳过本次清理，避免滞后的旧清理把刚建立的新操作状态误清为 None。
+        task=None（如 web force_stop 全局强停）维持无条件清理语义。
+        """
+        if task is not None and task is not self.operation_task:
+            return
         self.current_operation = None
         self.operation_task = None
         self.operation_cancel_event = None
@@ -2779,6 +2795,8 @@ class AttendanceSystem:
             return False, "当前没有进行中的操作"
 
         operation_type = self.current_operation
+        # 捕获本次要取消的 task 引用，供清理时做归属校验（防止误清后续新操作的状态）
+        op_task = self.operation_task
 
         # 设置取消事件
         if self.operation_cancel_event:
@@ -2800,8 +2818,8 @@ class AttendanceSystem:
         # 确保浏览器被关闭
         await self.cleanup_browser()
 
-        # 清理状态
-        await self._cleanup_operation_state()
+        # 清理状态（带归属校验：仅当 operation_task 仍是本次取消的 op_task 时才清）
+        await self._cleanup_operation_state(op_task)
 
         return True, f"{operation_type}操作已取消"
 
@@ -3436,13 +3454,15 @@ class AttendanceSystem:
             # 如果是失败、错误相关的打卡，发送给所有用户
             send_to_all = any(keyword in punch_type for keyword in ["失败", "错误", "异常"])
 
-            # 异步发送邮件
+            # 异步发送邮件；把临时截图的删除交给后台发送线程（cleanup_path），
+            # 避免主流程提前 os.remove 与后台读取附件竞争（WinError 32）。
             self.email_service.send_email_async(
                 subject=subject,
                 body=body,
                 image_path=attachment_path,
                 send_to_all=send_to_all,
-                callback=email_callback
+                callback=email_callback,
+                cleanup_path=attachment_path
             )
 
             # 立即返回True，不等待邮件发送完成

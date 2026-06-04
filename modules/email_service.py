@@ -237,14 +237,15 @@ class EmailService:
         self.logger.error(f"邮件发送失败，已重试{self.max_retries}次")
         return False
     
-    def send_email_async(self, subject: str, body: str, 
+    def send_email_async(self, subject: str, body: str,
                         recipients: Optional[List[str]] = None,
-                        image_path: Optional[str] = None, 
+                        image_path: Optional[str] = None,
                         is_html: bool = False,
                         send_to_all: bool = False,
-                        callback: Optional[callable] = None) -> None:
+                        callback: Optional[callable] = None,
+                        cleanup_path: Optional[str] = None) -> None:
         """异步发送邮件（不阻塞主流程）
-        
+
         Args:
             subject: 邮件主题
             body: 邮件正文
@@ -253,6 +254,8 @@ class EmailService:
             is_html: 是否为HTML格式邮件
             send_to_all: 是否发送给所有收件人，默认False只发送给第一个收件人
             callback: 发送完成后的回调函数（可选）
+            cleanup_path: 发送完成后需删除的临时附件路径（可选）。删除责任由本后台线程承担，
+                          避免主流程提前 os.remove 与本线程读取附件竞争导致 WinError 32。
         """
         def send_thread():
             try:
@@ -263,7 +266,15 @@ class EmailService:
                 self.logger.error(f"异步邮件发送异常: {e}")
                 if callback:
                     callback(False, subject)
-        
+            finally:
+                # 附件读取完成后再删除，从根本上消除主流程提前删除的时序竞态
+                if cleanup_path:
+                    try:
+                        if os.path.exists(cleanup_path):
+                            os.remove(cleanup_path)
+                    except Exception as e:
+                        self.logger.warning(f"清理邮件临时截图失败: {cleanup_path}, {e}")
+
         thread = threading.Thread(target=send_thread, daemon=True)
         thread.start()
         self.logger.info(f"邮件已提交异步发送队列: {subject}")

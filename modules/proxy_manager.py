@@ -461,6 +461,7 @@ class ProxyManager:
         creationflags = 0
         if os.name == 'nt':
             creationflags = getattr(subprocess, 'CREATE_NO_WINDOW', 0)
+        logf = None
         try:
             logf = open(self._log_path(), 'a', encoding='utf-8', errors='replace')
             self.proc = subprocess.Popen(
@@ -472,6 +473,14 @@ class ProxyManager:
         except Exception as e:
             logger.error('启动 mihomo 失败: %s', e, exc_info=True)
             return False, f'启动 mihomo 失败：{e}'
+        finally:
+            # 子进程已继承独立句柄；父端副本无需保留，确定性关闭：
+            # 失败路径修复句柄泄漏，成功路径避免父端写句柄长期占用 mihomo.log（Windows 删/轮转 WinError 32）。
+            if logf is not None:
+                try:
+                    logf.close()
+                except Exception:
+                    pass
 
         try:
             with open(self._pid_path(), 'w') as f:

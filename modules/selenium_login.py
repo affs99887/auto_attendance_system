@@ -1834,10 +1834,17 @@ class SeleniumLoginController:
             punch_result = {"punched": False, "message": "", "already_punched": False}
             
             if not button_status.get("offwork", False):
-                # 下班按钮不可用，说明已经打过卡了或还未上班打卡
-                await self.send_notification("完整下班流程", "下班按钮不可用，可能已经打过卡或还未上班打卡")
-                punch_result["already_punched"] = True
-                punch_result["message"] = "下班按钮不可用，可能已经打过卡或还未上班打卡"
+                # 下班按钮不可用：需区分"已完成上下班"与"今日尚未上班打卡"——后者下班按钮同样禁用。
+                if button_status.get("gotowork", False):
+                    # 上班按钮仍可用，说明今日尚未上班打卡，应判为失败而非"已打过下班卡"，
+                    # 避免掩盖"没上班、下班也没打成"的真实异常，让上层落入既有失败分支。
+                    await self.send_notification("完整下班流程", "下班按钮不可用且上班按钮仍可用，疑似今日尚未上班打卡")
+                    punch_result["message"] = "下班按钮不可用且上班按钮仍可用，疑似今日尚未上班打卡"
+                else:
+                    # 上班按钮也不可用，确为今日已完成上下班打卡
+                    await self.send_notification("完整下班流程", "下班按钮不可用，今日应已打过下班卡")
+                    punch_result["already_punched"] = True
+                    punch_result["message"] = "下班按钮不可用，今日应已打过下班卡"
             else:
                 # 下班按钮可用，执行打卡（跳过重复的frame切换和按钮检查）
                 await self.send_notification("完整下班流程", "步骤4: 执行下班打卡...")
