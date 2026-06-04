@@ -188,7 +188,7 @@ function TitleBar() {
         <span>自动打卡系统</span>
         <span style={{ color: 'var(--text-muted)', fontWeight: 400, marginLeft: 4 }}>v2.0</span>
       </div>
-      <div className="titlebar-title">Auto Attendance · 邓蕴哲@localhost</div>
+      <div className="titlebar-title">Auto Attendance · 赖得鑫@localhost</div>
       <div className="window-controls">
         <button className="win-btn" title="最小化" onClick={() => win?.minimize()}>
           <Icon.Minus size={10} />
@@ -228,7 +228,7 @@ function Toolbar({ title, sub, actions, clock }: ToolbarProps) {
 
 export function App() {
   const [screen, setScreen] = React.useState<ScreenId>('dashboard');
-  const [currentUser, setCurrentUser] = React.useState<string>('邓蕴哲');
+  const [currentUser, setCurrentUser] = React.useState<string>('赖得鑫');
   const clock = useClock();
   // 模式状态来自后端真实配置（单一事实源 = snapshot.config）；切换走 setMode（乐观更新+持久化+失败回滚）
   const cfg = useSystemStore(s => s.snapshot?.config);

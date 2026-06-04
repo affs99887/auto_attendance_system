@@ -390,7 +390,7 @@ export function SettingsScreen() {
             <button
               className="btn btn-primary"
               disabled={envLoading}
-              onClick={() => saveFields(['LOGIN_USERNAME', 'LOGIN_PASSWORD', 'LOGIN_USERNAME2', 'LOGIN_PASSWORD2', 'LOGIN_URL'])}
+              onClick={() => saveFields(['LOGIN_USERNAME', 'LOGIN_PASSWORD', 'LOGIN_URL'])}
             >
               <Icon.Check size={12} />保存到 .env（需重启）
             </button>

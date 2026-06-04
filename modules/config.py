@@ -324,7 +324,7 @@ class Config:
     @classmethod
     def get_user_configs(cls):
         """获取多用户配置"""
-        return [
+        users = [
             {
                 'username': cls.LOGIN_USERNAME,
                 'password': cls.LOGIN_PASSWORD,
@@ -332,16 +332,20 @@ class Config:
                     'punch_in_time': None,
                     'punch_out_time': None
                 }
-            },
-            {
+            }
+        ]
+        # 第二用户（邓蕴哲，2026-06 离职后已在 .env 注释）：仅当用户名/密码都配置时才纳入，
+        # 避免注释后产生 username=None 的脏条目，导致并行打卡误判、Telegram /check 等命令崩溃。
+        if cls.LOGIN_USERNAME2 and cls.LOGIN_PASSWORD2:
+            users.append({
                 'username': cls.LOGIN_USERNAME2,
                 'password': cls.LOGIN_PASSWORD2,
                 'punch_records': {
                     'punch_in_time': None,
                     'punch_out_time': None
                 }
-            }
-        ]
+            })
+        return users
 
     @classmethod
     def ensure_directories(cls):

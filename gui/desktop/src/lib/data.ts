@@ -12,8 +12,9 @@ import type {
 export const TODAY = '2026-05-19';
 
 export const USERS: User[] = [
-  { id: '邓蕴哲', name: '邓蕴哲', env: 'LOGIN_USERNAME', short: '邓', color: 'oklch(0.55 0.13 250)' },
-  { id: '赖得鑫', name: '赖得鑫', env: 'LOGIN_USERNAME2', short: '赖', color: 'oklch(0.55 0.13 30)' },
+  // 邓蕴哲已离职（2026-06），切单用户后注释保留；恢复双账号时取消下行注释，并把赖得鑫 env 改回 LOGIN_USERNAME2
+  // { id: '邓蕴哲', name: '邓蕴哲', env: 'LOGIN_USERNAME', short: '邓', color: 'oklch(0.55 0.13 250)' },
+  { id: '赖得鑫', name: '赖得鑫', env: 'LOGIN_USERNAME', short: '赖', color: 'oklch(0.55 0.13 30)' },
 ];
 
 export const RECORDS: RecordsByUser = {
@@ -100,12 +101,13 @@ export const SCHEDULED_TASKS: ScheduledTask[] = [
 ];
 
 export const RECENT_ACTIVITY: RecentActivityEntry[] = [
-  { ts: '08:29:55', user: '邓蕴哲', type: 'punch_in', status: 'ok', method: 'Selenium', detail: '登录成功 · 打卡按钮点击成功' },
+  // 邓蕴哲已离职（2026-06），切单用户后注释保留：
+  // { ts: '08:29:55', user: '邓蕴哲', type: 'punch_in', status: 'ok', method: 'Selenium', detail: '登录成功 · 打卡按钮点击成功' },
   { ts: '08:30:02', user: '赖得鑫', type: 'punch_in', status: 'ok', method: 'Selenium', detail: '并行打卡 · 全员成功' },
   { ts: '08:20:00', user: 'system', type: 'daily_status', status: 'ok', method: 'schedule', detail: '已发送每日状态推送' },
   { ts: '08:15:00', user: 'system', type: 'reminder', status: 'ok', method: 'schedule', detail: '8:15 每日提醒已触发' },
   { ts: '00:01:13', user: 'system', type: 'log_rotate', status: 'ok', method: 'system', detail: 'attendance_system.log 已轮转' },
-  { ts: '2026-05-18 17:03:00', user: '邓蕴哲', type: 'punch_out', status: 'ok', method: 'Selenium', detail: '工作时长 8h17m' },
+  // { ts: '2026-05-18 17:03:00', user: '邓蕴哲', type: 'punch_out', status: 'ok', method: 'Selenium', detail: '工作时长 8h17m' },
   { ts: '2026-05-18 17:14:00', user: '赖得鑫', type: 'punch_out', status: 'ok', method: 'Selenium', detail: '工作时长 8h23m' },
 ];
 

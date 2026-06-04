@@ -250,7 +250,7 @@ export function DashboardScreen() {
   const _now = new Date();
   const todayLabel = `${_now.getFullYear()}-${String(_now.getMonth() + 1).padStart(2, '0')}-${String(_now.getDate()).padStart(2, '0')} ${['周日', '周一', '周二', '周三', '周四', '周五', '周六'][_now.getDay()]}`;
 
-  const monthRecs = RECORDS['邓蕴哲']['2026-05'];
+  const monthRecs = RECORDS[currentUser]?.['2026-05'] ?? {};
   const onTimeCount = Object.values(monthRecs).filter(r => r.in && r.in <= '09:00:00').length;
   const totalInThisMonth = Object.values(monthRecs).filter(r => r.in).length;
 
@@ -303,7 +303,7 @@ export function DashboardScreen() {
           </div>
           <div className="kpi-meta">
             <StatusDot tone="success" />
-            准点率 {Math.round((onTimeCount / totalInThisMonth) * 100)}%
+            准点率 {totalInThisMonth ? Math.round((onTimeCount / totalInThisMonth) * 100) : 0}%
           </div>
         </div>
         <div className="kpi">
