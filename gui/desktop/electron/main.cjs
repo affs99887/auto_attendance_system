@@ -9,7 +9,7 @@
 //   1. dev:  AAS_DEV=1 npx electron electron/main.cjs   （Vite 必须先启）
 //   2. prod: npx electron .                             （走 build 后的 dist）
 
-const { app, BrowserWindow, Tray, Menu, nativeImage, shell, dialog, ipcMain } = require('electron');
+const { app, BrowserWindow, Tray, Menu, nativeImage, shell, dialog, ipcMain, screen } = require('electron');
 const path = require('node:path');
 const fs = require('node:fs');
 const { spawn, execFileSync } = require('node:child_process');
@@ -26,6 +26,8 @@ const LEGACY_DATA_DIR = 'C:\\auto_attendance_system';
 const DATA_DIR = process.env.AAS_DATA_DIR
   || (app.isPackaged ? LEGACY_DATA_DIR : PROJECT_ROOT);
 const TOKEN_PATH = path.join(DATA_DIR, 'logs', '.gui_token');
+// 窗口尺寸/位置/最大化状态持久化文件（关窗缩托盘不退进程，靠 resize/move 防抖落盘覆盖关闭场景）
+const WINDOW_STATE_PATH = path.join(DATA_DIR, 'window-state.json');
 const DEV_SERVER_URL = process.env.AAS_DEV_SERVER || 'http://127.0.0.1:5173';
 const HTTP_PORT = parseInt(process.env.AAS_HTTP_PORT || '8765', 10);
 const WS_PORT = parseInt(process.env.AAS_WS_PORT || '8766', 10);
@@ -264,10 +266,57 @@ async function waitForToken(timeoutMs = 60_000) {
 }
 
 // ============================================================================
+// 窗口状态持久化（尺寸 / 位置 / 最大化）
+//  - loadWindowState: 读 JSON，失败/不存在返回 null
+//  - saveWindowState: 写 JSON，失败静默
+//  - isVisibleOnSomeDisplay: 越界校验，bounds 与任一显示器 workArea 有可见交集才采用
+// ============================================================================
+function loadWindowState() {
+  try {
+    const raw = fs.readFileSync(WINDOW_STATE_PATH, 'utf-8');
+    const state = JSON.parse(raw);
+    if (state && typeof state === 'object') return state;
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+function saveWindowState(state) {
+  try {
+    fs.writeFileSync(WINDOW_STATE_PATH, JSON.stringify(state), 'utf-8');
+  } catch {
+    /* ignore */
+  }
+}
+
+function isVisibleOnSomeDisplay(bounds) {
+  if (
+    !bounds ||
+    typeof bounds.x !== 'number' || typeof bounds.y !== 'number' ||
+    typeof bounds.width !== 'number' || typeof bounds.height !== 'number'
+  ) {
+    return false;
+  }
+  return screen.getAllDisplays().some(d => {
+    const wa = d.workArea;
+    // 矩形相交（任意可见交集即可，防窗口落到已拔掉的副屏外）
+    return (
+      bounds.x < wa.x + wa.width &&
+      bounds.x + bounds.width > wa.x &&
+      bounds.y < wa.y + wa.height &&
+      bounds.y + bounds.height > wa.y
+    );
+  });
+}
+
+// ============================================================================
 // 创建主窗口（不再等 token —— 立刻显示，token 经 IPC 后到）
 // ============================================================================
 async function createWindow() {
-  const win = new BrowserWindow({
+  const savedState = loadWindowState();
+  // 默认 1480x920：不设 x/y 让其居中；有可见的历史 bounds 才复用尺寸+位置
+  const winOpts = {
     width: 1480,
     height: 920,
     minWidth: 1100,
@@ -290,11 +339,57 @@ async function createWindow() {
         `--aas-ws=ws://127.0.0.1:${WS_PORT}`,
       ],
     },
-  });
+  };
+
+  if (savedState && isVisibleOnSomeDisplay(savedState)) {
+    winOpts.width = savedState.width;
+    winOpts.height = savedState.height;
+    winOpts.x = savedState.x;
+    winOpts.y = savedState.y;
+  }
+
+  const win = new BrowserWindow(winOpts);
 
   mainWindow = win;
 
-  win.once('ready-to-show', () => win.show());
+  win.once('ready-to-show', () => {
+    win.show();
+    // 上次为最大化：show 后再 maximize（保留还原后的普通 bounds）
+    if (savedState && savedState.isMaximized) win.maximize();
+  });
+
+  // resize / move 防抖落盘：仅在非最大化时记录普通 bounds（最大化的 bounds 不入库，便于还原）
+  let saveTimer = null;
+  const scheduleSave = () => {
+    if (saveTimer) clearTimeout(saveTimer);
+    saveTimer = setTimeout(() => {
+      saveTimer = null;
+      if (win.isDestroyed()) return;
+      if (win.isMaximized()) return;
+      const b = win.getBounds();
+      saveWindowState({ width: b.width, height: b.height, x: b.x, y: b.y, isMaximized: false });
+    }, 300);
+  };
+  win.on('resize', scheduleSave);
+  win.on('move', scheduleSave);
+
+  // 最大化：记录 isMaximized=true，但普通 bounds 沿用上次保存的非最大化值（避免把最大化尺寸当成还原尺寸）
+  win.on('maximize', () => {
+    const prev = loadWindowState();
+    const b = win.getBounds();
+    saveWindowState({
+      width: prev && typeof prev.width === 'number' ? prev.width : b.width,
+      height: prev && typeof prev.height === 'number' ? prev.height : b.height,
+      x: prev && typeof prev.x === 'number' ? prev.x : b.x,
+      y: prev && typeof prev.y === 'number' ? prev.y : b.y,
+      isMaximized: true,
+    });
+  });
+  // 还原：此时 getBounds 即普通 bounds，记录 isMaximized=false
+  win.on('unmaximize', () => {
+    const b = win.getBounds();
+    saveWindowState({ width: b.width, height: b.height, x: b.x, y: b.y, isMaximized: false });
+  });
 
   // 渲染进程加载完成后补推一次最近状态 + 当前启动日志全量（解决 push 早于渲染进程注册监听的竞态；HMR/重载也安全幂等）
   win.webContents.on('did-finish-load', () => {

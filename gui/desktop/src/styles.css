@@ -863,3 +863,62 @@ html, body {
   border-radius: 2px 2px 0 0;
   min-height: 4px;
 }
+
+/* === 汇率换算器（ExchangeRatePanel）=== */
+.fx-conv-field { display: flex; align-items: center; gap: 10px; padding: 10px 12px; background: var(--bg-inset); border: 1px solid var(--border); border-radius: var(--radius); }
+.fx-conv-field.readonly { background: var(--accent-bg); border-color: var(--accent-border); }
+.fx-conv-cur { display: flex; flex-direction: column; gap: 1px; min-width: 56px; flex-shrink: 0; }
+.fx-conv-code { font-size: 14px; font-weight: 600; color: var(--text-primary); }
+.fx-conv-name { font-size: 10px; color: var(--text-muted); }
+.fx-conv-input { flex: 1; min-width: 0; text-align: right; font-size: 20px; font-weight: 500; border: none; background: transparent; padding: 0; }
+.fx-conv-input:focus { box-shadow: none; border: none; }
+.fx-conv-out { color: var(--accent-fg); }
+.fx-swap-wrap { position: relative; display: flex; align-items: center; justify-content: center; height: 4px; }
+.fx-swap-line { position: absolute; left: 0; right: 0; top: 50%; height: 1px; background: var(--border-soft); }
+.fx-swap-btn { position: relative; z-index: 1; background: var(--bg-card); width: 30px; height: 30px; border-radius: 50%; }
+.fx-swap-btn:hover { color: var(--accent); border-color: var(--accent-border); }
+
+/* === 汇率快捷对照 === */
+.fx-ref { display: flex; flex-direction: column; gap: 0; }
+.fx-ref-row { display: flex; justify-content: space-between; align-items: center; padding: 7px 0; border-bottom: 1px solid var(--border-soft); font-size: 12px; }
+.fx-ref-row:last-child { border-bottom: none; }
+.fx-ref-from { color: var(--text-secondary); }
+.fx-ref-to { color: var(--text-primary); font-weight: 500; }
+
+/* === 服务控制（ServiceControls）=== */
+.svc { background: var(--bg-card); border: 1px solid var(--border); border-radius: var(--radius-lg); padding: 11px; display: flex; flex-direction: column; gap: 10px; }
+.svc-head { display: flex; align-items: center; gap: 9px; }
+.svc-dot { width: 9px; height: 9px; border-radius: 50%; flex-shrink: 0; }
+.svc-dot.ok { background: var(--success); box-shadow: 0 0 0 3px var(--success-bg); }
+.svc-dot.off { background: var(--danger); box-shadow: 0 0 0 3px var(--danger-bg); }
+.svc-dot.busy { background: var(--warning); box-shadow: 0 0 0 3px var(--warning-bg); }
+.svc-head-main { font-size: 12.5px; font-weight: 600; line-height: 1.25; color: var(--text-primary); }
+.svc-head-sub { font-size: 10.5px; color: var(--text-muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.svc-acts { display: grid; grid-template-columns: repeat(3, 1fr); gap: 6px; }
+.svc-act { display: flex; flex-direction: column; align-items: center; gap: 4px; padding: 8px 4px; border: 1px solid var(--border); border-radius: var(--radius); background: var(--bg-inset); color: var(--text-secondary); cursor: pointer; font-size: 10.5px; font-family: inherit; transition: background .1s, color .1s, border-color .1s; }
+.svc-act:hover { background: var(--bg-hover); color: var(--text-primary); border-color: var(--border-strong); }
+.svc-act:disabled { opacity: .45; cursor: not-allowed; }
+.svc-act:disabled:hover { background: var(--bg-inset); color: var(--text-secondary); border-color: var(--border); }
+.svc-act svg { display: block; }
+.svc-act.danger { color: var(--danger); }
+.svc-act.danger:hover { background: var(--danger-bg); color: var(--danger); border-color: var(--danger-border); }
+.svc-act.start { color: #fff; background: var(--accent); border-color: var(--accent); }
+.svc-act.start:hover { filter: brightness(1.08); background: var(--accent); color: #fff; border-color: var(--accent); }
+.svc-acts-bar { display: flex; flex-wrap: wrap; }
+.svc-acts-bar .svc-act { flex: 0 0 auto; flex-direction: row; padding: 7px 13px; font-size: 12px; gap: 7px; }
+.svc-bar-info { flex: 1; min-width: 0; }
+.svc-bar { flex-direction: row; align-items: center; gap: 14px; background: transparent; border: none; border-radius: 0; padding: 8px 0 2px; }
+
+/* === 打卡操作行 + 临时提示 === */
+.punch-actions { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+.punch-toast { margin-top: 12px; font-size: 12px; padding: 9px 12px; border-radius: var(--radius); display: flex; align-items: center; gap: 8px; border: 1px solid; animation: toastIn .18s ease-out; }
+.punch-toast.success { background: var(--success-bg); color: var(--success); border-color: var(--success-border); }
+.punch-toast.info { background: var(--accent-bg); color: var(--accent-fg); border-color: var(--accent-border); }
+@keyframes toastIn { from { opacity: 0; transform: translateY(-3px); } to { opacity: 1; transform: none; } }
+
+/* 旋转图标（重启 / 重连 / 刷新）*/
+.spin-ic { display: inline-flex; animation: spin .8s linear infinite; }
+
+/* 侧栏用户行 */
+.side-user { display: flex; align-items: center; gap: 8px; padding: 6px 4px 2px; }
+.side-user .user-status { font-size: 10px; }

@@ -126,10 +126,13 @@ class AttendanceSystem:
         today_record = self.punch_record_manager.get_today_record()
         initial_in = datetime.strptime(today_record['punch_in_time'], '%H:%M:%S') if today_record['punch_in_time'] else None
         initial_out = datetime.strptime(today_record['punch_out_time'], '%H:%M:%S') if today_record['punch_out_time'] else None
+        # date 字段为该桶记录的归属日期，作为"是否今天"的权威判断（解决跨天/周末/假日永不重置问题）。
+        # 这里 get_today_record 读到的就是今天的记录，故初始归属日期 = 今天。
         self.today_punch_records = {
             user['username']: {
                 'punch_in_time': initial_in,
-                'punch_out_time': initial_out
+                'punch_out_time': initial_out,
+                'date': datetime.now().date()
             }
             for user in self.users
             if user.get('username')
@@ -271,7 +274,8 @@ class AttendanceSystem:
         if username not in self.today_punch_records:
             self.today_punch_records[username] = {
                 'punch_in_time': None,
-                'punch_out_time': None
+                'punch_out_time': None,
+                'date': None
             }
         return self.today_punch_records[username]
 
@@ -281,13 +285,16 @@ class AttendanceSystem:
         """
         record = self._get_user_today_record(username)
         record[kind] = time
+        # 每次写入都刷新归属日期为今天，作为"是否今天"的权威判断
+        record['date'] = datetime.now().date()
 
     def _reset_today_punch_records(self):
         """重置所有用户的今日打卡记录（用于跨日重置）"""
         for username in list(self.today_punch_records.keys()):
             self.today_punch_records[username] = {
                 'punch_in_time': None,
-                'punch_out_time': None
+                'punch_out_time': None,
+                'date': None
             }
 
     def _get_user_notification_state(self, username):
@@ -1515,6 +1522,25 @@ class AttendanceSystem:
             await self.send_daily_status()
         schedule.every().day.at(self.daily_status_time).do(lambda: asyncio.create_task(daily_status_job())).tag('daily_status')
 
+        # 汇率定时刷新（每 20 分钟）：阻塞 requests 放线程执行，避免卡事件循环；
+        # 刷新成功且 GUI 模式（_event_bus 非 None）时通过 WS 推送最新价。
+        async def exchange_rate_job():
+            try:
+                from modules.exchange_rate_service import refresh as _refresh
+                loop = asyncio.get_running_loop()
+                contract = await loop.run_in_executor(None, _refresh, None)
+                latest = (contract or {}).get('latest')
+                if latest and self._event_bus is not None:
+                    self._event_bus.publish_threadsafe('exchange_rate:update', {
+                        'price': latest.get('price'),
+                        'time': latest.get('time'),
+                        'base': 'CNY',
+                        'quote': 'JPY',
+                    })
+            except Exception as e:
+                logging.error(f"定时刷新汇率任务时发生错误: {str(e)}")
+        schedule.every(20).minutes.do(lambda: asyncio.create_task(exchange_rate_job())).tag('exchange_rate_update')
+
         # 从文件加载保存的定时任务
         saved_tasks = self.task_manager.get_tasks()
         for task in saved_tasks:
@@ -1570,6 +1596,20 @@ class AttendanceSystem:
                     except Exception as e:
                         logging.error(f"执行定时上班打卡任务时发生错误: {str(e)}")
                 schedule.every().day.at(task['scheduled_time']).do(lambda: asyncio.create_task(punch_in_job())).tag('punch_in_scheduled')
+
+        # 启动时触发一次汇率首刷（容错、不阻塞启动）：放 daemon 线程，避免阻塞 __init__ 与事件循环。
+        def _first_exchange_rate_refresh():
+            try:
+                from modules.exchange_rate_service import refresh as _refresh
+                _refresh(None)
+            except Exception as e:
+                logging.error(f"启动汇率首刷失败（忽略）: {str(e)}")
+        try:
+            import threading as _threading
+            _threading.Thread(target=_first_exchange_rate_refresh,
+                              name='aas-exchange-rate-first', daemon=True).start()
+        except Exception as e:
+            logging.error(f"启动汇率首刷线程失败（忽略）: {str(e)}")
 
     async def send_daily_status(self):
         """发送每日状态信息"""
@@ -3247,9 +3287,11 @@ class AttendanceSystem:
                     }
                     logging.info(f"用户 {uname} 跨日，重置打卡提醒状态: {current_date}")
 
-            # 重置昨天的打卡记录（按用户分桶后，任一用户的 punch_in_time 是昨天即触发重置所有用户）
+            # 重置昨天的打卡记录（基于归属日期 date 判断：任一用户桶的 date 早于今天即触发重置所有用户）。
+            # 用 date 字段而非 punch_in_time.date()：实时打卡含今天、DOM/OCR/启动加载日期为 1900-01-01，
+            # 语义不统一会导致次日遇周末/假日永不重置。date 字段是写入时记录的权威归属日期。
             needs_reset = any(
-                record.get('punch_in_time') and record['punch_in_time'].date() < current_date
+                record.get('date') and record['date'] < current_date
                 for record in self.today_punch_records.values()
             )
             if needs_reset:
@@ -3895,11 +3937,19 @@ class AttendanceSystem:
                 return str(dt)
 
         today_records = {}
+        _today = datetime.now().date()
         for username, rec in (self.today_punch_records or {}).items():
-            today_records[username] = {
-                'punch_in_time': _fmt_dt(rec.get('punch_in_time')),
-                'punch_out_time': _fmt_dt(rec.get('punch_out_time')),
-            }
+            # 归属日期不是今天（含周末/假日次日尚未触发重置）一律视为"未打卡"，避免展示昨天的旧时间
+            if rec.get('date') != _today:
+                today_records[username] = {
+                    'punch_in_time': None,
+                    'punch_out_time': None,
+                }
+            else:
+                today_records[username] = {
+                    'punch_in_time': _fmt_dt(rec.get('punch_in_time')),
+                    'punch_out_time': _fmt_dt(rec.get('punch_out_time')),
+                }
 
         try:
             cpu_percent = psutil.cpu_percent(interval=None)

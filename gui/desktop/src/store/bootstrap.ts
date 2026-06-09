@@ -15,10 +15,12 @@ import { usePunchStore } from './punch';
 import { useStartupStore } from './startup';
 import { useToastStore } from './toast';
 import { useProxyStore } from './proxy';
+import { useExchangeRateStore } from './exchangeRate';
 import { useStartupLogStore } from './startupLog';
 import { useServiceStore } from './service';
 
 const REFRESH_INTERVAL_MS = 15_000;
+const FX_REFRESH_INTERVAL_MS = 5 * 60_000; // 汇率轮询：5 分钟
 const PING_INTERVAL_MS = 400;
 const READY_TIMEOUT_MS = 35_000;
 
@@ -132,10 +134,29 @@ export function useBackendBootstrap() {
 
     void useSystemStore.getState().refresh();
     void useLogsStore.getState().loadTail(500);
+    // 汇率首屏拉取（FxSection 自身不触发首拉；WS exchange_rate:update 仅增量更新 resp.latest，
+    // resp 为 null 时 applyWsUpdate 会 no-op，故这里负责拉到首份序列）
+    void useExchangeRateStore.getState().refresh();
 
     const refreshTimer = window.setInterval(() => {
       void useSystemStore.getState().refresh();
     }, REFRESH_INTERVAL_MS);
+
+    // 汇率 5 分钟轮询 + 窗口重新可见/聚焦时补刷（与 system 15s 轮询同期生命周期，cleanup 一并清理）
+    const fxRefreshTimer = window.setInterval(() => {
+      void useExchangeRateStore.getState().refresh();
+    }, FX_REFRESH_INTERVAL_MS);
+
+    const onVisible = () => {
+      if (document.visibilityState === 'visible') {
+        void useExchangeRateStore.getState().refresh();
+      }
+    };
+    const onFocus = () => {
+      void useExchangeRateStore.getState().refresh();
+    };
+    document.addEventListener('visibilitychange', onVisible);
+    window.addEventListener('focus', onFocus);
 
     const unsubs: Array<() => void> = [];
     wsClient.start();
@@ -169,8 +190,19 @@ export function useBackendBootstrap() {
       void useProxyStore.getState().refreshProfiles();
     }));
 
+    // 汇率最新报价推送（data = {price, time, base, quote}，仅取 price/time 合并进 resp.latest）
+    unsubs.push(wsClient.subscribe('exchange_rate:update', data => {
+      const d = data as { price?: number; time?: number };
+      if (typeof d?.price === 'number' && typeof d?.time === 'number') {
+        useExchangeRateStore.getState().applyWsUpdate({ price: d.price, time: d.time });
+      }
+    }));
+
     return () => {
       window.clearInterval(refreshTimer);
+      window.clearInterval(fxRefreshTimer);
+      document.removeEventListener('visibilitychange', onVisible);
+      window.removeEventListener('focus', onFocus);
       unsubs.forEach(fn => fn());
       wsClient.stop();
     };
