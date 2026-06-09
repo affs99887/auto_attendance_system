@@ -16,11 +16,13 @@ import { useStartupStore } from './startup';
 import { useToastStore } from './toast';
 import { useProxyStore } from './proxy';
 import { useExchangeRateStore } from './exchangeRate';
+import { useAiNewsStore } from './aiNews';
 import { useStartupLogStore } from './startupLog';
 import { useServiceStore } from './service';
 
 const REFRESH_INTERVAL_MS = 15_000;
 const FX_REFRESH_INTERVAL_MS = 5 * 60_000; // 汇率轮询：5 分钟
+const AI_NEWS_REFRESH_INTERVAL_MS = 15 * 60_000; // AI 资讯轮询：15 分钟
 const PING_INTERVAL_MS = 400;
 const READY_TIMEOUT_MS = 35_000;
 
@@ -137,6 +139,9 @@ export function useBackendBootstrap() {
     // 汇率首屏拉取（FxSection 自身不触发首拉；WS exchange_rate:update 仅增量更新 resp.latest，
     // resp 为 null 时 applyWsUpdate 会 no-op，故这里负责拉到首份序列）
     void useExchangeRateStore.getState().refresh();
+    // AI 资讯首屏拉取（NewsScreen 自身不触发首拉；WS ai_news:update 仅触发重拉，
+    // 首份缓存由这里负责拉到）
+    void useAiNewsStore.getState().refresh();
 
     const refreshTimer = window.setInterval(() => {
       void useSystemStore.getState().refresh();
@@ -147,13 +152,20 @@ export function useBackendBootstrap() {
       void useExchangeRateStore.getState().refresh();
     }, FX_REFRESH_INTERVAL_MS);
 
+    // AI 资讯 15 分钟轮询（与上述轮询同期生命周期，cleanup 一并清理）
+    const aiNewsTimer = window.setInterval(() => {
+      void useAiNewsStore.getState().refresh();
+    }, AI_NEWS_REFRESH_INTERVAL_MS);
+
     const onVisible = () => {
       if (document.visibilityState === 'visible') {
         void useExchangeRateStore.getState().refresh();
+        void useAiNewsStore.getState().refresh();
       }
     };
     const onFocus = () => {
       void useExchangeRateStore.getState().refresh();
+      void useAiNewsStore.getState().refresh();
     };
     document.addEventListener('visibilitychange', onVisible);
     window.addEventListener('focus', onFocus);
@@ -198,9 +210,15 @@ export function useBackendBootstrap() {
       }
     }));
 
+    // AI 资讯更新推送：触发重拉（force 默认 false，命中后端 TTL 直接拿新缓存，不重复打外网）
+    unsubs.push(wsClient.subscribe('ai_news:update', () => {
+      void useAiNewsStore.getState().refresh();
+    }));
+
     return () => {
       window.clearInterval(refreshTimer);
       window.clearInterval(fxRefreshTimer);
+      window.clearInterval(aiNewsTimer);
       document.removeEventListener('visibilitychange', onVisible);
       window.removeEventListener('focus', onFocus);
       unsubs.forEach(fn => fn());

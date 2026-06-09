@@ -183,6 +183,14 @@ export const Icon = {
   Cloud: makeIcon(
     <path d="M4.5 12.5a3 3 0 0 1-.5-6 4 4 0 0 1 7.7.5 2.8 2.8 0 0 1 .3 5.5z" />,
   ),
+  Sparkle: makeIcon(<path d="M8 2l1.4 4.2L13.5 8l-4.1 1.4L8 14l-1.4-4.6L2.5 8l4.1-1.8L8 2z" />),
+  External: makeIcon(
+    <>
+      <path d="M6.5 3.5H3.5v9h9v-3" />
+      <path d="M9.5 3.5h3v3" />
+      <path d="M12.5 3.5l-5.5 5.5" />
+    </>,
+  ),
   Minus: makeIcon(<path d="M3 8h10" />),
   Maximize: makeIcon(<rect x="2.5" y="2.5" width="11" height="11" rx="1" />),
   Close: makeIcon(<path d="M3 3l10 10M13 3L3 13" />),

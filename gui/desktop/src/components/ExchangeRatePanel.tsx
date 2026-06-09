@@ -60,7 +60,7 @@ function useMeasure(): [React.RefObject<HTMLDivElement>, number] {
 function FxChart({ series, direction }: { series: SeriesPoint[]; direction: ExchangeRateDirection }) {
   const [wrapRef, W] = useMeasure();
   const [hover, setHover] = React.useState<number | null>(null);
-  const H = 248;
+  const H = 200;
   const padL = 52, padR = 16, padT = 16, padB = 26;
   const innerW = Math.max(W - padL - padR, 10);
   const innerH = H - padT - padB;
@@ -96,8 +96,8 @@ function FxChart({ series, direction }: { series: SeriesPoint[]; direction: Exch
 
   const onMove = (e: React.MouseEvent<SVGRectElement>) => {
     const rect = e.currentTarget.getBoundingClientRect();
-    const mx = e.clientX - rect.left;
-    let idx = Math.round(((mx - padL) / innerW) * (series.length - 1));
+    const mx = e.clientX - rect.left; // rect 起点即 SVG x=padL，已是相对内区左缘
+    let idx = Math.round((mx / innerW) * (series.length - 1));
     idx = Math.max(0, Math.min(series.length - 1, idx));
     setHover(idx);
   };
@@ -218,18 +218,13 @@ function FxChart({ series, direction }: { series: SeriesPoint[]; direction: Exch
   );
 }
 
-// --- 汇率换算器 ---
-function FxConverter({
-  direction,
-  rate,
-  onSwap,
-}: {
-  direction: ExchangeRateDirection;
-  rate: number;
-  onSwap: () => void;
-}) {
-  const cny2jpy = direction === 'CNY_JPY';
-  const [amount, setAmount] = React.useState(cny2jpy ? '100' : '10000');
+// --- 汇率换算器（独立于走势图：自带方向，默认 日元→人民币 / 1000 日元）---
+// baseRate 恒为 CNY→JPY 原值；内部按自身方向取倒数得到展示用 rate
+function FxConverter({ baseRate }: { baseRate: number }) {
+  const [dir, setDir] = React.useState<ExchangeRateDirection>('JPY_CNY');
+  const cny2jpy = dir === 'CNY_JPY';
+  const rate = cny2jpy ? baseRate : 1 / baseRate;
+  const [amount, setAmount] = React.useState('1000');
   const from = cny2jpy ? { code: 'CNY', name: '人民币' } : { code: 'JPY', name: '日元' };
   const to = cny2jpy ? { code: 'JPY', name: '日元' } : { code: 'CNY', name: '人民币' };
   const num = parseFloat(amount) || 0;
@@ -240,81 +235,90 @@ function FxConverter({
 
   // 切换方向后重置默认输入值
   React.useEffect(() => {
-    setAmount(cny2jpy ? '100' : '10000');
+    setAmount(cny2jpy ? '100' : '1000');
   }, [cny2jpy]);
 
-  const quicks = cny2jpy ? [100, 500, 1000, 5000] : [10000, 50000, 100000, 500000];
+  const onSwap = () => setDir(cny2jpy ? 'JPY_CNY' : 'CNY_JPY');
+  const quicks = cny2jpy ? [100, 500, 1000, 5000] : [1000, 5000, 10000, 50000];
   const refs = cny2jpy ? [10, 100, 1000, 10000] : [1000, 10000, 100000, 1000000];
 
   return (
-    <div className="card" style={{ display: 'flex', flexDirection: 'column' }}>
+    <div className="card">
       <div className="card-header">
         <div className="card-title">汇率转换器</div>
         <span className="pill pill-neutral mono">{rate.toFixed(cny2jpy ? 4 : 6)}</span>
       </div>
-      <div className="card-body" style={{ flex: 1, display: 'flex', flexDirection: 'column', gap: 10 }}>
-        <div className="fx-conv-field">
-          <div className="fx-conv-cur">
-            <span className="fx-conv-code mono">{from.code}</span>
-            <span className="fx-conv-name">{from.name}</span>
-          </div>
-          <input
-            className="input mono fx-conv-input"
-            inputMode="decimal"
-            value={amount}
-            onChange={(e) => setAmount(e.target.value.replace(/[^0-9.]/g, ''))}
-          />
-        </div>
-
-        <div className="fx-swap-wrap">
-          <div className="fx-swap-line"></div>
-          <button className="btn btn-ico fx-swap-btn" title="切换方向" onClick={onSwap}>
-            <Icon.Refresh size={13} />
-          </button>
-        </div>
-
-        <div className="fx-conv-field readonly">
-          <div className="fx-conv-cur">
-            <span className="fx-conv-code mono">{to.code}</span>
-            <span className="fx-conv-name">{to.name}</span>
-          </div>
-          <div className="fx-conv-input mono fx-conv-out">{outStr}</div>
-        </div>
-
-        <div className="muted" style={{ fontSize: 11, lineHeight: 1.6, marginTop: 2 }}>
-          1 {from.code} ={' '}
-          <span className="mono" style={{ color: 'var(--text-secondary)' }}>
-            {rate.toFixed(cny2jpy ? 4 : 6)}
-          </span>{' '}
-          {to.code} · 按最新汇率换算
-        </div>
-        <div className="row" style={{ gap: 6, flexWrap: 'wrap' }}>
-          {quicks.map((q) => (
-            <button key={q} className="btn btn-sm" style={{ flex: 1 }} onClick={() => setAmount(String(q))}>
-              {q.toLocaleString()}
-            </button>
-          ))}
-        </div>
-        <div className="divider"></div>
-        <div className="kicker" style={{ marginBottom: 2 }}>
-          快捷对照 · 按最新汇率
-        </div>
-        <div className="fx-ref">
-          {refs.map((a) => (
-            <div className="fx-ref-row" key={a}>
-              <span className="fx-ref-from mono">
-                {a.toLocaleString()} {from.code}
-              </span>
-              <span className="fx-ref-to mono">
-                {cny2jpy
-                  ? '¥ ' + (a * rate).toLocaleString('ja-JP', { maximumFractionDigits: 0 })
-                  : '¥ ' + (a * rate).toLocaleString('zh-CN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
-                <span className="muted" style={{ marginLeft: 4, fontWeight: 400 }}>
-                  {to.code}
-                </span>
-              </span>
+      <div className="card-body">
+        <div className="grid" style={{ gridTemplateColumns: '1fr 1fr', gap: 24, alignItems: 'start' }}>
+          {/* 左列：输入 + 方向切换 + 输出 + 说明 + 快捷金额 */}
+          <div className="col" style={{ gap: 10 }}>
+            <div className="fx-conv-field">
+              <div className="fx-conv-cur">
+                <span className="fx-conv-code mono">{from.code}</span>
+                <span className="fx-conv-name">{from.name}</span>
+              </div>
+              <input
+                className="input mono fx-conv-input"
+                inputMode="decimal"
+                value={amount}
+                onChange={(e) => setAmount(e.target.value.replace(/[^0-9.]/g, ''))}
+              />
             </div>
-          ))}
+
+            <div className="fx-swap-wrap">
+              <div className="fx-swap-line"></div>
+              <button className="btn btn-ico fx-swap-btn" title="切换方向" onClick={onSwap}>
+                <Icon.Refresh size={13} />
+              </button>
+            </div>
+
+            <div className="fx-conv-field readonly">
+              <div className="fx-conv-cur">
+                <span className="fx-conv-code mono">{to.code}</span>
+                <span className="fx-conv-name">{to.name}</span>
+              </div>
+              <div className="fx-conv-input mono fx-conv-out">{outStr}</div>
+            </div>
+
+            <div className="muted" style={{ fontSize: 11, lineHeight: 1.6, marginTop: 2 }}>
+              1 {from.code} ={' '}
+              <span className="mono" style={{ color: 'var(--text-secondary)' }}>
+                {rate.toFixed(cny2jpy ? 4 : 6)}
+              </span>{' '}
+              {to.code} · 按最新汇率换算
+            </div>
+            <div className="row" style={{ gap: 6, flexWrap: 'wrap' }}>
+              {quicks.map((q) => (
+                <button key={q} className="btn btn-sm" style={{ flex: 1 }} onClick={() => setAmount(String(q))}>
+                  {q.toLocaleString()}
+                </button>
+              ))}
+            </div>
+          </div>
+
+          {/* 右列：快捷对照表 */}
+          <div className="col" style={{ gap: 4 }}>
+            <div className="kicker" style={{ marginBottom: 2 }}>
+              快捷对照 · 按最新汇率
+            </div>
+            <div className="fx-ref">
+              {refs.map((a) => (
+                <div className="fx-ref-row" key={a}>
+                  <span className="fx-ref-from mono">
+                    {a.toLocaleString()} {from.code}
+                  </span>
+                  <span className="fx-ref-to mono">
+                    {cny2jpy
+                      ? '¥ ' + (a * rate).toLocaleString('ja-JP', { maximumFractionDigits: 0 })
+                      : '¥ ' + (a * rate).toLocaleString('zh-CN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+                    <span className="muted" style={{ marginLeft: 4, fontWeight: 400 }}>
+                      {to.code}
+                    </span>
+                  </span>
+                </div>
+              ))}
+            </div>
+          </div>
         </div>
       </div>
     </div>
@@ -349,6 +353,10 @@ export function FxSection() {
       ? series[series.length - 1].v
       : 0;
 
+  // 换算器基准：CNY→JPY 原值（与走势展示方向无关），优先后端 latest.price
+  const baseRate =
+    resp?.latest?.price ?? (resp?.points?.length ? resp.points[resp.points.length - 1].value : 0);
+
   // 涨跌：用展示序列首尾
   const first = hasData ? series[0].v : 0;
   const last = hasData ? series[series.length - 1].v : 0;
@@ -371,9 +379,10 @@ export function FxSection() {
         : null;
 
   return (
-    <div className="grid" style={{ gridTemplateColumns: '1.6fr 1fr', gap: 16, alignItems: 'stretch' }}>
-      <div className="card" style={{ display: 'flex', flexDirection: 'column' }}>
-        <div className="card-header">
+    <div className="col gap-4">
+      {/* 走势卡：数字左 / 图右；区间 tab + 刷新迁至头部，方向切换移到图上方 */}
+      <div className="card">
+        <div className="card-header" style={{ flexWrap: 'wrap', rowGap: 10 }}>
           <div className="row gap-2" style={{ alignItems: 'center', minWidth: 0 }}>
             <Icon.Globe size={16} />
             <div style={{ minWidth: 0 }}>
@@ -383,47 +392,8 @@ export function FxSection() {
               </div>
             </div>
           </div>
-          <div className="tab-bar" style={{ flexShrink: 0 }}>
-            {([
-              { k: 'CNY_JPY' as ExchangeRateDirection, t: 'CNY → JPY' },
-              { k: 'JPY_CNY' as ExchangeRateDirection, t: 'JPY → CNY' },
-            ]).map((o) => (
-              <button
-                key={o.k}
-                className={`tab-btn ${direction === o.k ? 'active' : ''}`}
-                onClick={() => setDirection(o.k)}
-              >
-                {o.t}
-              </button>
-            ))}
-          </div>
-        </div>
-        <div className="card-body" style={{ flex: 1, display: 'flex', flexDirection: 'column', gap: 4 }}>
-          <div className="row spread" style={{ alignItems: 'flex-end' }}>
-            <div className="row" style={{ alignItems: 'baseline', gap: 10 }}>
-              <div className="mono" style={{ fontSize: 32, fontWeight: 600, lineHeight: 1 }}>
-                {hasData ? rate.toFixed(decimals) : '—'}
-              </div>
-              {hasData && (
-                <div
-                  className="mono"
-                  style={{ fontSize: 13, fontWeight: 600, color: up ? 'var(--success)' : 'var(--danger)' }}
-                >
-                  {up ? '▲' : '▼'} {Math.abs(delta).toFixed(decimals)} ({up ? '+' : '−'}
-                  {Math.abs(pct).toFixed(2)}%)
-                </div>
-              )}
-            </div>
-            <div className="muted" style={{ fontSize: 11, textAlign: 'right' }}>
-              <div>
-                1 {pair.from} = {hasData ? rate.toFixed(decimals) : '—'} {pair.to}
-              </div>
-              <div className="mono" style={{ marginTop: 2 }}>
-                更新于 {updatedAt ? updatedAt.toLocaleTimeString('zh-CN', { hour12: false }) : '—'}
-              </div>
-            </div>
-          </div>
-          <div className="row spread" style={{ marginTop: 8, flexWrap: 'wrap', rowGap: 8 }}>
+          {/* 区间 / 刷新：横向摆放（方向切换不再放头部）*/}
+          <div className="row gap-2" style={{ marginLeft: 'auto', flexWrap: 'wrap', justifyContent: 'flex-end', rowGap: 8 }}>
             <div className="tab-bar">
               {FX_RANGES.map((r) => (
                 <button
@@ -442,30 +412,80 @@ export function FxSection() {
               {loading ? '刷新中…' : '刷新'}
             </button>
           </div>
-          {hasData ? (
-            <FxChart series={series} direction={direction} />
-          ) : (
-            <div
-              className="muted"
-              style={{
-                height: 248,
-                display: 'flex',
-                alignItems: 'center',
-                justifyContent: 'center',
-                fontSize: 13,
-              }}
-            >
-              {loading ? '加载中…' : '暂无数据'}
+        </div>
+        <div className="card-body">
+          <div
+            className="grid"
+            style={{ gridTemplateColumns: 'minmax(150px, 0.24fr) minmax(0, 1fr)', gap: 24, alignItems: 'stretch' }}
+          >
+            {/* 左：数字块 */}
+            <div className="col" style={{ gap: 10, minWidth: 0, justifyContent: 'center' }}>
+              <div>
+                <div className="mono" style={{ fontSize: 30, fontWeight: 600, lineHeight: 1.05 }}>
+                  {hasData ? rate.toFixed(decimals) : '—'}
+                </div>
+                {hasData && (
+                  <div
+                    className="mono"
+                    style={{ fontSize: 13, fontWeight: 600, marginTop: 4, color: up ? 'var(--success)' : 'var(--danger)' }}
+                  >
+                    {up ? '▲' : '▼'} {Math.abs(delta).toFixed(decimals)} ({up ? '+' : '−'}
+                    {Math.abs(pct).toFixed(2)}%)
+                  </div>
+                )}
+              </div>
+              <div className="muted" style={{ fontSize: 11, lineHeight: 1.7 }}>
+                <div>
+                  1 {pair.from} ={' '}
+                  <span className="mono" style={{ color: 'var(--text-secondary)' }}>
+                    {hasData ? rate.toFixed(decimals) : '—'}
+                  </span>{' '}
+                  {pair.to}
+                </div>
+                <div className="mono" style={{ marginTop: 2 }}>
+                  更新于 {updatedAt ? updatedAt.toLocaleTimeString('zh-CN', { hour12: false }) : '—'}
+                </div>
+              </div>
             </div>
-          )}
+            {/* 右：方向切换置于走势图上方（不进入图表区域）*/}
+            <div style={{ minWidth: 0, display: 'flex', flexDirection: 'column', gap: 6 }}>
+              <div className="tab-bar" style={{ alignSelf: 'flex-end' }}>
+                {([
+                  { k: 'CNY_JPY' as ExchangeRateDirection, t: 'CNY → JPY' },
+                  { k: 'JPY_CNY' as ExchangeRateDirection, t: 'JPY → CNY' },
+                ]).map((o) => (
+                  <button
+                    key={o.k}
+                    className={`tab-btn ${direction === o.k ? 'active' : ''}`}
+                    onClick={() => setDirection(o.k)}
+                  >
+                    {o.t}
+                  </button>
+                ))}
+              </div>
+              {hasData ? (
+                <FxChart series={series} direction={direction} />
+              ) : (
+                <div
+                  className="muted"
+                  style={{
+                    height: 200,
+                    display: 'flex',
+                    alignItems: 'center',
+                    justifyContent: 'center',
+                    fontSize: 13,
+                  }}
+                >
+                  {loading ? '加载中…' : '暂无数据'}
+                </div>
+              )}
+            </div>
+          </div>
         </div>
       </div>
 
-      <FxConverter
-        direction={direction}
-        rate={rate}
-        onSwap={() => setDirection(cny2jpy ? 'JPY_CNY' : 'CNY_JPY')}
-      />
+      {/* 转换器：走势下方，整行 · 独立方向（默认日元→人民币）*/}
+      <FxConverter baseRate={baseRate} />
     </div>
   );
 }

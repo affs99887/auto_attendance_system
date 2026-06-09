@@ -8,6 +8,7 @@ import { useSystemStore } from '../store/system';
 import { usePunchStore } from '../store/punch';
 import { api } from '../lib/api';
 import { FxSection } from '../components/ExchangeRatePanel';
+import { useAiNewsStore, CATEGORY_BY_SLUG, relTime } from '../store/aiNews';
 
 /** 后端 today_records 时间字段：`'08:29:55'` 或 `'1900-01-01T08:29:55'`，统一抽 HH:MM:SS */
 function extractTime(raw: string | null | undefined): string | null {
@@ -60,7 +61,6 @@ function estimateOut(inT: string | null): string | null {
 }
 
 function PunchUserCard({ user }: { user: User }) {
-  const { setScreen, setCurrentUser } = useApp();
   const snapshot = useSystemStore(s => s.snapshot);
   const refreshStatus = useSystemStore(s => s.refresh);
   // 操作 busy 态：驱动按钮 spin-ic 图标动画 + 互斥禁用（in/out/auto/check 四种动作）
@@ -175,8 +175,8 @@ function PunchUserCard({ user }: { user: User }) {
   const estOut = punchedIn ? estimateOut(today.in) : null;
 
   return (
-    <div className="card">
-      <div className="card-header">
+    <div className="card" style={{ display: 'flex', flexDirection: 'column', height: '100%' }}>
+      <div className="card-header" style={{ flexWrap: 'wrap', rowGap: 10 }}>
         <div className="row gap-2">
           <div
             className="user-avatar"
@@ -189,76 +189,36 @@ function PunchUserCard({ user }: { user: User }) {
             <div className="card-sub mono">{user.env}</div>
           </div>
         </div>
-        {punchedOut ? (
-          <span className="pill pill-success"><span className="dot" />已完成</span>
-        ) : punchedIn ? (
-          <span className="pill pill-info"><span className="dot" />工作中</span>
-        ) : (
-          <span className="pill pill-warning"><span className="dot" />未打卡</span>
-        )}
-      </div>
-      <div className="card-body">
-        <div className="grid grid-2" style={{ gap: 12 }}>
-          <div className="col" style={{ gap: 4 }}>
+        {/* 上/下班时间：迁移到顶部，横向摆放 + 状态 pill */}
+        <div className="row gap-4" style={{ marginLeft: 'auto', alignItems: 'flex-end' }}>
+          <div className="col" style={{ gap: 0, alignItems: 'flex-end' }}>
             <div className="kicker">上班</div>
-            <div className="mono" style={{ fontSize: 22, fontWeight: 500 }}>
+            <div className="mono" style={{ fontSize: 18, fontWeight: 600 }}>
               {today.in || <span className="muted">--:--:--</span>}
             </div>
-            {today.in && <div className="muted" style={{ fontSize: 11 }}>Selenium · 已写入</div>}
           </div>
-          <div className="col" style={{ gap: 4 }}>
+          <div className="col" style={{ gap: 0, alignItems: 'flex-end' }}>
             <div className="kicker">下班</div>
             <div
               className="mono"
-              style={{ fontSize: 22, fontWeight: 500, color: today.out ? undefined : 'var(--text-muted)' }}
+              style={{ fontSize: 18, fontWeight: 600, color: today.out ? undefined : 'var(--text-muted)' }}
             >
               {today.out || (estOut ? estOut : '--:--:--')}
             </div>
-            <div className="muted" style={{ fontSize: 11 }}>
-              {today.out ? '已写入' : estOut ? '预计 · 8h15m + 随机' : '—'}
-            </div>
           </div>
+          {punchedOut ? (
+            <span className="pill pill-success"><span className="dot" />已完成</span>
+          ) : punchedIn ? (
+            <span className="pill pill-info"><span className="dot" />工作中</span>
+          ) : (
+            <span className="pill pill-warning"><span className="dot" />未打卡</span>
+          )}
         </div>
-        <div className="divider" />
-        <div className="punch-actions">
-          <button
-            className="btn btn-primary"
-            disabled={punchedIn || busy !== null}
-            onClick={() => void doPunch('in')}
-          >
-            {ico('in', Icon.Punch)} 上班打卡
-          </button>
-          <button
-            className="btn"
-            disabled={!punchedIn || punchedOut || busy !== null}
-            onClick={() => void doPunch('out')}
-          >
-            {ico('out', Icon.Power)} 下班打卡
-          </button>
-          <button
-            className="btn"
-            disabled={!punchedIn || punchedOut || busy !== null}
-            onClick={() => void doAuto()}
-          >
-            {ico('auto', Icon.Clock)} 自动下班
-          </button>
-          <button
-            className="btn"
-            disabled={busy !== null}
-            onClick={() => void doCheck()}
-          >
-            {ico('check', Icon.Eye)} 获取打卡情况
-          </button>
-          <button
-            className="btn btn-sm"
-            style={{ marginLeft: 'auto' }}
-            onClick={() => {
-              setCurrentUser(user.id);
-              setScreen('records');
-            }}
-          >
-            查看记录 <Icon.ChevronRight size={10} />
-          </button>
+      </div>
+      <div className="card-body" style={{ flex: 1, display: 'flex', flexDirection: 'column' }}>
+        <div className="muted" style={{ fontSize: 11 }}>
+          {today.in ? 'Selenium · 已写入' : '尚未打卡'}
+          {today.out ? ' · 已下班' : estOut ? ` · 预计下班 ${estOut}（8h15m + 随机）` : ''}
         </div>
         {toast && (
           <div className={`punch-toast ${toast.tone}`}>
@@ -266,6 +226,110 @@ function PunchUserCard({ user }: { user: User }) {
             <span>{toast.msg}</span>
           </div>
         )}
+        {/* 控制器：横向按钮组，靠模块底部 */}
+        <div
+          className="punch-actions"
+          style={{ marginTop: 'auto', paddingTop: 14, borderTop: '1px solid var(--border-soft)' }}
+        >
+          <button
+            className="btn btn-primary btn-sm"
+            disabled={punchedIn || busy !== null}
+            onClick={() => void doPunch('in')}
+          >
+            {ico('in', Icon.Punch)} 上班打卡
+          </button>
+          <button
+            className="btn btn-sm"
+            disabled={!punchedIn || punchedOut || busy !== null}
+            onClick={() => void doPunch('out')}
+          >
+            {ico('out', Icon.Power)} 下班打卡
+          </button>
+          <button
+            className="btn btn-sm"
+            disabled={!punchedIn || punchedOut || busy !== null}
+            onClick={() => void doAuto()}
+          >
+            {ico('auto', Icon.Clock)} 自动下班
+          </button>
+          <button
+            className="btn btn-sm"
+            disabled={busy !== null}
+            onClick={() => void doCheck()}
+          >
+            {ico('check', Icon.Eye)} 获取打卡情况
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// 仪表盘 AI 资讯卡片的版块标签（内联小号样式）
+function dashCatTag(slug: string | null | undefined) {
+  const c = (slug ? CATEGORY_BY_SLUG[slug] : undefined) ?? CATEGORY_BY_SLUG.industry;
+  return <span className="cat-tag" style={{ ['--ch' as any]: c.hue, fontSize: 10, padding: '1px 7px' }}>{c.label}</span>;
+}
+
+// 让 AI 资讯卡片高度跟随今日打卡卡片（CSS 只能短→长，故用 JS 同步）
+function useMatchHeight(): [React.RefObject<HTMLDivElement>, number | null] {
+  const ref = React.useRef<HTMLDivElement>(null);
+  const [h, setH] = React.useState<number | null>(null);
+  React.useLayoutEffect(() => {
+    if (!ref.current) return;
+    const el = ref.current;
+    const update = () => setH(el.offsetHeight);
+    update();
+    const ro = new ResizeObserver(update);
+    ro.observe(el);
+    const t = window.setTimeout(update, 400);
+    if (document.fonts && document.fonts.ready) void document.fonts.ready.then(update);
+    return () => { ro.disconnect(); window.clearTimeout(t); };
+  }, []);
+  return [ref, h];
+}
+
+// 仪表盘 AI 资讯模块 —— 竖向精选列表（与今日打卡同一行，高度对齐）
+function DashNewsCard({ matchH }: { matchH: number | null }) {
+  const resp = useAiNewsStore(s => s.resp);
+  const loading = useAiNewsStore(s => s.loading);
+  const refresh = useAiNewsStore(s => s.refresh);
+  const items = resp?.items ?? [];
+  const top = React.useMemo(
+    () =>
+      [...items]
+        .sort((a, b) => new Date(b.publishedAt ?? 0).getTime() - new Date(a.publishedAt ?? 0).getTime())
+        .slice(0, 6),
+    [items],
+  );
+  return (
+    <div className="card" style={{ display: 'flex', flexDirection: 'column', height: matchH || undefined }}>
+      <div className="card-header">
+        <div className="row gap-2">
+          <div className="news-mark" style={{ width: 26, height: 26, borderRadius: 6 }}><Icon.Sparkle size={14} /></div>
+          <div className="col" style={{ gap: 0 }}>
+            <div className="card-title">AI 资讯</div>
+            <div className="card-sub">AI HOT · 今日精选</div>
+          </div>
+        </div>
+        <button className="btn btn-ico btn-sm" title="刷新" onClick={() => void refresh(true)} disabled={loading}>
+          <span className={loading ? 'spin-ic' : ''} style={{ display: 'inline-flex' }}><Icon.Refresh size={13} /></span>
+        </button>
+      </div>
+      <div className="card-body scroll-area" style={{ padding: '4px 16px', flex: 1, minHeight: 0, overflowY: 'auto' }}>
+        <div className="dash-news">
+          {top.map(it => (
+            <a key={it.id} className="dash-news-row" href={it.url} target="_blank" rel="noreferrer">
+              <div className="dash-news-title">{it.title}</div>
+              <div className="dash-news-meta">
+                {dashCatTag(it.category)}
+                <span className="muted" style={{ fontSize: 10.5, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
+                  {it.source} · {relTime(it.publishedAt)}
+                </span>
+              </div>
+            </a>
+          ))}
+        </div>
       </div>
     </div>
   );
@@ -373,6 +437,9 @@ export function DashboardScreen() {
   const earliest = Math.min(...minutesArr);
   const latest = Math.max(...minutesArr);
 
+  // AI 资讯卡片高度跟随今日打卡卡片（同一行内对齐）
+  const [punchRef, punchH] = useMatchHeight();
+
   const spark = Object.entries(monthRecs)
     .slice(-14)
     .map(([, r]) => {
@@ -428,16 +495,27 @@ export function DashboardScreen() {
         </div>
       </div>
 
-      {/* Per-user punch cards */}
-      <div className="col gap-2">
-        <div className="row spread">
-          <div className="kicker">今日打卡 · {todayLabel}</div>
-          <button className="btn btn-sm" onClick={() => setScreen('punch')}>
-            打开打卡控制台 <Icon.ChevronRight size={10} />
-          </button>
+      {/* 今日打卡 + AI 资讯 · 同一行 */}
+      <div className="grid" style={{ gridTemplateColumns: 'minmax(0, 0.82fr) minmax(0, 1fr)', gap: 16, alignItems: 'start' }}>
+        <div className="col gap-2" style={{ minWidth: 0 }}>
+          <div className="row spread">
+            <div className="kicker">今日打卡 · {todayLabel}</div>
+            <button className="btn btn-sm" onClick={() => setScreen('punch')}>
+              打卡控制台 <Icon.ChevronRight size={10} />
+            </button>
+          </div>
+          <div ref={punchRef} className="col gap-4">
+            {USERS.map(u => <PunchUserCard key={u.id} user={u} />)}
+          </div>
         </div>
-        <div className="grid" style={{ gridTemplateColumns: USERS.length > 1 ? '1fr 1fr' : '1fr' }}>
-          {USERS.map(u => <PunchUserCard key={u.id} user={u} />)}
+        <div className="col gap-2" style={{ minWidth: 0 }}>
+          <div className="row spread">
+            <div className="kicker">AI 资讯 · AI HOT 中文精选</div>
+            <button className="btn btn-sm" onClick={() => setScreen('news')}>
+              查看全部 <Icon.ChevronRight size={10} />
+            </button>
+          </div>
+          <DashNewsCard matchH={punchH} />
         </div>
       </div>
 

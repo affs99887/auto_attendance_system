@@ -1,7 +1,6 @@
 // 应用主壳 — 设计稿 app.jsx 的 TS 平移：TitleBar + Sidebar + Toolbar + 路由。
 import * as React from 'react';
 import { Icon, type IconName } from './lib/icons';
-import { USERS } from './lib/data';
 import type { OpState, ScreenId, SysStatus } from './lib/types';
 import { DashboardScreen } from './screens/Dashboard';
 import { PunchScreen } from './screens/Punch';
@@ -9,6 +8,7 @@ import { RecordsScreen } from './screens/Records';
 import { ShotsScreen } from './screens/Shots';
 import { TasksScreen } from './screens/Tasks';
 import { LogsScreen } from './screens/Logs';
+import { NewsScreen } from './screens/News';
 import { SettingsScreen } from './screens/Settings';
 import { ProxyScreen } from './screens/Proxy';
 import { AboutScreen } from './screens/About';
@@ -30,6 +30,7 @@ const SCREENS: Record<ScreenId, ScreenComponent> = {
   shots: ShotsScreen,
   tasks: TasksScreen,
   logs: LogsScreen,
+  news: NewsScreen,
   settings: SettingsScreen,
   proxy: ProxyScreen,
   about: AboutScreen,
@@ -71,7 +72,7 @@ interface NavEntry {
   id: ScreenId;
   label: string;
   icon: IconName;
-  group: 'main' | 'config';
+  group: 'main' | 'news' | 'config';
   badge?: string;
 }
 
@@ -82,6 +83,7 @@ const NAV: NavEntry[] = [
   { id: 'shots', label: '截图档案', icon: 'Camera', group: 'main' },
   { id: 'tasks', label: '定时任务', icon: 'Tasks', group: 'main', badge: '4' },
   { id: 'logs', label: '系统日志', icon: 'Logs', group: 'main' },
+  { id: 'news', label: 'AI 资讯', icon: 'Sparkle', group: 'news' },
   { id: 'settings', label: '系统设置', icon: 'Settings', group: 'config' },
   { id: 'proxy', label: '网络加速', icon: 'Globe', group: 'config' },
   { id: 'about', label: '关于 & 命令', icon: 'Info', group: 'config' },
@@ -94,6 +96,7 @@ const SCREEN_SUB: Record<ScreenId, string> = {
   shots: '查看每位用户最近 3 张打卡截图',
   tasks: '查看与终止 schedule 计划任务',
   logs: '实时日志、过滤错误与导出',
+  news: 'AI HOT 中文 AI 资讯 · 模型 / 产品 / 论文 / 行业动态',
   settings: '环境变量、动态配置与多账户设置',
   proxy: '内置网络加速（仅代理本程序）· 订阅 / 节点 / 延迟',
   about: 'Telegram 命令、系统组件与版本信息',
@@ -102,64 +105,47 @@ const SCREEN_SUB: Record<ScreenId, string> = {
 interface SidebarProps {
   screen: ScreenId;
   setScreen: (s: ScreenId) => void;
-  currentUser: string;
 }
 
-function Sidebar({ screen, setScreen, currentUser }: SidebarProps) {
-  const user = USERS.find(u => u.id === currentUser) ?? USERS[0];
+function Sidebar({ screen, setScreen }: SidebarProps) {
+  // 按分组渲染导航项（main / news / config 复用同一份逻辑）
+  const renderGroup = (group: NavEntry['group']) => (
+    <nav className="side-nav">
+      {NAV.filter(n => n.group === group).map(n => {
+        const IconCmp = Icon[n.icon];
+        return (
+          <button
+            key={n.id}
+            className={`side-item ${screen === n.id ? 'active' : ''}`}
+            onClick={() => setScreen(n.id)}
+          >
+            <span className="side-ico"><IconCmp /></span>
+            <span>{n.label}</span>
+            {n.badge && <span className="side-badge mono">{n.badge}</span>}
+          </button>
+        );
+      })}
+    </nav>
+  );
+
   return (
     <aside className="sidebar">
       <div className="side-section">
         <div className="side-label">工作台</div>
-        <nav className="side-nav">
-          {NAV.filter(n => n.group === 'main').map(n => {
-            const IconCmp = Icon[n.icon];
-            return (
-              <button
-                key={n.id}
-                className={`side-item ${screen === n.id ? 'active' : ''}`}
-                onClick={() => setScreen(n.id)}
-              >
-                <span className="side-ico"><IconCmp /></span>
-                <span>{n.label}</span>
-                {n.badge && <span className="side-badge mono">{n.badge}</span>}
-              </button>
-            );
-          })}
-        </nav>
+        {renderGroup('main')}
+      </div>
+      <div className="side-section">
+        <div className="side-label">资讯</div>
+        {renderGroup('news')}
       </div>
       <div className="side-section">
         <div className="side-label">配置</div>
-        <nav className="side-nav">
-          {NAV.filter(n => n.group === 'config').map(n => {
-            const IconCmp = Icon[n.icon];
-            return (
-              <button
-                key={n.id}
-                className={`side-item ${screen === n.id ? 'active' : ''}`}
-                onClick={() => setScreen(n.id)}
-              >
-                <span className="side-ico"><IconCmp /></span>
-                <span>{n.label}</span>
-              </button>
-            );
-          })}
-        </nav>
+        {renderGroup('config')}
       </div>
 
+      {/* 底部仅保留服务控制（已切单用户，去掉账户行）— 照设计稿最终态 */}
       <div className="side-footer">
-        <div className="side-label" style={{ padding: '0 0 2px' }}>服务控制</div>
         <ServiceControls variant="compact" />
-        {/* 账户静态展示（已切单用户，去掉切换交互）— 照设计稿 side-user */}
-        <div className="side-user">
-          <div className="user-avatar" style={{ background: user.color }}>
-            {user.short}
-          </div>
-          <div className="user-info">
-            <div className="user-name">{user.name}</div>
-            <div className="user-status mono">{user.env}</div>
-          </div>
-        </div>
       </div>
     </aside>
   );
@@ -253,7 +239,6 @@ export function App() {
             <Sidebar
               screen={screen}
               setScreen={setScreen}
-              currentUser={currentUser}
             />
             <main className="main">
               <Toolbar title={screenTitle} sub={screenSub} actions={<ModeQuickToggle />} clock={clock} />

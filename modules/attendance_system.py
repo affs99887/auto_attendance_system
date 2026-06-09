@@ -1541,6 +1541,22 @@ class AttendanceSystem:
                 logging.error(f"定时刷新汇率任务时发生错误: {str(e)}")
         schedule.every(20).minutes.do(lambda: asyncio.create_task(exchange_rate_job())).tag('exchange_rate_update')
 
+        # AI 资讯定时刷新（每 30 分钟）：阻塞 requests 放线程执行，避免卡事件循环；
+        # 刷新成功且 GUI 模式（_event_bus 非 None）时通过 WS 推送更新摘要（更新时间 + 条数）。
+        async def ai_news_job():
+            try:
+                from modules.ai_news_service import refresh as _refresh_news
+                loop = asyncio.get_running_loop()
+                contract = await loop.run_in_executor(None, _refresh_news)
+                if self._event_bus is not None:
+                    self._event_bus.publish_threadsafe('ai_news:update', {
+                        'updated_at': (contract or {}).get('updated_at'),
+                        'count': (contract or {}).get('count'),
+                    })
+            except Exception as e:
+                logging.error(f"定时刷新 AI 资讯任务时发生错误: {str(e)}")
+        schedule.every(30).minutes.do(lambda: asyncio.create_task(ai_news_job())).tag('ai_news_update')
+
         # 从文件加载保存的定时任务
         saved_tasks = self.task_manager.get_tasks()
         for task in saved_tasks:
@@ -1610,6 +1626,20 @@ class AttendanceSystem:
                               name='aas-exchange-rate-first', daemon=True).start()
         except Exception as e:
             logging.error(f"启动汇率首刷线程失败（忽略）: {str(e)}")
+
+        # 启动时触发一次 AI 资讯首刷（容错、不阻塞启动）：放 daemon 线程，避免阻塞 __init__ 与事件循环。
+        def _first_ai_news_refresh():
+            try:
+                from modules.ai_news_service import refresh as _refresh_news
+                _refresh_news()
+            except Exception as e:
+                logging.error(f"启动 AI 资讯首刷失败（忽略）: {str(e)}")
+        try:
+            import threading as _threading
+            _threading.Thread(target=_first_ai_news_refresh,
+                              name='aas-ai-news-first', daemon=True).start()
+        except Exception as e:
+            logging.error(f"启动 AI 资讯首刷线程失败（忽略）: {str(e)}")
 
     async def send_daily_status(self):
         """发送每日状态信息"""

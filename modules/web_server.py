@@ -482,6 +482,24 @@ def _build_flask_app(attendance_system, bridge: AsyncioBridge,
                 'updated_at': None, 'latest': None, 'points': [],
             })
 
+    # ----- AI 资讯（AI HOT 精选）-----
+    @app.get('/api/v1/ai-news')
+    @require_token
+    def get_ai_news():
+        """返回 AI HOT 精选资讯契约（updated_at + count + items）。
+
+        query: force=0|1（1 跳过 TTL 立即拉）。
+        失败也返回 200 + 旧缓存；彻底无数据时 updated_at:null、count:0、items:[]。
+        """
+        force = request.args.get('force', '0') in ('1', 'true', 'True')
+        try:
+            from modules.ai_news_service import get_ai_news as _gan
+            return jsonify(_gan(force=force))
+        except Exception:
+            logging.exception("get_ai_news failed")
+            # 即便彻底异常也返回 200 + 空结构，避免前端报错
+            return jsonify({'updated_at': None, 'count': 0, 'items': []})
+
     # ----- Auto byebye -----
     @app.post('/api/v1/punch/auto_byebye/calc')
     @require_token

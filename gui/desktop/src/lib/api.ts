@@ -82,6 +82,24 @@ export interface ExchangeRateResponse {
   points: ExchangeRatePoint[]; // 按时间升序
 }
 
+// ===== AI 资讯（AI HOT，后端聚合中文 AI 资讯并按版块归类）=====
+export interface AiNewsItem {
+  id: string;
+  title: string;
+  title_en?: string | null;
+  url: string;
+  source: string;
+  publishedAt?: string | null; // 内容发布时间（ISO 字符串）
+  summary?: string | null;
+  category?: string | null; // 版块 slug，对应 AI_NEWS_CATEGORIES
+}
+
+export interface AiNewsResponse {
+  updated_at: number | null; // 缓存最后刷新时刻（unix 秒）
+  count: number;
+  items: AiNewsItem[];
+}
+
 export interface ApiOptions {
   method?: 'GET' | 'POST' | 'PUT' | 'PATCH' | 'DELETE';
   body?: unknown;
@@ -253,6 +271,14 @@ export const api = {
     const qs = new URLSearchParams({ range });
     if (force) qs.set('force', '1');
     return request<ExchangeRateResponse>(`/api/v1/exchange-rate?${qs.toString()}`);
+  },
+
+  // AI 资讯（AI HOT 聚合）；force=true 跳过后端缓存强制刷新
+  getAiNews: (force?: boolean) => {
+    const qs = new URLSearchParams();
+    if (force) qs.set('force', '1');
+    const q = qs.toString();
+    return request<AiNewsResponse>(`/api/v1/ai-news${q ? `?${q}` : ''}`);
   },
 
   getErrorLogs: (page = 1, perPage = 5) =>
