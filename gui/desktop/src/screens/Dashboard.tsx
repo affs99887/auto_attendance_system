@@ -7,6 +7,7 @@ import type { RecentActivityEntry, User } from '../lib/types';
 import { useSystemStore } from '../store/system';
 import { usePunchStore } from '../store/punch';
 import { api } from '../lib/api';
+import { FxSection } from '../components/ExchangeRatePanel';
 
 /** 后端 today_records 时间字段：`'08:29:55'` 或 `'1900-01-01T08:29:55'`，统一抽 HH:MM:SS */
 function extractTime(raw: string | null | undefined): string | null {
@@ -62,23 +63,108 @@ function PunchUserCard({ user }: { user: User }) {
   const { setScreen, setCurrentUser } = useApp();
   const snapshot = useSystemStore(s => s.snapshot);
   const refreshStatus = useSystemStore(s => s.refresh);
-  // 触发该用户的上/下班打卡（与 /punch_in /punch_out 同接口，进度经 WS punch:progress 展示）
-  const [busy, setBusy] = React.useState<null | 'in' | 'out'>(null);
-  const [hint, setHint] = React.useState<{ ok: boolean; text: string } | null>(null);
+  // 操作 busy 态：驱动按钮 spin-ic 图标动画 + 互斥禁用（in/out/auto/check 四种动作）
+  const [busy, setBusy] = React.useState<null | 'in' | 'out' | 'auto' | 'check'>(null);
+  // 结果提示：照设计稿 punch-toast（success/info）替代原 hint 文本
+  const [toast, setToast] = React.useState<{ tone: 'success' | 'info'; msg: string } | null>(null);
+
+  // 显示提示并自动消失（3.2s）
+  const toastTimer = React.useRef<number | null>(null);
+  const showToast = (tone: 'success' | 'info', msg: string) => {
+    setToast({ tone, msg });
+    if (toastTimer.current !== null) window.clearTimeout(toastTimer.current);
+    toastTimer.current = window.setTimeout(() => setToast(null), 3200);
+  };
+  React.useEffect(() => () => {
+    if (toastTimer.current !== null) window.clearTimeout(toastTimer.current);
+  }, []);
+
+  // 上/下班打卡（与 /punch_in /punch_out 同接口，进度经 WS punch:progress 展示）
   const doPunch = async (kind: 'in' | 'out') => {
+    if (busy) return;
     setBusy(kind);
-    setHint(null);
+    setToast(null);
     try {
       const r = kind === 'in' ? await api.punchIn(user.id) : await api.punchOut(user.id);
       // 后端业务失败经 HTTP 200 {success:false} 返回（不会进 catch），需显式判断给出反馈
-      setHint({ ok: Boolean(r.success), text: r.message || (r.success ? '操作已启动' : '操作失败') });
+      const ok = Boolean(r.success);
+      showToast(ok ? 'success' : 'info', r.message || (ok ? '操作已启动' : '操作失败'));
     } catch (e) {
-      setHint({ ok: false, text: e instanceof Error ? e.message : '请求失败' });
+      showToast('info', e instanceof Error ? e.message : '请求失败');
     } finally {
       setBusy(null);
       void refreshStatus();
     }
   };
+
+  // 自动下班：先 calc 取建议下班时刻（HH:MM），再 confirm 调度定时下班
+  const doAuto = async () => {
+    if (busy) return;
+    setBusy('auto');
+    setToast(null);
+    try {
+      const calc = await api.autoByebyeCalc(user.id);
+      const t = calc.punch_out_time;
+      if (!calc.success || !t) {
+        showToast('info', calc.message || '无法计算下班时间');
+        return;
+      }
+      const [hStr, mStr] = t.split(':');
+      const hour = Number(hStr);
+      const minute = Number(mStr);
+      if (Number.isNaN(hour) || Number.isNaN(minute)) {
+        showToast('info', `下班时间解析失败：${t}`);
+        return;
+      }
+      const confirm = await api.autoByebyeConfirm(hour, minute);
+      if (confirm.success) {
+        showToast('info', `已调度自动下班 · 预计 ${confirm.time ?? t}`);
+      } else {
+        showToast('info', confirm.error || '调度失败');
+      }
+    } catch (e) {
+      showToast('info', e instanceof Error ? e.message : '请求失败');
+    } finally {
+      setBusy(null);
+      void refreshStatus();
+    }
+  };
+
+  // 获取打卡情况：登录系统读取所有用户今日上/下班时间（不触发打卡），结果回写今日记录
+  const doCheck = async () => {
+    if (busy) return;
+    setBusy('check');
+    setToast(null);
+    try {
+      const r = await api.fetchPunchStatus();
+      if (r.success) {
+        const mine = r.results?.[user.id];
+        if (mine) {
+          const inT = extractTime(mine.punch_in_time) ?? '未打卡';
+          const outT = extractTime(mine.punch_out_time) ?? '未打卡';
+          showToast('info', `打卡情况 · 上班 ${inT} · 下班 ${outT}`);
+        } else {
+          showToast('info', '已刷新打卡情况');
+        }
+      } else {
+        showToast('info', r.error || '获取打卡情况失败');
+      }
+    } catch (e) {
+      showToast('info', e instanceof Error ? e.message : '请求失败');
+    } finally {
+      setBusy(null);
+      void refreshStatus();
+    }
+  };
+
+  // 按钮图标：busy 时换成旋转的 Refresh
+  const ico = (name: 'in' | 'out' | 'auto' | 'check', Cmp: (typeof Icon)[keyof typeof Icon]) =>
+    busy === name ? (
+      <span className="spin-ic" style={{ display: 'inline-flex' }}><Icon.Refresh size={13} /></span>
+    ) : (
+      <Cmp size={13} />
+    );
+
   // 今日打卡仅取后端 today_records（不再回退到写死的 mock 5/19 数据）
   const apiRec = snapshot?.today_records?.[user.id];
   const today = apiRec
@@ -134,20 +220,34 @@ function PunchUserCard({ user }: { user: User }) {
           </div>
         </div>
         <div className="divider" />
-        <div className="row gap-2">
+        <div className="punch-actions">
           <button
             className="btn btn-primary"
             disabled={punchedIn || busy !== null}
-            onClick={() => doPunch('in')}
+            onClick={() => void doPunch('in')}
           >
-            <Icon.Punch size={12} /> {busy === 'in' ? '打卡中…' : '上班打卡'}
+            {ico('in', Icon.Punch)} 上班打卡
+          </button>
+          <button
+            className="btn"
+            disabled={!punchedIn || punchedOut || busy !== null}
+            onClick={() => void doPunch('out')}
+          >
+            {ico('out', Icon.Power)} 下班打卡
+          </button>
+          <button
+            className="btn"
+            disabled={!punchedIn || punchedOut || busy !== null}
+            onClick={() => void doAuto()}
+          >
+            {ico('auto', Icon.Clock)} 自动下班
           </button>
           <button
             className="btn"
             disabled={busy !== null}
-            onClick={() => doPunch('out')}
+            onClick={() => void doCheck()}
           >
-            <Icon.Power size={12} /> {busy === 'out' ? '打卡中…' : '下班打卡'}
+            {ico('check', Icon.Eye)} 获取打卡情况
           </button>
           <button
             className="btn btn-sm"
@@ -160,16 +260,10 @@ function PunchUserCard({ user }: { user: User }) {
             查看记录 <Icon.ChevronRight size={10} />
           </button>
         </div>
-        {hint && (
-          <div
-            className="mono"
-            style={{
-              marginTop: 8,
-              fontSize: 11,
-              color: hint.ok ? 'var(--success)' : 'var(--danger)',
-            }}
-          >
-            {hint.ok ? '✓ ' : '✗ '}{hint.text}
+        {toast && (
+          <div className={`punch-toast ${toast.tone}`}>
+            {toast.tone === 'success' ? <Icon.Check size={13} /> : <Icon.Info size={13} />}
+            <span>{toast.msg}</span>
           </div>
         )}
       </div>
@@ -216,8 +310,24 @@ function ActivityRow({ entry }: { entry: RecentActivityEntry }) {
 }
 
 export function DashboardScreen() {
-  const { sysStatus, headless, setScreen, currentUser } = useApp();
+  const { sysStatus, headless, setScreen, currentUser, clock } = useApp();
   const snapshot = useSystemStore(s => s.snapshot);
+
+  // 跨过 0 点（本地日期变化）时刷新一次系统快照，避免今日记录停留在昨天。
+  // 仅比较「年-月-日」串，日期不变（每秒 tick）时不触发。
+  const prevDateRef = React.useRef<string | null>(null);
+  React.useEffect(() => {
+    const dateKey = `${clock.getFullYear()}-${clock.getMonth() + 1}-${clock.getDate()}`;
+    if (prevDateRef.current === null) {
+      prevDateRef.current = dateKey; // 首次挂载只记录，不触发
+      return;
+    }
+    if (prevDateRef.current !== dateKey) {
+      prevDateRef.current = dateKey;
+      void useSystemStore.getState().refresh();
+    }
+  }, [clock]);
+
   const lastFetched = useSystemStore(s => s.lastFetched);
   const punchEntries = usePunchStore(s => s.entries);
 
@@ -326,9 +436,15 @@ export function DashboardScreen() {
             打开打卡控制台 <Icon.ChevronRight size={10} />
           </button>
         </div>
-        <div className="grid grid-2">
+        <div className="grid" style={{ gridTemplateColumns: USERS.length > 1 ? '1fr 1fr' : '1fr' }}>
           {USERS.map(u => <PunchUserCard key={u.id} user={u} />)}
         </div>
+      </div>
+
+      {/* Exchange rate: chart + converter（接真实 useExchangeRateStore） */}
+      <div className="col gap-2">
+        <div className="kicker">汇率 · 人民币 / 日元</div>
+        <FxSection />
       </div>
 
       {/* Bottom: Activity + System health */}

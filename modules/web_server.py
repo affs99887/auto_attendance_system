@@ -459,6 +459,29 @@ def _build_flask_app(attendance_system, bridge: AsyncioBridge,
             })
         return jsonify({'users': users})
 
+    # ----- 汇率（Yahoo CNY->JPY）-----
+    @app.get('/api/v1/exchange-rate')
+    @require_token
+    def get_exchange_rate():
+        """返回 CNY->JPY 汇率契约（最新价 + 历史序列）。
+
+        query: range=7d|30d|quarter|year|3y（非法回退 30d）、force=0|1（1 跳过 TTL 立即拉）。
+        失败也返回 200 + 旧缓存；彻底无数据时 latest:null、points:[]。
+        """
+        range_ = request.args.get('range', '30d')
+        force = request.args.get('force', '0') in ('1', 'true', 'True')
+        try:
+            from modules.exchange_rate_service import get_exchange_rate as _ger
+            data = _ger(range_, force=force)
+            return jsonify(data)
+        except Exception:
+            logging.exception("get_exchange_rate failed")
+            # 即便彻底异常也返回 200 + 空结构，避免前端报错
+            return jsonify({
+                'base': 'CNY', 'quote': 'JPY', 'range': range_,
+                'updated_at': None, 'latest': None, 'points': [],
+            })
+
     # ----- Auto byebye -----
     @app.post('/api/v1/punch/auto_byebye/calc')
     @require_token

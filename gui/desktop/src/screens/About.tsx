@@ -2,9 +2,7 @@
 import * as React from 'react';
 import { Icon } from '../lib/icons';
 import { COMMANDS } from '../lib/data';
-import { api, ApiError } from '../lib/api';
-import { useSystemStore } from '../store/system';
-import { useServiceStore } from '../store/service';
+import { ServiceControls } from '../components/ServiceControls';
 
 const DATA_FLOW = `  ┌─────────────────┐
   │  Telegram Bot   │ ◄── 用户命令 (/punch_in 等)
@@ -41,109 +39,8 @@ const MODULES = [
 ];
 
 export function AboutScreen() {
-  const snapshot = useSystemStore(s => s.snapshot);
-  // 后端服务（main.py）运行/可控状态：驱动启动/重启/终止按钮互斥
-  const running = useServiceStore(s => s.running);
-  const available = useServiceStore(s => s.available);
-  const [confirmStop, setConfirmStop] = React.useState(false);
-  const [reconnecting, setReconnecting] = React.useState(false);
-  const [toast, setToast] = React.useState<string | null>(null);
-
-  const showToast = (text: string) => {
-    setToast(text);
-    window.setTimeout(() => setToast(null), 4000);
-  };
-
-  // 重启：优先 Electron 桥；无桥回退 REST systemRestart
-  const handleRestart = async () => {
-    if (window.AAS_SERVICE) {
-      const r = await window.AAS_SERVICE.restart();
-      showToast(r?.message ?? '已发送重启指令');
-      return;
-    }
-    try {
-      const r = await api.systemRestart();
-      showToast(r.note ?? '已发出重启信号（由 Electron 处理）');
-    } catch (e) {
-      showToast(`请求失败: ${e instanceof ApiError ? e.status : (e as Error).message}`);
-    }
-  };
-
-  // 启动服务（仅未运行时显示）
-  const handleStart = async () => {
-    const r = await window.AAS_SERVICE?.start();
-    showToast(r?.message ?? '已发送启动指令');
-  };
-
-  // 重连 Telegram bot（不重启进程，本地防抖）
-  const handleReconnect = async () => {
-    if (reconnecting) return;
-    setReconnecting(true);
-    try {
-      const r = await api.botReconnect();
-      showToast(r.success ? (r.message ?? 'Bot 已重连') : (r.error ?? '重连失败'));
-    } catch (e) {
-      showToast(`重连失败: ${e instanceof ApiError ? e.status : (e as Error).message}`);
-    } finally {
-      setReconnecting(false);
-    }
-  };
-
-  const heartbeatMs = snapshot?.heartbeat?.last
-    ? new Date(snapshot.heartbeat.last).getTime()
-    : null;
-  const runMins = heartbeatMs ? Math.max(0, Math.round((Date.now() - heartbeatMs) / 60_000)) : null;
-
   return (
     <div className="col gap-6">
-      {toast && (
-        <div
-          style={{
-            position: 'fixed', top: 80, right: 24, zIndex: 200,
-            background: 'var(--bg-card)',
-            border: '1px solid var(--accent-border)',
-            borderLeft: '3px solid var(--accent)',
-            borderRadius: 'var(--radius)',
-            padding: '10px 16px',
-            boxShadow: 'var(--shadow-lg)',
-            fontSize: 13,
-            maxWidth: 360,
-          }}
-        >
-          {toast}
-        </div>
-      )}
-      {confirmStop && (
-        <div
-          style={{
-            position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.4)',
-            display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 1500,
-          }}
-          onClick={() => setConfirmStop(false)}
-        >
-          <div className="card" style={{ width: 400 }} onClick={e => e.stopPropagation()}>
-            <div className="card-body">
-              <div className="h2" style={{ marginBottom: 8 }}>终止后端服务？</div>
-              <div className="muted" style={{ fontSize: 12, marginBottom: 16 }}>
-                终止后端服务？将停止 main.py（含 Telegram bot），可在此页重新启动。
-              </div>
-              <div className="row gap-2" style={{ justifyContent: 'flex-end' }}>
-                <button className="btn" onClick={() => setConfirmStop(false)}>取消</button>
-                <button
-                  className="btn btn-danger"
-                  onClick={async () => {
-                    setConfirmStop(false);
-                    const r = await window.AAS_SERVICE?.stop();
-                    showToast(r?.message ?? '已发送终止指令');
-                  }}
-                >
-                  确认终止
-                </button>
-              </div>
-            </div>
-          </div>
-        </div>
-      )}
       <div className="grid" style={{ gridTemplateColumns: '1fr 1.4fr', gap: 16 }}>
         <div className="card">
           <div className="card-body">
@@ -171,42 +68,8 @@ export function AboutScreen() {
               <div className="spread"><span>看门狗重启</span><span className="mono">0 次</span></div>
             </div>
             <div className="divider" />
-            {/* 服务状态 pill + 按钮组（启动/重启互斥）*/}
-            <div className="row gap-2" style={{ alignItems: 'center', flexWrap: 'wrap' }}>
-              {!available ? (
-                <span className="pill pill-neutral"><span className="dot" />浏览器模式</span>
-              ) : running ? (
-                <span className="pill pill-success"><span className="dot" />服务运行中</span>
-              ) : (
-                <span className="pill pill-danger"><span className="dot" />服务已停止</span>
-              )}
-
-              {!running ? (
-                // 未运行：仅「启动服务」（无桥时禁用）
-                <button className="btn" disabled={!available} onClick={handleStart}>
-                  <Icon.Power size={12} />启动服务
-                </button>
-              ) : (
-                // 运行中：重启 / 终止 / 重连 Bot
-                <>
-                  <button className="btn" onClick={handleRestart}>
-                    <Icon.Refresh size={12} />重启服务
-                  </button>
-                  <button className="btn btn-danger" onClick={() => setConfirmStop(true)}>
-                    <Icon.Power size={12} />终止服务
-                  </button>
-                  <button className="btn" disabled={reconnecting} onClick={handleReconnect}>
-                    <Icon.Bot size={12} />{reconnecting ? '重连中…' : '重连 Bot'}
-                  </button>
-                </>
-              )}
-
-              {runMins !== null && (
-                <span className="muted" style={{ fontSize: 11, marginLeft: 'auto' }}>
-                  上次心跳：{runMins} 分钟前
-                </span>
-              )}
-            </div>
+            {/* 服务控制（启动/重启/终止/重连 + 心跳）— 统一走 ServiceControls bar 形态 */}
+            <ServiceControls variant="bar" />
           </div>
         </div>
 

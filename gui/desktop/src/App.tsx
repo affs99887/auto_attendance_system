@@ -18,6 +18,7 @@ import { StartupOverlay } from './components/StartupOverlay';
 import { ToastHost } from './components/ToastHost';
 import { ModeQuickToggle } from './components/ModeQuickToggle';
 import { SystemBanners } from './components/SystemBanners';
+import { ServiceControls } from './components/ServiceControls';
 import { useSystemStore } from './store/system';
 
 type ScreenComponent = React.ComponentType;
@@ -75,7 +76,7 @@ interface NavEntry {
 }
 
 const NAV: NavEntry[] = [
-  { id: 'dashboard', label: '概览', icon: 'Dashboard', group: 'main' },
+  { id: 'dashboard', label: '仪表盘', icon: 'Dashboard', group: 'main' },
   { id: 'punch', label: '打卡操作', icon: 'Punch', group: 'main' },
   { id: 'records', label: '打卡记录', icon: 'Records', group: 'main' },
   { id: 'shots', label: '截图档案', icon: 'Camera', group: 'main' },
@@ -87,7 +88,7 @@ const NAV: NavEntry[] = [
 ];
 
 const SCREEN_SUB: Record<ScreenId, string> = {
-  dashboard: '今日打卡、系统状态与最近活动',
+  dashboard: '今日打卡、汇率行情与最近活动',
   punch: '手动触发上班、下班或自动下班打卡',
   records: '按用户、按月份查看与统计打卡历史',
   shots: '查看每位用户最近 3 张打卡截图',
@@ -102,11 +103,9 @@ interface SidebarProps {
   screen: ScreenId;
   setScreen: (s: ScreenId) => void;
   currentUser: string;
-  setCurrentUser: (u: string) => void;
-  sysStatus: SysStatus;
 }
 
-function Sidebar({ screen, setScreen, currentUser, setCurrentUser, sysStatus }: SidebarProps) {
+function Sidebar({ screen, setScreen, currentUser }: SidebarProps) {
   const user = USERS.find(u => u.id === currentUser) ?? USERS[0];
   return (
     <aside className="sidebar">
@@ -149,30 +148,17 @@ function Sidebar({ screen, setScreen, currentUser, setCurrentUser, sysStatus }: 
       </div>
 
       <div className="side-footer">
-        <div style={{ display: 'flex', flexDirection: 'column', gap: 6, padding: '4px 8px' }}>
-          <div style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: 11, color: 'var(--text-muted)', whiteSpace: 'nowrap' }}>
-            <span style={{ width: 6, height: 6, borderRadius: '50%', background: 'var(--success)' }} />
-            <span>{sysStatus.serviceLabel}</span>
-          </div>
-          <div style={{ fontSize: 10, color: 'var(--text-muted)', paddingLeft: 12, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
-            模式: <span style={{ color: 'var(--text-secondary)' }}>{sysStatus.modeLabel}</span>
-          </div>
-        </div>
-        <div
-          className="user-chip"
-          onClick={() => {
-            const idx = USERS.findIndex(u => u.id === currentUser);
-            setCurrentUser(USERS[(idx + 1) % USERS.length].id);
-          }}
-        >
+        <div className="side-label" style={{ padding: '0 0 2px' }}>服务控制</div>
+        <ServiceControls variant="compact" />
+        {/* 账户静态展示（已切单用户，去掉切换交互）— 照设计稿 side-user */}
+        <div className="side-user">
           <div className="user-avatar" style={{ background: user.color }}>
             {user.short}
           </div>
           <div className="user-info">
-            <div className="user-name">{currentUser}</div>
-            <div className="user-status">点击切换用户</div>
+            <div className="user-name">{user.name}</div>
+            <div className="user-status mono">{user.env}</div>
           </div>
-          <Icon.ChevronDown size={12} />
         </div>
       </div>
     </aside>
@@ -255,7 +241,7 @@ export function App() {
   };
 
   const ScreenCmp = SCREENS[screen];
-  const screenTitle = NAV.find(n => n.id === screen)?.label ?? '概览';
+  const screenTitle = NAV.find(n => n.id === screen)?.label ?? '仪表盘';
   const screenSub = SCREEN_SUB[screen];
 
   return (
@@ -268,8 +254,6 @@ export function App() {
               screen={screen}
               setScreen={setScreen}
               currentUser={currentUser}
-              setCurrentUser={setCurrentUser}
-              sysStatus={sysStatus}
             />
             <main className="main">
               <Toolbar title={screenTitle} sub={screenSub} actions={<ModeQuickToggle />} clock={clock} />

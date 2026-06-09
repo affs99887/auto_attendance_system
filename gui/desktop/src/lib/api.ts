@@ -67,6 +67,21 @@ export interface StatusSnapshot {
   };
 }
 
+// ===== 汇率（CNY->JPY，后端只产出该方向；JPY->CNY 由前端取倒数）=====
+export interface ExchangeRatePoint {
+  t: number; // unix 秒
+  value: number; // CNY->JPY
+}
+
+export interface ExchangeRateResponse {
+  base: string;
+  quote: string;
+  range: string;
+  updated_at: number | null; // 缓存最后刷新时刻（unix 秒）
+  latest: { price: number; time: number } | null; // price=CNY->JPY，time=报价时间（unix 秒）
+  points: ExchangeRatePoint[]; // 按时间升序
+}
+
 export interface ApiOptions {
   method?: 'GET' | 'POST' | 'PUT' | 'PATCH' | 'DELETE';
   body?: unknown;
@@ -231,6 +246,13 @@ export const api = {
   getRecords: (username: string, year: number, month: number) => {
     const qs = new URLSearchParams({ username, year: String(year), month: String(month) });
     return request<RecordsResponse>(`/api/v1/records?${qs.toString()}`);
+  },
+
+  // 汇率走势（base=CNY quote=JPY）；force=true 跳过缓存强制刷新
+  getExchangeRate: (range: string, force?: boolean) => {
+    const qs = new URLSearchParams({ range });
+    if (force) qs.set('force', '1');
+    return request<ExchangeRateResponse>(`/api/v1/exchange-rate?${qs.toString()}`);
   },
 
   getErrorLogs: (page = 1, perPage = 5) =>
