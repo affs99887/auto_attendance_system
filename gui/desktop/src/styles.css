@@ -1529,6 +1529,33 @@ input[type='date']::-webkit-calendar-picker-indicator { cursor: pointer; opacity
   transition: color 0.12s, background 0.12s;
 }
 .ep-memo-del:hover { color: var(--danger); background: var(--danger-bg); }
+.ep-memo-edit-btn {
+  flex-shrink: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 22px;
+  height: 22px;
+  margin-top: -2px; /* 与首行光学居中（同删除键） */
+  border: none;
+  border-radius: 5px;
+  background: transparent;
+  color: var(--text-muted);
+  cursor: pointer;
+  padding: 0;
+  transition: color 0.12s, background 0.12s;
+}
+.ep-memo-edit-btn:hover { color: var(--accent-fg); background: var(--accent-bg); }
+.ep-memo-edit {
+  flex: 1;
+  min-width: 0;
+  height: 24px;
+  padding: 2px 8px;
+  font-size: 12.5px;
+  margin-top: -3px; /* 与 18px 首行对齐 */
+}
+.ep-memo-archived { opacity: 0.8; background: var(--bg-inset); }
+.ep-memo-archived .ep-hint-inline { flex-shrink: 0; }
 
 /* 假期说明 */
 .ep-help { font-size: 12.5px; line-height: 1.7; color: var(--text-primary); gap: 16px; }

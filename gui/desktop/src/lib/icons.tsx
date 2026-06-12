@@ -146,6 +146,7 @@ export const Icon = {
     </>,
   ),
   Plus: makeIcon(<path d="M8 3v10M3 8h10" />),
+  Pencil: makeIcon(<path d="M11.2 2.3l2.5 2.5L5.4 13l-3.2.8.8-3.2 8.2-8.3zM9.5 4l2.5 2.5" />),
   Trash: makeIcon(
     <>
       <path d="M2.5 4h11" />

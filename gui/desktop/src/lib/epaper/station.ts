@@ -21,6 +21,7 @@ export interface StationMemoItem {
   id: number;
   text: string;
   done: boolean;
+  doneAt?: number; // 划掉时刻（epoch ms），驱动「完成超 3 天自动归档」；未完成时无此字段
 }
 
 /** 生效中的个人请假（驱动状态 D） */
@@ -266,12 +267,18 @@ function drawHeader(ctx: CanvasRenderingContext2D, data: StationData) {
   ctx.fillText(wd, x, baseline - 1);
   x += ctx.measureText(wd).width + 7;
 
-  // 右：红点 + 信息站 + 时间（从右往左排）
+  // 右：红点 + 信息站 + 刷新时间（从右往左排）
   let rx = 390;
   ctx.font = `700 12px ${MONO}`;
   const timeText = `${p2(now.getHours())}:${p2(now.getMinutes())}`;
   rx -= ctx.measureText(timeText).width;
   ctx.fillText(timeText, rx, baseline - 1);
+
+  // 「刷新于」前缀：内容生成于推送瞬间，屏上时间即上次刷新时间
+  ctx.font = `600 11px ${SANS}`;
+  const refreshLabel = '刷新于';
+  rx -= 4 + ctx.measureText(refreshLabel).width;
+  ctx.fillText(refreshLabel, rx, baseline - 1);
 
   ctx.font = `700 11px ${SANS}`;
   const title = '信息站';

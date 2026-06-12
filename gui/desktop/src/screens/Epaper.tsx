@@ -4,10 +4,10 @@
 // 画布、抖动与绘图工具为页面本地状态。
 import * as React from 'react';
 import { Icon } from '../lib/icons';
-import { useEpaperStore, epdClient, buildStationData, type EpdScanDevice } from '../store/epaper';
+import { useEpaperStore, epdClient, buildStationData, sortMemos, type EpdScanDevice } from '../store/epaper';
 import { EpdCmd, canvasSizes, canvasSizeLabels, epdDrivers, hex2bytes, parseHolidayData, buildHolidayPayload, DEFAULT_HOLIDAYS_2026, DEFAULT_HOLIDAYS_2027 } from '../lib/epaper/protocol';
 import { adjustContrast, ditherImage, processImageData, decodeProcessedData, type DitherMode, type DitherAlgorithm } from '../lib/epaper/dithering';
-import { renderStation, STATION_MEMO_MAX } from '../lib/epaper/station';
+import { renderStation, STATION_MEMO_MAX, type StationMemoItem } from '../lib/epaper/station';
 import { sendCanvasToEpd, epdSendBusy } from '../lib/epaper/sendImage';
 import { appAlert, appConfirm } from '../lib/dialog';
 import { PaintManager, type PaintTool } from '../lib/epaper/paint';
@@ -101,6 +101,7 @@ export function EpaperScreen() {
   const quickConnecting = useEpaperStore(s => s.quickConnecting);
   const invertRender = useEpaperStore(s => s.invertRender);
   const memos = useEpaperStore(s => s.memos);
+  const memoArchive = useEpaperStore(s => s.memoArchive);
   const stationAutoMin = useEpaperStore(s => s.stationAutoMin);
   const stationPushing = useEpaperStore(s => s.stationPushing);
   const stationLastPush = useEpaperStore(s => s.stationLastPush);
@@ -143,6 +144,9 @@ export function EpaperScreen() {
   const [holidayData, setHolidayData] = React.useState('');
 
   const [memoText, setMemoText] = React.useState('');
+  const [memoEditId, setMemoEditId] = React.useState<number | null>(null); // 行内编辑中的备忘录 id
+  const [memoEditText, setMemoEditText] = React.useState('');
+  const [memoArchiveOpen, setMemoArchiveOpen] = React.useState(false); // 展开已归档备忘录
   const [stationRendering, setStationRendering] = React.useState(false);
   const [stationPreviewed, setStationPreviewed] = React.useState(false); // 已渲染过预览（显示预览画布）
   const [workbenchOpen, setWorkbenchOpen] = React.useState(false);       // 传图工作台展开（默认收起）
@@ -497,6 +501,50 @@ export function EpaperScreen() {
     setMemoText('');
   };
 
+  // 展示序：未完成在上、已完成沉底（底层数组保持添加顺序，取消勾选回到原位置）
+  const sortedMemos = React.useMemo(() => sortMemos(memos), [memos]);
+
+  // FLIP 动画：排序/增删导致条目位移时，从旧位置平滑滑动到新位置（勾选沉底 / 取消勾选浮回）
+  const memoListRef = React.useRef<HTMLDivElement | null>(null);
+  const memoRowTops = React.useRef<Map<string, number>>(new Map());
+  React.useLayoutEffect(() => {
+    const list = memoListRef.current;
+    if (!list) return;
+    const rows = Array.from(list.querySelectorAll<HTMLElement>('[data-memo-id]'));
+    const tops = new Map<string, number>();
+    // 用容器内容坐标（抵消列表自身滚动），避免用户滚动后 toggle 触发整列假位移动画
+    const base = list.getBoundingClientRect().top - list.scrollTop;
+    for (const el of rows) tops.set(el.dataset.memoId!, el.getBoundingClientRect().top - base);
+    for (const el of rows) {
+      const id = el.dataset.memoId!;
+      const prev = memoRowTops.current.get(id);
+      const now = tops.get(id)!;
+      if (prev != null && Math.abs(prev - now) > 1) {
+        el.style.transition = 'none';
+        el.style.transform = `translateY(${prev - now}px)`;
+        void el.offsetHeight; // 强制 reflow，让起点 transform 先生效
+        el.style.transition = 'transform 0.32s ease';
+        el.style.transform = '';
+        el.addEventListener('transitionend', function clear() {
+          el.style.transition = '';
+          el.removeEventListener('transitionend', clear);
+        });
+      }
+    }
+    memoRowTops.current = tops;
+  }, [sortedMemos]);
+
+  // 备忘录行内编辑（铅笔按钮或双击文本进入；Enter/失焦保存，Esc 取消，改空=放弃）
+  const startMemoEdit = (m: StationMemoItem) => {
+    setMemoEditId(m.id);
+    setMemoEditText(m.text);
+  };
+  const commitMemoEdit = () => {
+    if (memoEditId != null && memoEditText.trim()) store().updateMemo(memoEditId, memoEditText);
+    setMemoEditId(null);
+  };
+  const cancelMemoEdit = () => setMemoEditId(null);
+
   const downloadDataArray = () => {
     const canvas = canvasRef.current, ctx = ctxRef.current, crop = cropRef.current;
     if (!canvas || !ctx || !crop) return;
@@ -832,10 +880,10 @@ export function EpaperScreen() {
                   <span className="field-label">备忘录（屏上展示前 {STATION_MEMO_MAX} 条）</span>
                   <span className="ep-hint-inline mono">{memos.filter(m => m.done).length} / {memos.length}</span>
                 </div>
-                <div className="ep-memo-list">
+                <div className="ep-memo-list" ref={memoListRef}>
                   {memos.length === 0 && <div className="ep-memo-empty">暂无事项 — 在下方输入添加</div>}
-                  {memos.map((m, i) => (
-                    <div key={m.id} className={`ep-memo-item ${m.done ? 'done' : ''}`}>
+                  {sortedMemos.map((m, i) => (
+                    <div key={m.id} data-memo-id={m.id} className={`ep-memo-item ${m.done ? 'done' : ''}`}>
                       <button
                         className={`ep-memo-check ${m.done ? 'on' : ''}`}
                         title={m.done ? '标记未完成' : '标记完成'}
@@ -843,13 +891,71 @@ export function EpaperScreen() {
                       >
                         {m.done && <Icon.Check size={11} />}
                       </button>
-                      <span className="ep-memo-text">{m.text}</span>
+                      {memoEditId === m.id ? (
+                        <input
+                          className="input ep-memo-edit"
+                          autoFocus
+                          maxLength={40}
+                          value={memoEditText}
+                          onChange={e => setMemoEditText(e.target.value)}
+                          onKeyDown={e => {
+                            if (e.key === 'Enter') commitMemoEdit();
+                            else if (e.key === 'Escape') cancelMemoEdit();
+                          }}
+                          onBlur={commitMemoEdit}
+                        />
+                      ) : (
+                        <span className="ep-memo-text" title="双击修改" onDoubleClick={() => startMemoEdit(m)}>{m.text}</span>
+                      )}
                       {i >= STATION_MEMO_MAX && <span className="ep-badge" title="超出屏幕展示条数">屏外</span>}
+                      {memoEditId !== m.id && (
+                        <button className="ep-memo-edit-btn" title="修改" onClick={() => startMemoEdit(m)}>
+                          <Icon.Pencil size={13} />
+                        </button>
+                      )}
                       <button className="ep-memo-del" title="删除" onClick={() => store().removeMemo(m.id)}>
                         <Icon.Trash size={13} />
                       </button>
                     </div>
                   ))}
+
+                  {/* 已归档（划掉超 3 天自动移入）：可恢复 / 删除 / 清空 */}
+                  {memoArchive.length > 0 && (
+                    <>
+                      <button className="ep-hidden-toggle" onClick={() => setMemoArchiveOpen(v => !v)}>
+                        <Icon.ChevronDown size={13} className={`ep-hidden-chev ${memoArchiveOpen ? 'open' : ''}`} />
+                        {memoArchiveOpen
+                          ? `收起归档（${memoArchive.length}）`
+                          : `已归档 ${memoArchive.length} 条 · 划掉超 3 天自动归档`}
+                      </button>
+                      {memoArchiveOpen && memoArchive.map(m => (
+                        <div key={m.id} className="ep-memo-item done ep-memo-archived">
+                          <span className="ep-memo-text">{m.text}</span>
+                          <span className="ep-hint-inline mono">
+                            {(d => `${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')} 归档`)(new Date(m.archivedAt))}
+                          </span>
+                          <button className="ep-memo-edit-btn" title="恢复为未完成" onClick={() => store().restoreMemo(m.id)}>
+                            <Icon.Undo size={13} />
+                          </button>
+                          <button className="ep-memo-del" title="彻底删除" onClick={() => store().removeArchivedMemo(m.id)}>
+                            <Icon.Trash size={13} />
+                          </button>
+                        </div>
+                      ))}
+                      {memoArchiveOpen && (
+                        <button
+                          className="ep-hidden-toggle"
+                          onClick={() => void (async () => {
+                            if (await appConfirm(`清空全部 ${memoArchive.length} 条归档？`, { title: '清空归档', danger: true, confirmText: '清空' })) {
+                              store().clearMemoArchive();
+                            }
+                          })()}
+                        >
+                          <Icon.Trash size={12} /> 清空归档
+                        </button>
+                      )}
+                    </>
+                  )}
                 </div>
                 <div className="ep-row">
                   <input
@@ -880,7 +986,7 @@ export function EpaperScreen() {
                     <option value={120}>每 2 小时</option>
                     <option value={240}>每 4 小时</option>
                   </select>
-                  <span className="ep-hint-inline">仅连接时执行，间隔过密影响屏幕寿命</span>
+                  <span className="ep-hint-inline">到点未连接会先自动重连再推送；间隔过密影响屏幕寿命</span>
                 </div>
 
                 {/* 倒置渲染：屏幕倒挂安装时勾选，发送/推送统一旋转 180°（跨重启记忆） */}

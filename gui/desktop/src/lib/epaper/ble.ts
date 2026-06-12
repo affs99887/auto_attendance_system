@@ -218,11 +218,15 @@ export class EpdBleClient {
       });
     } catch (e) {
       console.error(e);
-      if ((e as Error).message) this.log('requestDevice: ' + (e as Error).message);
-      this.log('请检查蓝牙是否已开启，且使用的浏览器支持蓝牙！建议使用以下浏览器：');
-      this.log('• 电脑: Chrome/Edge');
-      this.log('• Android: Chrome/Edge');
-      this.log('• iOS: Bluefy 浏览器');
+      const msg = (e as Error).message || '';
+      if (msg) this.log('requestDevice: ' + msg);
+      // 用户取消 / 自动重连超时取消（User cancelled）不属于环境问题，不刷浏览器建议
+      if (!/cancel/i.test(msg)) {
+        this.log('请检查蓝牙是否已开启，且使用的浏览器支持蓝牙！建议使用以下浏览器：');
+        this.log('• 电脑: Chrome/Edge');
+        this.log('• Android: Chrome/Edge');
+        this.log('• iOS: Bluefy 浏览器');
+      }
       return;
     }
 

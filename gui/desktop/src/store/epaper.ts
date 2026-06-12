@@ -85,20 +85,38 @@ function loadInvert(): boolean {
 const MEMO_KEY = 'aas.epd.memos';
 const STATION_KEY = 'aas.epd.station';
 
-function loadMemos(): { items: StationMemoItem[]; nextId: number } {
+/** 已归档备忘录（完成超 3 天自动移入，不再上屏/占列表位） */
+export interface ArchivedMemo extends StationMemoItem {
+  archivedAt: number; // epoch ms
+}
+
+const MEMO_ARCHIVE_MS = 3 * 86400000; // 划掉超过 3 天自动归档
+
+/** 稳定分区排序：未完成在上，已完成沉底（两组各保持原相对顺序）。
+ *  仅在展示/上屏时派生使用 —— 底层 memos 数组始终保持添加顺序不重排，
+ *  因此取消勾选后条目精确回到勾选前的位置。 */
+export function sortMemos(items: StationMemoItem[]): StationMemoItem[] {
+  return [...items.filter(m => !m.done), ...items.filter(m => m.done)];
+}
+
+function loadMemos(): { items: StationMemoItem[]; nextId: number; archive: ArchivedMemo[] } {
   try {
     const raw = typeof localStorage !== 'undefined' ? localStorage.getItem(MEMO_KEY) : null;
     if (raw) {
       const o = JSON.parse(raw);
       if (Array.isArray(o.items)) {
-        return { items: o.items, nextId: typeof o.nextId === 'number' ? o.nextId : o.items.length + 1 };
+        return {
+          items: o.items,
+          nextId: typeof o.nextId === 'number' ? o.nextId : o.items.length + 1,
+          archive: Array.isArray(o.archive) ? o.archive : [],
+        };
       }
     }
   } catch { /* 忽略损坏的本地数据 */ }
-  return { items: [], nextId: 1 };
+  return { items: [], nextId: 1, archive: [] };
 }
-function saveMemos(items: StationMemoItem[], nextId: number) {
-  persist(MEMO_KEY, { items, nextId });
+function saveMemos(items: StationMemoItem[], nextId: number, archive: ArchivedMemo[]) {
+  persist(MEMO_KEY, { items, nextId, archive });
 }
 
 /** 请假设置（驱动信息站「请假中」全屏状态） */
@@ -156,6 +174,7 @@ interface EpaperState {
 
   // 信息站（备忘录 + 定时推送 + 请假设置）
   memos: StationMemoItem[];
+  memoArchive: ArchivedMemo[];   // 已归档（完成超 3 天自动移入）
   stationAutoMin: number;        // 自动推送间隔（分钟，0 = 关闭）
   stationPushing: boolean;       // 信息站推送进行中
   stationLastPush: number | null; // 上次成功推送（epoch ms）
@@ -170,7 +189,11 @@ interface EpaperState {
 
   addMemo: (text: string) => void;
   toggleMemo: (id: number) => void;
+  updateMemo: (id: number, text: string) => void;
   removeMemo: (id: number) => void;
+  restoreMemo: (id: number) => void;        // 归档项恢复为未完成，回到主列表
+  removeArchivedMemo: (id: number) => void; // 彻底删除单条归档
+  clearMemoArchive: () => void;             // 清空归档
   setStationAutoMin: (min: number) => void;
   setStationLeave: (patch: Partial<StationLeaveCfg>) => void;
   pushStation: (reason?: 'manual' | 'auto') => Promise<boolean>; // 离屏渲染并发送到屏幕
@@ -193,6 +216,8 @@ let memoNextId = initMemos.nextId;
 // 本次「回选 → 连接」流程中选中的 deviceId（modal 点选或一键重连自动回选），
 // 连接成功时与设备名一起存为 lastDevice 供下次一键重连。
 let pendingSelectId: string | null = null;
+// 定时推送发起的自动重连：连接成功后补推一次（蓝牙会自动断开，到点先重连再推送）
+let autoPushAfterConnect = false;
 // 一键重连超时定时器（目标设备一直未被扫到时收尾）
 let quickTimer: number | null = null;
 function clearQuickTimer() {
@@ -225,6 +250,7 @@ export const useEpaperStore = create<EpaperState>((set, get) => ({
   invertRender: loadInvert(),
 
   memos: initMemos.items,
+  memoArchive: initMemos.archive,
   stationAutoMin: initStation.autoMin,
   stationPushing: false,
   stationLastPush: initStation.lastPush,
@@ -261,19 +287,52 @@ export const useEpaperStore = create<EpaperState>((set, get) => ({
     if (!t) return;
     const memos = [...get().memos, { id: memoNextId++, text: t, done: false }];
     set({ memos });
-    saveMemos(memos, memoNextId);
+    saveMemos(memos, memoNextId, get().memoArchive);
   },
 
   toggleMemo(id) {
-    const memos = get().memos.map(m => (m.id === id ? { ...m, done: !m.done } : m));
+    // 划掉记录 doneAt（驱动 3 天自动归档）；沉底是展示层 sortMemos 派生的，
+    // 底层顺序不动 —— 取消划掉自然回到勾选前的位置
+    const memos = get().memos.map(m => {
+      if (m.id !== id) return m;
+      return m.done ? { ...m, done: false, doneAt: undefined } : { ...m, done: true, doneAt: Date.now() };
+    });
     set({ memos });
-    saveMemos(memos, memoNextId);
+    saveMemos(memos, memoNextId, get().memoArchive);
+  },
+
+  updateMemo(id, text) {
+    const t = text.trim();
+    if (!t) return; // 改空视为放弃，保留原文
+    const memos = get().memos.map(m => (m.id === id ? { ...m, text: t } : m));
+    set({ memos });
+    saveMemos(memos, memoNextId, get().memoArchive);
   },
 
   removeMemo(id) {
     const memos = get().memos.filter(m => m.id !== id);
     set({ memos });
-    saveMemos(memos, memoNextId);
+    saveMemos(memos, memoNextId, get().memoArchive);
+  },
+
+  restoreMemo(id) {
+    const item = get().memoArchive.find(m => m.id === id);
+    if (!item) return;
+    const memoArchive = get().memoArchive.filter(m => m.id !== id);
+    const memos = [...get().memos, { id: item.id, text: item.text, done: false }];
+    set({ memos, memoArchive });
+    saveMemos(memos, memoNextId, memoArchive);
+  },
+
+  removeArchivedMemo(id) {
+    const memoArchive = get().memoArchive.filter(m => m.id !== id);
+    set({ memoArchive });
+    saveMemos(get().memos, memoNextId, memoArchive);
+  },
+
+  clearMemoArchive() {
+    set({ memoArchive: [] });
+    saveMemos(get().memos, memoNextId, []);
   },
 
   // ===== 信息站：推送 =====
@@ -281,7 +340,7 @@ export const useEpaperStore = create<EpaperState>((set, get) => ({
   setStationAutoMin(min) {
     set({ stationAutoMin: min });
     saveStationCfg(min, get().stationLastPush, get().stationLeave);
-    if (min > 0) get().addLog(`信息站自动推送已开启：每 ${min} 分钟（仅连接时执行）`);
+    if (min > 0) get().addLog(`信息站自动推送已开启：每 ${min} 分钟（断开时自动重连后推送）`);
     else get().addLog('信息站自动推送已关闭');
   },
 
@@ -372,6 +431,7 @@ export const useEpaperStore = create<EpaperState>((set, get) => ({
     quickTimer = window.setTimeout(() => {
       quickTimer = null;
       if (!useEpaperStore.getState().quickConnecting) return;
+      autoPushAfterConnect = false; // 超时未扫到设备，放弃本次补推
       window.AAS_EPD?.select('');
       useEpaperStore.setState({ quickConnecting: false });
       useEpaperStore.getState().addLog('一键重连超时：未发现上次连接的设备，请确认设备已开机，或用「连接设备」重新搜索');
@@ -382,6 +442,7 @@ export const useEpaperStore = create<EpaperState>((set, get) => ({
   cancelQuickReconnect() {
     if (!get().quickConnecting) return;
     clearQuickTimer();
+    autoPushAfterConnect = false; // 用户主动取消，连带放弃本次补推
     window.AAS_EPD?.select('');
     set({ quickConnecting: false });
     get().addLog('已取消一键重连');
@@ -429,11 +490,24 @@ export const epdClient = new EpdBleClient({
         scanning: false, connectingId: null, scanDevices: [], quickConnecting: false,
         lastConnectedName: last, pairedNames: paired, lastDevice,
       });
+      // 定时推送发起的重连：连上后等设备回传配置/MTU（INIT 后首条通知）再补推。
+      // 补推前复核自动推送仍开启（重连窗口期内用户可能已关闭）且设备仍在线。
+      if (autoPushAfterConnect) {
+        autoPushAfterConnect = false;
+        window.setTimeout(() => {
+          const s = useEpaperStore.getState();
+          if (s.stationAutoMin > 0 && s.connected && !s.stationPushing && !epdSendBusy()) {
+            void s.pushStation('auto');
+          }
+        }, 3500);
+      }
     } else {
       // 断开 / 连接失败：复位连接态并关闭扫描 modal / 一键重连态（此时 requestDevice 已结束，
       // 列表不再更新，关闭后用户可重新点击「连接设备」发起新扫描）。
       clearQuickTimer();
       pendingSelectId = null;
+      autoPushAfterConnect = false; // 重连失败则放弃本次补推，等下一轮定时
+
       useEpaperStore.setState({
         connected, canReconnect, deviceName, firmware,
         scanning: false, connectingId: null, scanDevices: [], quickConnecting: false,
@@ -514,9 +588,10 @@ async function hydrateFromFile() {
     patch.lastDevice = dev.lastDevice;
   }
 
-  const memosO = all[MEMO_KEY] as { items?: StationMemoItem[]; nextId?: number } | undefined;
+  const memosO = all[MEMO_KEY] as { items?: StationMemoItem[]; nextId?: number; archive?: ArchivedMemo[] } | undefined;
   if (memosO && typeof memosO === 'object' && Array.isArray(memosO.items)) {
     patch.memos = memosO.items;
+    patch.memoArchive = Array.isArray(memosO.archive) ? memosO.archive : [];
     memoNextId = typeof memosO.nextId === 'number' ? memosO.nextId : memosO.items.length + 1;
   }
 
@@ -536,11 +611,40 @@ async function hydrateFromFile() {
   // 回写全部键：补齐文件缺失键（迁移 localStorage 旧数据），并同步 localStorage 与文件
   const st = useEpaperStore.getState();
   saveDevHistory(st.lastConnectedName, st.pairedNames, st.lastDevice);
-  saveMemos(st.memos, memoNextId);
+  saveMemos(st.memos, memoNextId, st.memoArchive);
   saveStationCfg(st.stationAutoMin, st.stationLastPush, st.stationLeave);
   persist(INVERT_KEY, st.invertRender);
+
+  archiveExpiredMemos(); // 回灌完成后立刻清一遍过期完成项
 }
 void hydrateFromFile();
+
+// ===== 备忘录自动归档 =====
+// 划掉超过 3 天的项移入归档区（不再上屏/占列表位）；旧数据里已划掉但没有
+// doneAt 的项先补记当前时刻（从现在起算 3 天），避免升级后被立即归档。
+function archiveExpiredMemos() {
+  const st = useEpaperStore.getState();
+  const now = Date.now();
+  let changed = false;
+  const keep: StationMemoItem[] = [];
+  const archive = [...st.memoArchive];
+  for (const m of st.memos) {
+    if (m.done && !m.doneAt) {
+      keep.push({ ...m, doneAt: now });
+      changed = true;
+    } else if (m.done && m.doneAt && now - m.doneAt > MEMO_ARCHIVE_MS) {
+      archive.push({ ...m, archivedAt: now });
+      changed = true;
+    } else {
+      keep.push(m);
+    }
+  }
+  if (changed) {
+    useEpaperStore.setState({ memos: keep, memoArchive: archive });
+    saveMemos(keep, memoNextId, archive);
+  }
+}
+archiveExpiredMemos();
 
 // ===== 信息站数据组装（渲染预览与推送共用）=====
 
@@ -566,7 +670,8 @@ export async function buildStationData(): Promise<StationData> {
     lunar: lunarText(now),
     usage: usageR.status === 'fulfilled' ? usageR.value : null,
     calendar,
-    memos: useEpaperStore.getState().memos,
+    memos: sortMemos(useEpaperStore.getState().memos), // 上屏同样未完成在上、已完成沉底
+
     clawd,
     leave: leaveActive ? { label: lv.label || '请假', start: lv.start, end: lv.end } : null,
     leaveWorkdayAfter: calendar?.workday_after ?? null,
@@ -580,13 +685,33 @@ export async function buildStationData(): Promise<StationData> {
 let stationLastAttempt = 0;
 if (typeof window !== 'undefined') {
   window.setInterval(() => {
+    archiveExpiredMemos(); // 长开应用也按时归档过期完成项（与自动推送开关无关）
     const st = useEpaperStore.getState();
     if (st.stationAutoMin <= 0) return;
-    if (!st.connected || st.stationPushing || epdSendBusy()) return;
+    if (st.stationPushing || epdSendBusy()) return;
     const interval = st.stationAutoMin * 60_000;
     const base = Math.max(st.stationLastPush ?? 0, stationLastAttempt);
     if (Date.now() - base < interval) return;
-    stationLastAttempt = Date.now();
-    void st.pushStation('auto');
+    if (st.connected) {
+      stationLastAttempt = Date.now();
+      void st.pushStation('auto');
+      return;
+    }
+    // 蓝牙会自动断开：到点未连接时先重连，连接成功后补推（见 onConnectionChange）。
+    // 本次会话断联（设备对象还在内存）→ 直接 GATT 重连，最快；
+    // 重启后（无内存设备）→ 走一键重连（按记忆的 lastDevice 后台扫描自动回选）。
+    if (st.quickConnecting || st.scanning) return; // 已在连接流程中，等结果
+    if (st.canReconnect) {
+      stationLastAttempt = Date.now();
+      autoPushAfterConnect = true;
+      st.addLog('定时推送：设备已断开，正在重连…');
+      void st.reconnect();
+    } else if (st.lastDevice) {
+      stationLastAttempt = Date.now();
+      autoPushAfterConnect = true;
+      st.addLog('定时推送：设备未连接，先尝试一键重连…');
+      st.quickReconnect();
+    }
+    // 无任何可重连目标：跳过本轮，等下一次到点
   }, 60_000);
 }
