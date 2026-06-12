@@ -5,6 +5,7 @@ import { api, ApiError, type ProxyProfile } from '../lib/api';
 import { useProxyStore } from '../store/proxy';
 import { useToastStore } from '../store/toast';
 import { Icon } from '../lib/icons';
+import { appConfirm } from '../lib/dialog';
 
 function fmtRate(bytesPerSec: number): string {
   const u = ['B/s', 'KB/s', 'MB/s', 'GB/s'];
@@ -203,7 +204,7 @@ export function ProxyScreen() {
 
   // 删除配置（二次确认）
   const deleteProfile = async (p: ProxyProfile) => {
-    if (!window.confirm(`确定删除配置「${p.name}」？`)) return;
+    if (!(await appConfirm(`确定删除配置「${p.name}」？`, { danger: true, confirmText: '删除' }))) return;
     setBusy(true);
     try {
       const r = await api.deleteProxyProfile(p.id);

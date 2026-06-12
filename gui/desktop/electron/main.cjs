@@ -42,6 +42,8 @@ let appQuitting = false;
 const RESTART_WINDOW_MS = 3600 * 1000;
 const RESTART_MAX = 5;
 let restartHistory = [];
+let bluetoothRequest = null;
+let pairingRequest = null;
 
 // ============================================================================
 // 服务控制状态机标志（供 service:* IPC 区分「手动停止 / 重启 / 崩溃」三种 exit）
@@ -192,13 +194,8 @@ function spawnPython() {
     restartHistory = restartHistory.filter(t => now - t < RESTART_WINDOW_MS);
     if (restartHistory.length >= RESTART_MAX) {
       console.error(`[aas-electron] 重启过频（最近 1 小时已 ${restartHistory.length} 次），停止自动重启`);
-      pushStatus({ state: 'failed', reason: `Python 后端反复崩溃（1 小时内 ${restartHistory.length} 次），已停止自动重启。请查看日志。` });
-      if (mainWindow) {
-        dialog.showErrorBox(
-          'Python 后端反复崩溃',
-          `过去 1 小时内已重启 ${restartHistory.length} 次，已停止自动重启。\n请检查 logs/attendance_system.log 后手动重启程序。`,
-        );
-      }
+      // 不再弹系统 showErrorBox：pushStatus(failed) 已把原因推给渲染端（系统横幅/启动覆盖层展示）
+      pushStatus({ state: 'failed', reason: `Python 后端反复崩溃（1 小时内 ${restartHistory.length} 次），已停止自动重启。请查看 logs/attendance_system.log 后手动重启。` });
       pushServiceStatus(false); // 彻底放弃自动重启：服务已停止
       return;
     }
@@ -290,6 +287,46 @@ function saveWindowState(state) {
   }
 }
 
+// ============================================================================
+// GUI 设置持久化（gui-settings.json）
+//  打包应用以 file:// 加载，渲染进程 localStorage 跨重启不可靠；
+//  墨水屏连接历史 / 备忘录 / 自动推送 / 倒置渲染等需要记忆的数据统一落到该文件，
+//  经 AAS_SETTINGS（preload）get/set。写盘防抖 300ms，退出前强制 flush。
+// ============================================================================
+const GUI_SETTINGS_PATH = path.join(DATA_DIR, 'gui-settings.json');
+let guiSettings = null;       // 惰性加载缓存（主进程内存为权威）
+let guiSettingsTimer = null;  // 防抖写盘定时器
+
+function getGuiSettings() {
+  if (guiSettings == null) {
+    try {
+      const o = JSON.parse(fs.readFileSync(GUI_SETTINGS_PATH, 'utf-8'));
+      guiSettings = o && typeof o === 'object' ? o : {};
+    } catch {
+      guiSettings = {};
+    }
+  }
+  return guiSettings;
+}
+
+function flushGuiSettings() {
+  if (guiSettingsTimer) { clearTimeout(guiSettingsTimer); guiSettingsTimer = null; }
+  if (guiSettings == null) return;
+  try {
+    fs.writeFileSync(GUI_SETTINGS_PATH, JSON.stringify(guiSettings, null, 2), 'utf-8');
+  } catch { /* ignore */ }
+}
+
+ipcMain.handle('settings:get-all', () => getGuiSettings());
+ipcMain.on('settings:set', (_event, key, value) => {
+  if (typeof key !== 'string' || !key) return;
+  const s = getGuiSettings();
+  if (value === undefined || value === null) delete s[key];
+  else s[key] = value;
+  if (guiSettingsTimer) clearTimeout(guiSettingsTimer);
+  guiSettingsTimer = setTimeout(flushGuiSettings, 300);
+});
+
 function isVisibleOnSomeDisplay(bounds) {
   if (
     !bounds ||
@@ -351,6 +388,7 @@ async function createWindow() {
   const win = new BrowserWindow(winOpts);
 
   mainWindow = win;
+  installBluetoothHandlers(win);
 
   win.once('ready-to-show', () => {
     win.show();
@@ -445,6 +483,60 @@ function createTray() {
   tray.setContextMenu(menu);
   tray.on('double-click', () => { if (mainWindow) { mainWindow.show(); mainWindow.focus(); } });
 }
+
+// 设备列表去重 + 原样透传名称（空串=无名设备，由渲染端决定过滤/隐藏）
+function mapBleDevices(deviceList) {
+  const map = new Map();
+  for (const device of deviceList || []) {
+    if (!device || !device.deviceId) continue;
+    map.set(device.deviceId, { deviceId: device.deviceId, deviceName: device.deviceName || '' });
+  }
+  return Array.from(map.values());
+}
+
+function installBluetoothHandlers(win) {
+  // 拦截系统原生蓝牙选择器：把扫到的设备实时推给渲染进程，由页面自定义 modal 展示并回选。
+  // 该事件会随新设备被发现而多次触发，每次携带累积的 deviceList 与一个新的 callback —— 始终保留最新的。
+  win.webContents.on('select-bluetooth-device', (event, deviceList, callback) => {
+    event.preventDefault();
+    bluetoothRequest = { callback };
+    if (!win.isDestroyed()) {
+      win.webContents.send('epd:ble-devices', mapBleDevices(deviceList));
+    }
+  });
+
+  // 蓝牙配对确认：不再弹系统 messageBox，推给渲染进程用应用内对话框确认后回传。
+  win.webContents.session.setBluetoothPairingHandler((details, callback) => {
+    if (details.pairingKind === 'confirmPin' || details.pairingKind === 'confirm') {
+      pairingRequest = { callback };
+      if (!win.isDestroyed()) {
+        win.webContents.send('epd:ble-pairing', {
+          kind: details.pairingKind,
+          deviceId: details.deviceId || '蓝牙设备',
+          pin: String(details.pin || ''),
+        });
+      }
+      return;
+    }
+    callback({ confirmed: false });
+  });
+}
+
+// 渲染端应用内对话框的配对确认结果
+ipcMain.on('epd:ble-pairing-response', (_event, confirmed) => {
+  if (!pairingRequest) return;
+  const cb = pairingRequest.callback;
+  pairingRequest = null;
+  try { cb({ confirmed: !!confirmed }); } catch { /* 请求可能已失效，忽略 */ }
+});
+
+// 渲染端从自定义 modal 回选设备（空串=取消）。callback 只能调用一次，调用后请求即解析/取消。
+ipcMain.on('epd:ble-select', (_event, deviceId) => {
+  if (!bluetoothRequest) return;
+  const cb = bluetoothRequest.callback;
+  bluetoothRequest = null;
+  try { cb(deviceId || ''); } catch { /* 请求可能已失效，忽略 */ }
+});
 
 // ============================================================================
 // 窗口控制 IPC（自绘标题栏的三个按钮）
@@ -608,5 +700,6 @@ app.on('window-all-closed', () => {
 
 app.on('before-quit', () => {
   appQuitting = true;
+  flushGuiSettings();
   killPython();
 });

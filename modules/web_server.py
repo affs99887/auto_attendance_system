@@ -500,6 +500,49 @@ def _build_flask_app(attendance_system, bridge: AsyncioBridge,
             # 即便彻底异常也返回 200 + 空结构，避免前端报错
             return jsonify({'updated_at': None, 'count': 0, 'items': []})
 
+    # ----- Claude Code 额度（墨水屏信息站）-----
+    @app.get('/api/v1/claude-usage')
+    @require_token
+    def get_claude_usage():
+        """返回本机 Claude Code 的 5h/周限额用量契约。
+
+        query: force=0|1（1 跳过 TTL 立即拉）。
+        失败也返回 200 + available:false（或旧缓存），绝不 500。
+        """
+        force = request.args.get('force', '0') in ('1', 'true', 'True')
+        try:
+            from modules.claude_usage_service import get_claude_usage as _gcu
+            return jsonify(_gcu(force=force))
+        except Exception:
+            logging.exception("get_claude_usage failed")
+            return jsonify({
+                'available': False, 'updated_at': None,
+                'five_hour': None, 'seven_day': None, 'error': '服务异常',
+            })
+
+    # ----- 日历信息（墨水屏信息站：休班标记/最近休息日/下一假期/调休补班）-----
+    @app.get('/api/v1/calendar-info')
+    @require_token
+    def get_calendar_info():
+        """返回当月日历契约（chinese_calendar 数据缺失时回退仅双休）。
+
+        query: after=YYYY-MM-DD（可选）—— 额外返回该日之后的首个工作日
+        （workday_after，「请假中」状态计算销假上班日用）。
+        """
+        try:
+            from modules.calendar_info_service import get_calendar_info as _gci
+            return jsonify(_gci(after=request.args.get('after') or None))
+        except Exception:
+            logging.exception("get_calendar_info failed")
+            import datetime as _dt
+            _t = _dt.date.today()
+            return jsonify({
+                'available': False, 'today': _t.isoformat(),
+                'year': _t.year, 'month': _t.month, 'days': [], 'week': [],
+                'nearest_rest': None, 'next_holidays': [], 'next_makeup': [],
+                'workday_after': None,
+            })
+
     # ----- Auto byebye -----
     @app.post('/api/v1/punch/auto_byebye/calc')
     @require_token

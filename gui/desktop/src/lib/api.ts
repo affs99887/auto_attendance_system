@@ -100,6 +100,56 @@ export interface AiNewsResponse {
   items: AiNewsItem[];
 }
 
+// ===== Claude Code 额度（墨水屏信息站，后端读本机凭据拉官方 usage 接口）=====
+export interface ClaudeUsageWindow {
+  used_pct: number;          // 已用百分比 0-100
+  resets_at: string | null;  // 重置时刻（ISO 字符串）
+}
+
+export interface ClaudeUsageResponse {
+  available: boolean;
+  updated_at: number | null; // 缓存最后刷新时刻（unix 秒）
+  five_hour: ClaudeUsageWindow | null;
+  seven_day: ClaudeUsageWindow | null;
+  error?: string | null;
+}
+
+// ===== 日历信息（墨水屏信息站，chinese_calendar 休班标记）=====
+export interface CalendarDayMark {
+  d: number;        // 几号
+  off: boolean;     // 休息日（双休/节假日）
+  statutory: boolean; // 法定假日
+  makeup: boolean;  // 调休补班
+}
+
+export interface CalendarInfoResponse {
+  available: boolean;
+  today: string; // ISO 日期
+  year: number;
+  month: number;
+  days: CalendarDayMark[];
+  /** 本周（周一起 7 天，可跨月）：信息站「本周日历条」 */
+  week: Array<{ date: string; d: number; off: boolean }>;
+  nearest_rest: {
+    days: number;          // 距今天数（0 = 今天在休）
+    date: string;
+    name: string | null;   // 节日名（端午节…）；普通双休为 null
+    label: string;         // 「本周双休」/「端午节连休」/「双休进行中」
+    span: [string, string]; // 连续休息区间首末日
+    kind: 'weekend' | 'holiday';
+    next_workday: string;  // 本轮休息结束后的首个工作日（ISO）
+  } | null;
+  next_holidays: Array<{
+    name: string;       // 中文名；连段假期合并（如 国庆中秋）
+    start: string;      // 法定假期首日（ISO）
+    end: string;        // 法定假期末日（ISO）
+    days_until: number;
+  }>; // 近期法定假期（最多 2 个）
+  next_makeup: string[]; // 后续调休补班日（最多 2 个）
+  /** 传入 after 时返回：该日之后的首个工作日（请假销假日） */
+  workday_after: string | null;
+}
+
 export interface ApiOptions {
   method?: 'GET' | 'POST' | 'PUT' | 'PATCH' | 'DELETE';
   body?: unknown;
@@ -280,6 +330,15 @@ export const api = {
     const q = qs.toString();
     return request<AiNewsResponse>(`/api/v1/ai-news${q ? `?${q}` : ''}`);
   },
+
+  // Claude Code 额度（墨水屏信息站）；force=true 跳过后端缓存
+  getClaudeUsage: (force?: boolean) =>
+    request<ClaudeUsageResponse>(`/api/v1/claude-usage${force ? '?force=1' : ''}`),
+
+  // 日历信息（墨水屏信息站：当月休班标记/本周条/最近休息日/近期假期/调休补班）
+  // after：可选 ISO 日期，请求该日之后的首个工作日（请假销假日）
+  getCalendarInfo: (after?: string) =>
+    request<CalendarInfoResponse>(`/api/v1/calendar-info${after ? `?after=${after}` : ''}`),
 
   getErrorLogs: (page = 1, perPage = 5) =>
     request<{ groups: ErrorGroup[]; page: number; total_pages: number; total_groups: number }>(

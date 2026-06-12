@@ -72,3 +72,29 @@ contextBridge.exposeInMainWorld('AAS_LOG', {
     return () => ipcRenderer.removeListener('backend:log', handler);
   },
 });
+
+contextBridge.exposeInMainWorld('AAS_SETTINGS', {
+  // 全量拉取持久化 GUI 设置（主进程 gui-settings.json，跨重启可靠）
+  getAll: () => ipcRenderer.invoke('settings:get-all'),
+  // 写入单个键（主进程防抖落盘；value 传 null 删除该键）
+  set: (key, value) => ipcRenderer.send('settings:set', key, value),
+});
+
+contextBridge.exposeInMainWorld('AAS_EPD', {
+  // 订阅主进程推送的蓝牙设备流（select-bluetooth-device 拦截后实时转发）
+  onDevices: (cb) => {
+    const handler = (_e, devices) => cb(devices);
+    ipcRenderer.on('epd:ble-devices', handler);
+    return () => ipcRenderer.removeListener('epd:ble-devices', handler);
+  },
+  // 回选设备（空串=取消本次扫描请求）
+  select: (deviceId) => ipcRenderer.send('epd:ble-select', deviceId || ''),
+  // 蓝牙配对确认请求（渲染端用应用内对话框确认）
+  onPairing: (cb) => {
+    const handler = (_e, req) => cb(req);
+    ipcRenderer.on('epd:ble-pairing', handler);
+    return () => ipcRenderer.removeListener('epd:ble-pairing', handler);
+  },
+  // 配对确认结果回传
+  pairingResponse: (confirmed) => ipcRenderer.send('epd:ble-pairing-response', !!confirmed),
+});

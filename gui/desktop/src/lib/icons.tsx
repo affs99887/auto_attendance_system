@@ -183,6 +183,45 @@ export const Icon = {
   Cloud: makeIcon(
     <path d="M4.5 12.5a3 3 0 0 1-.5-6 4 4 0 0 1 7.7.5 2.8 2.8 0 0 1 .3 5.5z" />,
   ),
+  Epaper: makeIcon(
+    <>
+      <rect x="2" y="2" width="12" height="12" rx="1.5" />
+      <path d="M4.5 5h7M4.5 8h5M4.5 11h7" />
+    </>,
+  ),
+  Bluetooth: makeIcon(<path d="M4.5 5L11.5 11L8 14L8 2L11.5 5L4.5 11" />),
+  Brush: makeIcon(
+    <>
+      <path d="M11 2.5l2.5 2.5L6 12.5L3 13l.5-3z" />
+      <path d="M9.5 4l2.5 2.5" />
+    </>,
+  ),
+  Eraser: makeIcon(
+    <>
+      <path d="M3.5 10.5l5-5 4 4-3.5 3.5H6z" />
+      <path d="M5.5 13.5H13" />
+    </>,
+  ),
+  TextTool: makeIcon(<path d="M3.5 4V3h9v1M8 3v10M6.5 13h3" />),
+  Undo: makeIcon(
+    <>
+      <path d="M5 6H9.8a3.2 3.2 0 1 1 0 6.4H6" />
+      <path d="M5 6l2.5-2.3M5 6l2.5 2.3" />
+    </>,
+  ),
+  Redo: makeIcon(
+    <>
+      <path d="M11 6H6.2a3.2 3.2 0 1 0 0 6.4H10" />
+      <path d="M11 6L8.5 3.7M11 6L8.5 8.3" />
+    </>,
+  ),
+  Send: makeIcon(<path d="M14 2L7 9M14 2l-4.5 12-2.5-5-5-2.5L14 2z" />),
+  AlertTriangle: makeIcon(
+    <>
+      <path d="M8 1.5l6.5 11.5H1.5z" />
+      <path d="M8 6.5v3M8 11.2h.01" />
+    </>,
+  ),
   Sparkle: makeIcon(<path d="M8 2l1.4 4.2L13.5 8l-4.1 1.4L8 14l-1.4-4.6L2.5 8l4.1-1.8L8 2z" />),
   External: makeIcon(
     <>

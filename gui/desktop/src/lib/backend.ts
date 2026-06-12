@@ -65,6 +65,25 @@ declare global {
       getBuffer: () => Promise<string[]>;
       onLog: (cb: (p: { lines: string[] }) => void) => () => void;
     };
+    /** GUI 设置持久化桥（主进程 gui-settings.json；纯浏览器下为 undefined）。
+     *  打包应用以 file:// 加载时 localStorage 跨重启不可靠，需要记忆的设置以此为权威。 */
+    AAS_SETTINGS?: {
+      getAll: () => Promise<Record<string, unknown>>;
+      set: (key: string, value: unknown) => void;
+    };
+    /** 墨水屏蓝牙选择桥（纯浏览器下为 undefined）：
+     *  主进程拦截 select-bluetooth-device 后把设备流实时推给渲染进程，
+     *  由页面自定义 modal 展示并回选 deviceId（空串=取消）。 */
+    AAS_EPD?: {
+      /** 订阅扫描到的设备流（name 可能为空串=无名设备），返回取消订阅函数 */
+      onDevices: (cb: (devices: Array<{ deviceId: string; deviceName: string }>) => void) => () => void;
+      /** 回选设备（deviceId 空串=取消本次请求） */
+      select: (deviceId: string) => void;
+      /** 蓝牙配对确认请求（渲染端用应用内对话框确认），返回取消订阅函数 */
+      onPairing: (cb: (req: { kind: 'confirmPin' | 'confirm'; deviceId: string; pin: string }) => void) => () => void;
+      /** 配对确认结果回传 */
+      pairingResponse: (confirmed: boolean) => void;
+    };
   }
 }
 
