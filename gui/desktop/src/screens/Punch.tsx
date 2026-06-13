@@ -513,6 +513,13 @@ export function PunchScreen() {
     timersRef.current.forEach(t => clearTimeout(t));
   }, []);
 
+  // 切换 tab（上班↔下班/自动/获取）时清空旧 progress —— 否则上一流程的 done:true / idx=10
+  // 会被新 tab 的 PunchFlowCard 复用，命中 stepIdx>=totalSecs 误显示「成功 10/10」，
+  // 让用户误以为新流程已执行。切 tab 仅在 !running 时允许，故清空不会丢弃在跑流程。
+  React.useEffect(() => {
+    setProgress({});
+  }, [kind]);
+
   // 真实进度：订阅 WS punch:progress，按「用户名」把后端每步通知映射到步骤并单调推进。
   // 后端卡住 → 收不到新事件 → 步骤停在当前位置，不再有假定时器自顾自往下流转。
   React.useEffect(() => {

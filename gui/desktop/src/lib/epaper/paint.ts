@@ -84,12 +84,20 @@ export class PaintManager {
     this.hideBrushCursor = this.hideBrushCursor.bind(this);
   }
 
-  saveToHistory() {
+  // 大画布（1360×480≈2.6MB / 960×640≈2.4MB）下每次保存都会做一次整张 getImageData，
+  // 这是同步操作、跑在主线程；连续描边时每个 endPaint 都触发一次，逐笔会有可感知卡顿。
+  // 为降低"每存成本"：允许调用方把已经持有、不会再被改写的整张 ImageData 直接传进来复用，
+  // 省掉一次重复的 getImageData——例如 convertDithering 写回画布后本就持有最终像素副本，
+  // 不必让 saveToHistory 再读一遍同样大小的整张位图。未传入时仍按需 getImageData。
+  // 调用约定：传入的 snapshot 必须是调用方拥有、之后不会再 mutate/transfer 其 buffer 的副本，
+  //          否则历史快照会被破坏（故不要把会转移到 worker 的 buffer 直接传进来）。
+  // 注：单步内存仍受 MAX_HISTORY_BYTES 字节预算约束，见下方淘汰逻辑。
+  saveToHistory(snapshot?: ImageData) {
     // 撤销后再绘制时丢弃后续历史
     this.historyStack = this.historyStack.slice(0, this.historyStep + 1);
 
     const canvasState: CanvasState = {
-      imageData: this.ctx.getImageData(0, 0, this.canvas.width, this.canvas.height),
+      imageData: snapshot ?? this.ctx.getImageData(0, 0, this.canvas.width, this.canvas.height),
       textElements: JSON.parse(JSON.stringify(this.textElements)),
       lineSegments: JSON.parse(JSON.stringify(this.lineSegments)),
     };

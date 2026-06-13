@@ -2,8 +2,8 @@
 import * as React from 'react';
 import { useApp } from '../App';
 import { Icon } from '../lib/icons';
-import { RECENT_ACTIVITY, RECORDS, USERS } from '../lib/data';
-import type { RecentActivityEntry, User } from '../lib/types';
+import { USERS } from '../lib/data';
+import type { PunchRec, RecentActivityEntry, User } from '../lib/types';
 import { useSystemStore } from '../store/system';
 import { usePunchStore } from '../store/punch';
 import { api } from '../lib/api';
@@ -15,6 +15,20 @@ function extractTime(raw: string | null | undefined): string | null {
   if (!raw) return null;
   if (raw.includes('T')) return (raw.split('T')[1] ?? '').slice(0, 8);
   return raw.slice(0, 8);
+}
+
+/** 把后端 records ({punch_in_time, punch_out_time}) 归一为前端 PunchRec ({in, out})，与 Records.tsx 一致 */
+function normalizeRecords(raw: unknown): Record<string, PunchRec> {
+  const result: Record<string, PunchRec> = {};
+  if (!raw || typeof raw !== 'object') return result;
+  for (const [date, val] of Object.entries(raw as Record<string, unknown>)) {
+    if (!val || typeof val !== 'object') continue;
+    const v = val as Record<string, unknown>;
+    const inV = (v.punch_in_time ?? v.in ?? null) as string | null;
+    const outV = (v.punch_out_time ?? v.out ?? null) as string | null;
+    result[date] = { in: inV, out: outV };
+  }
+  return result;
 }
 
 interface StatusDotProps {
@@ -424,7 +438,23 @@ export function DashboardScreen() {
   const _now = new Date();
   const todayLabel = `${_now.getFullYear()}-${String(_now.getMonth() + 1).padStart(2, '0')}-${String(_now.getDate()).padStart(2, '0')} ${['周日', '周一', '周二', '周三', '周四', '周五', '周六'][_now.getDay()]}`;
 
-  const monthRecs = RECORDS[currentUser]?.['2026-05'] ?? {};
+  // 本月统计改用真实 API（api.getRecords 当前用户 + 真实年月）；不再硬编码 2026-05 mock。
+  // API 不可用时落到空记录 {}，下方统计自然显示 0/—，而非展示假数据。
+  const _year = _now.getFullYear();
+  const _month = _now.getMonth() + 1;
+  const [monthRecs, setMonthRecs] = React.useState<Record<string, PunchRec>>({});
+  React.useEffect(() => {
+    let cancelled = false;
+    api.getRecords(currentUser, _year, _month)
+      .then(r => {
+        if (!cancelled) setMonthRecs(normalizeRecords(r.records));
+      })
+      .catch(() => {
+        // 静默退到空态（不落 mock），避免展示从未发生的假统计
+        if (!cancelled) setMonthRecs({});
+      });
+    return () => { cancelled = true; };
+  }, [currentUser, _year, _month]);
   const onTimeCount = Object.values(monthRecs).filter(r => r.in && r.in <= '09:00:00').length;
   const totalInThisMonth = Object.values(monthRecs).filter(r => r.in).length;
 
@@ -434,8 +464,10 @@ export function DashboardScreen() {
       const [h, m] = (r.in as string).split(':').map(Number);
       return h * 60 + m;
     });
-  const earliest = Math.min(...minutesArr);
-  const latest = Math.max(...minutesArr);
+  // 空记录（API 不可用/本月无数据）时 minutesArr 为空，Math.min/max 会得 ±Infinity，
+  // 故先判空，无数据时置 null，由下方"本月准点节奏"显示占位而非 Infinity:NaN。
+  const earliest = minutesArr.length ? Math.min(...minutesArr) : null;
+  const latest = minutesArr.length ? Math.max(...minutesArr) : null;
 
   // AI 资讯卡片高度跟随今日打卡卡片（同一行内对齐）
   const [punchRef, punchH] = useMatchHeight();
@@ -538,9 +570,9 @@ export function DashboardScreen() {
             </button>
           </div>
           <div className="card-body" style={{ padding: '4px 16px' }}>
-            {/* 优先显示 WS punch:progress；不足或为空时用 mock 兜底 */}
+            {/* 来源 WS punch:progress；为空时显示空态（不再用 mock RECENT_ACTIVITY 兜底，避免展示从未发生的活动） */}
             {punchEntries.length === 0
-              ? RECENT_ACTIVITY.map((e, i) => <ActivityRow key={i} entry={e} />)
+              ? <div className="empty-state">暂无活动 — 打卡或调度事件将实时出现在此</div>
               : punchEntries
                   .slice(-7)
                   .reverse()
@@ -566,11 +598,17 @@ export function DashboardScreen() {
               <div>
                 <div className="card-title">本月准点节奏</div>
                 <div className="card-sub mono">
-                  {earliest >= 60 * 8
-                    ? `${Math.floor(earliest / 60)}:${String(earliest % 60).padStart(2, '0')}`
-                    : '08:25'}
-                  {' – '}
-                  {Math.floor(latest / 60)}:{String(latest % 60).padStart(2, '0')} · 上班时间分布
+                  {earliest !== null && latest !== null ? (
+                    <>
+                      {earliest >= 60 * 8
+                        ? `${Math.floor(earliest / 60)}:${String(earliest % 60).padStart(2, '0')}`
+                        : '08:25'}
+                      {' – '}
+                      {Math.floor(latest / 60)}:{String(latest % 60).padStart(2, '0')} · 上班时间分布
+                    </>
+                  ) : (
+                    '— · 本月暂无打卡记录'
+                  )}
                 </div>
               </div>
             </div>

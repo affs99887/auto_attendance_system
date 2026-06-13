@@ -1,19 +1,24 @@
-numpy==1.24.3
-opencv-python==4.8.1.78
+# numpy/opencv/Pillow 升到提供 cp312 wheel 的版本：原先锁定的 1.24.3 / 4.8.1.78 / 10.2.0
+# 只覆盖 cp38–cp311，2026 年新装 Python 默认 3.12+ 时首装会在编译/解析阶段直接失败。
+# 加上限避免拉到 numpy 2.x（与 opencv 4.10 的 ABI 不匹配）。
+numpy>=1.26.4,<2.0
+opencv-python>=4.10.0.84,<4.11
 pyautogui==0.9.54
 pytesseract==0.3.10
 python-dotenv==1.0.0
 schedule==1.2.1
 psutil==5.9.8
-Pillow==10.2.0
-requests>=2.31.0
-Flask>=3.0.0
-waitress>=2.1.2
+Pillow>=10.4.0,<11
+requests>=2.31.0,<3
+Flask>=3.0.0,<4
+waitress>=2.1.2,<4
 python-telegram-bot==20.7
 chinese-calendar>=1.11.0
-pywin32>=306
+# pywin32 仅 Windows 有候选版本，加平台标记，否则 Linux/WSL 上 pip 找不到候选会令整个 -r 安装中止
+pywin32>=306 ; sys_platform == "win32"
 colorama>=0.4.6
-selenium>=4.15.0
-webdriver-manager>=4.0.0
-websockets>=11.0
-PyYAML>=6.0
+selenium>=4.15.0,<5
+webdriver-manager>=4.0.0,<5
+# websockets 上限 <14：14 起弃用、15 移除 websockets.legacy，而 main.spec 仍 hiddenimport websockets.legacy.server
+websockets>=11.0,<14
+PyYAML>=6.0,<7

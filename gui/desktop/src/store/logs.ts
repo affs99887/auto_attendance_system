@@ -33,10 +33,18 @@ export const useLogsStore = create<LogState>((set, get) => ({
   error: null,
 
   async loadTail(count = 500) {
+    // 记录发起 fetch 时已有的行数：fetch 在途期间 WS log:stream 可能继续 appendLine，
+    // 这些新增行不在本次 tail 结果里。整组替换会把它们覆盖丢弃（断线重连补拉时尤为明显），
+    // 故 resolve 时把"在途新增"的尾部行接在拉取结果之后，消除日志空洞又不丢实时行。
+    const baseLen = get().lines.length;
     set({ loading: true, error: null });
     try {
       const { lines } = await api.getLogsTail(count);
-      set({ lines: lines.map(parseLine), loading: false });
+      const tail = lines.map(parseLine);
+      const appendedDuringFetch = get().lines.slice(baseLen);
+      const merged = appendedDuringFetch.length ? [...tail, ...appendedDuringFetch] : tail;
+      if (merged.length > MAX_LINES) merged.splice(0, merged.length - MAX_LINES);
+      set({ lines: merged, loading: false });
     } catch (e) {
       const msg = e instanceof ApiError ? `${e.status} ${e.message}` : (e as Error).message;
       set({ error: msg, loading: false });

@@ -8,7 +8,8 @@
 import * as React from 'react';
 import { Icon } from '../lib/icons';
 import { useSystemStore } from '../store/system';
-import { api } from '../lib/api';
+import { api, ApiError } from '../lib/api';
+import { useToastStore } from '../store/toast';
 
 function formatElapsed(ms: number): string {
   const total = Math.floor(ms / 1000);
@@ -31,17 +32,31 @@ export function LegacyModeOverlay() {
     return () => window.clearInterval(id);
   }, [currentOp]);
 
+  // cancelling 本地态：驱动取消按钮 disabled/loading，防止 operationStop 在途时重复点击堆积请求
+  const [cancelling, setCancelling] = React.useState(false);
+
   // 只有 use_selenium_login = false 且打卡进行中才显示
   if (useSelenium !== false || !currentOp) return null;
 
   const startedTs = startedAt ? new Date(startedAt).getTime() : now;
   const elapsedMs = Math.max(0, now - startedTs);
 
+  // 取消当前打卡：原本静默吞错，失败时按钮无反应，用户会误以为界面卡死而乱动鼠标键盘（恰恰是本遮罩要防止的）。
+  // 改为：本地 cancelling 态驱动 disabled/loading；失败 toast 报错；成功也给确认提示（status:update 推送前用户无感知）。
   const handleCancel = async () => {
+    if (cancelling) return;
+    setCancelling(true);
     try {
-      await api.operationStop();
-    } catch {
-      /* ignore */
+      const r = await api.operationStop();
+      useToastStore.getState().push(
+        r.success === false ? 'err' : 'ok',
+        r.message ?? '已发送取消指令',
+      );
+    } catch (e) {
+      const msg = e instanceof ApiError ? `${e.status} ${e.message}` : (e as Error).message;
+      useToastStore.getState().push('err', `取消失败: ${msg}`);
+    } finally {
+      setCancelling(false);
     }
   };
 
@@ -128,8 +143,11 @@ export function LegacyModeOverlay() {
         </div>
 
         <div className="row gap-2" style={{ justifyContent: 'center' }}>
-          <button className="btn btn-danger" onClick={handleCancel}>
-            <Icon.Stop size={12} />取消当前打卡 (/stop)
+          <button className="btn btn-danger" onClick={handleCancel} disabled={cancelling}>
+            <span className={cancelling ? 'spin-ic' : ''} style={{ display: 'inline-flex' }}>
+              <Icon.Stop size={12} />
+            </span>
+            {cancelling ? '取消中…' : '取消当前打卡 (/stop)'}
           </button>
         </div>
 

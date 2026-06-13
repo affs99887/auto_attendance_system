@@ -334,15 +334,36 @@ class Config:
             return 9899
 
     @classmethod
+    def _mihomo_binary_missing(cls):
+        """检测 mihomo 二进制是否缺失（确定性失败信号）。
+
+        [M60] 二进制不存在属"重试多少次都不会好"的确定性失败——此时 mihomo 永远不会就绪，
+        若 get_telegram_proxy 仍返回内置死端口，Telegram 全链路会永久不可用。这里只做纯文件
+        存在性判断（无副作用），不导入/实例化 ProxyManager（其 __init__ 有迁移副作用，且会引入
+        与 modules.proxy_manager 的循环导入）。路径派生与 ProxyManager.mihomo_path() 保持一致：
+        <project_root>/bin/mihomo(.exe)，二者同在 modules/ 下故 __file__ 推导出的根目录相同。
+        """
+        try:
+            project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+            name = 'mihomo.exe' if os.name == 'nt' else 'mihomo'
+            return not os.path.isfile(os.path.join(project_root, 'bin', name))
+        except Exception:
+            # 探测自身异常时保守认为"未缺失"，沿用原有"等待 mihomo 启动"的行为，避免误回退。
+            return False
+
+    @classmethod
     def get_telegram_proxy(cls):
         """返回 Telegram 使用的代理 URL。
 
-        - 启用内置加速：**始终**直连本程序自管理的 mihomo 本地端口，完全不依赖系统代理。
+        - 启用内置加速：默认直连本程序自管理的 mihomo 本地端口，完全不依赖系统代理。
           端口暂未就绪时仍返回内置 URL（由 Telegram 初始化的有限次重试等待 mihomo 启动完成），
-          **绝不回退**到系统 Clash/VPN 端口（7897 等）——避免误用与本程序无关的系统代理。
+          不回退到系统 Clash/VPN 端口（7897 等）——避免误用与本程序无关的系统代理。
+          [M60] 例外：当检测到确定性失败（mihomo 二进制缺失）时，mihomo 永远无法就绪，
+          继续返回内置死端口会让打卡通知/远程控制/状态上报永久失效，故此时回退到下方
+          系统代理探测路径（探测不到再走直连），而非死等。
         - 未启用：按顺序探测 TELEGRAM_PROXY_PORTS（系统 Clash 等），返回首个可连通的；都不通则 None。
         """
-        if cls.get_proxy_enabled():
+        if cls.get_proxy_enabled() and not cls._mihomo_binary_missing():
             port = cls.get_proxy_local_port()
             url = f"http://127.0.0.1:{port}"
             try:
@@ -354,6 +375,13 @@ class Config:
                     f"内置加速端口 127.0.0.1:{port} 未就绪，等待 mihomo 启动（不回退系统代理）"
                 )
             return url
+        # [M60] 启用了内置加速但二进制缺失（确定性失败）：落入此分支，回退系统代理探测/直连，
+        # 以免 Telegram 永久指向无人监听的回环端口。
+        if cls.get_proxy_enabled():
+            logging.warning(
+                "已启用内置网络加速但未找到 mihomo 二进制（bin/ 缺失），"
+                "回退系统代理探测/直连，请检查 bin/ 是否已打包或在 GUI 关闭内置加速开关"
+            )
         host = cls.TELEGRAM_PROXY_HOST
         scheme = cls.TELEGRAM_PROXY_SCHEME
         timeout = cls.TELEGRAM_PROXY_PROBE_TIMEOUT

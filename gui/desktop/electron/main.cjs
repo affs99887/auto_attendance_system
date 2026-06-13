@@ -9,7 +9,7 @@
 //   1. dev:  AAS_DEV=1 npx electron electron/main.cjs   （Vite 必须先启）
 //   2. prod: npx electron .                             （走 build 后的 dist）
 
-const { app, BrowserWindow, Tray, Menu, nativeImage, shell, dialog, ipcMain, screen } = require('electron');
+const { app, BrowserWindow, Tray, Menu, nativeImage, shell, dialog, ipcMain, screen, powerMonitor, net } = require('electron');
 const path = require('node:path');
 const fs = require('node:fs');
 const { spawn, execFileSync } = require('node:child_process');
@@ -54,6 +54,22 @@ let pairingRequest = null;
 let manualStop = false;
 let restarting = false;
 let lastServiceRunning = true;
+// 重启定时器句柄（崩溃 2s / 主动重启 300ms 共用一个槽位）。
+// 存成模块变量使其可被 spawnPython/service:stop/before-quit 主动取消，
+// 杜绝「定时器到点时旧引用已被新 spawn 占用 → 再 spawn 覆盖成孤儿」的竞态。
+let pendingRestartTimer = null;
+// 正在等待某个被 kill 的进程 exit（service:stop/restart 发出 taskkill 后置 true，
+// 该进程 exit 处理完成后清回 false）。期间拒绝并发的 service:* 请求，
+// 避免「旧进程未真正退出就被第二条请求当作已停止」而再 spawn 出双进程。
+let killPending = false;
+
+// 取消挂起的重启定时器（统一入口，防止句柄泄漏后回调误触发 spawn）
+function clearPendingRestart() {
+  if (pendingRestartTimer) {
+    clearTimeout(pendingRestartTimer);
+    pendingRestartTimer = null;
+  }
+}
 
 // ============================================================================
 // 后端启动状态（推给渲染进程的 backend:status）
@@ -135,6 +151,13 @@ function armReadiness() {
 // 启动 Python 后端 + 崩溃重启
 // ============================================================================
 function spawnPython() {
+  // 守卫：已有在跟踪的进程时直接返回，杜绝旧进程存活时被新 spawn 覆盖引用（孤儿根因之一）。
+  if (pythonProc) {
+    console.warn('[aas-electron] spawnPython 跳过：已有 Python 进程在运行');
+    return;
+  }
+  // 进入新一轮 spawn，先取消任何挂起的重启定时器，避免它到点后再 spawn 出第二个进程。
+  clearPendingRestart();
   // 直接跑 main.py --gui（跳过 start.py 那层 subprocess，少一个进程、少一个窗口）
   const mainPy = path.join(PROJECT_ROOT, 'main.py');
   if (!fs.existsSync(mainPy)) {
@@ -163,6 +186,8 @@ function spawnPython() {
     // configure_console_encoding 只设 errors=replace 不强制 utf-8，故 PYTHONIOENCODING 必须显式给。
     env: { ...process.env, AAS_PLAIN_CONSOLE: '1', PYTHONUNBUFFERED: '1', PYTHONIOENCODING: 'utf-8' },
   });
+  // 闭包捕获本次 spawn 出的 proc：用它与全局 pythonProc 比对，过滤掉「过期进程」的迟到 error/exit。
+  const proc = pythonProc;
   // python 的 stdout/stderr：转发到 Electron 控制台调试 + 解析进启动日志缓冲推给渲染进程
   pythonProc.stdout?.on('data', d => { process.stdout.write(`[py] ${d}`); ingestChunk(d.toString('utf8')); });
   pythonProc.stderr?.on('data', d => { process.stderr.write(`[py] ${d}`); ingestChunk(d.toString('utf8')); }); // traceback 在 stderr
@@ -170,6 +195,16 @@ function spawnPython() {
   // spawn 失败（python 不在 PATH / 无法执行）只触发 'error' 不触发 'exit'——首装最高频故障
   pythonProc.on('error', err => {
     console.error('[aas-electron] python spawn error:', err.message);
+    // 该路径不会再来 'exit'，必须在此清空引用：否则配合开头的 `if (pythonProc) return` 守卫，
+    // 残留的失败 proc 引用会永久挡住后续 service:start/重启。仅当仍是本次 proc 才清，避免误清新进程。
+    if (pythonProc === proc) pythonProc = null;
+    // 'error' 不会再触发 'exit'，三态标志的复位本应在 exit 处理器完成，这里必须补做：
+    // 否则若本次 spawn 是 service:restart 触发（restarting=true）却 spawn 失败，restarting 将悬空残留，
+    // 待用户经 service:restart 的 `!pythonProc` 分支重新拉起新进程后，新进程将来真实崩溃时会误入 restarting
+    // 分支绕过限频统计直接重启。manualStop 同理一并复位，确保状态机回到干净的「未运行」态。
+    restarting = false;
+    manualStop = false;
+    killPending = false; // 解除可能的并发拒绝
     pushStatus({
       state: 'failed',
       reason: `无法启动 Python（${err.message}）。请确认已安装 Python 并加入 PATH。`,
@@ -179,14 +214,31 @@ function spawnPython() {
 
   pythonProc.on('exit', (code, signal) => {
     console.warn(`[aas-electron] python exited code=${code} signal=${signal}`);
-    pythonProc = null;
+    // 只有退出的正是当前跟踪的进程才清空引用；否则是已被替换的旧进程的迟到 exit，作废以免清掉新进程。
+    if (pythonProc === proc) {
+      pythonProc = null;
+    } else {
+      console.warn('[aas-electron] 忽略过期 Python 进程的 exit（引用已被新进程占用）');
+      return;
+    }
+    // 本进程是被 service:stop/restart 主动 kill 的：此 exit 到达即解除并发拒绝，放行后续 service:* 请求。
+    killPending = false;
     if (appQuitting) return;
 
     // —— 服务控制三分支：手动停止 / 主动重启 / 崩溃 ——
     // 1) 用户主动停止：清标志、推 running=false，不自动重启
     if (manualStop) { manualStop = false; pushServiceStatus(false); return; }
     // 2) 用户主动重启：清标志，延迟 300ms 后重新 spawn（spawn 成功会推 running=true）
-    if (restarting) { restarting = false; setTimeout(() => { if (!appQuitting) spawnPython(); }, 300); return; }
+    //    定时器句柄存入 pendingRestartTimer 以便可取消；回调内再校验 !pythonProc && !manualStop 防覆盖。
+    if (restarting) {
+      restarting = false;
+      clearPendingRestart();
+      pendingRestartTimer = setTimeout(() => {
+        pendingRestartTimer = null;
+        if (!appQuitting && !pythonProc && !manualStop) spawnPython();
+      }, 300);
+      return;
+    }
     // 3) 其余为崩溃：进入下方原有限频自动重启逻辑
 
     // 检查重启频率
@@ -201,7 +253,12 @@ function spawnPython() {
     }
     restartHistory.push(now);
     console.info(`[aas-electron] 2 秒后自动重启 Python (第 ${restartHistory.length}/${RESTART_MAX} 次)`);
-    setTimeout(() => { if (!appQuitting) spawnPython(); }, 2000);
+    // 同样把句柄存入 pendingRestartTimer，回调内再校验：若用户已手动启动/停止则不再补 spawn。
+    clearPendingRestart();
+    pendingRestartTimer = setTimeout(() => {
+      pendingRestartTimer = null;
+      if (!appQuitting && !pythonProc && !manualStop) spawnPython();
+    }, 2000);
   });
 
   // 拉起后开始侦测就绪（重启也会重新 arm，旧代际自动作废）
@@ -234,6 +291,17 @@ function checkWatchdogRunning() {
 
 function killPython() {
   if (!pythonProc) return;
+  // 进程从未真正起来（spawn 失败 / pid 未分配）：taskkill /pid undefined 会静默失败，
+  // 且这种 proc 不会触发 'exit'，引用永远不会被清。此处直接置空并复位状态机，
+  // 否则 killPending=true 与残留 pythonProc 会双重卡死后续 service:* 控制。
+  if (pythonProc.pid == null) {
+    pythonProc = null;
+    killPending = false;
+    restarting = false;
+    manualStop = false;
+    pushServiceStatus(false);
+    return;
+  }
   try {
     if (process.platform === 'win32') {
       // Windows: 用 taskkill /T 杀进程树（连带 python 拉起的 mihomo 子进程一起回收）
@@ -244,7 +312,9 @@ function killPython() {
   } catch (e) {
     console.error('[aas-electron] killPython failed:', e);
   }
-  pythonProc = null;
+  // 不在此处置空 pythonProc：taskkill 是异步发出的，旧进程此刻尚未真正退出。
+  // 引用统一由该进程的 'exit' 处理器在确认 pythonProc === proc 后清空，
+  // 避免「刚置 null → 并发请求误判已停止 → 再 spawn 出双进程」的竞态。
 }
 
 // ============================================================================
@@ -259,7 +329,52 @@ async function waitForToken(timeoutMs = 60_000) {
     }
     await new Promise(r => setTimeout(r, 500));
   }
+  // 超时抛错前最后再查一次：截止判定基于挂钟（Date.now），若机器在等待期间睡眠，
+  // 唤醒后 while 条件会先判超时退出而跳过检查——但 token 文件此刻可能早已写出。
+  // 这里补一次读取，避免「睡眠跨过启动窗口 → 唤醒即误报启动超时」。
+  if (fs.existsSync(TOKEN_PATH)) {
+    const token = fs.readFileSync(TOKEN_PATH, 'utf-8').trim();
+    if (token) return token;
+  }
   throw new Error(`token 文件 ${TOKEN_PATH} 在 ${timeoutMs}ms 内未生成`);
+}
+
+// ============================================================================
+// 睡眠/唤醒处理（修复 M93：唤醒后误报启动超时 / 不对后端做任何健康检查）
+//  - HTTP GET /api/v1/ping 探活：用 Electron net（走主进程，无跨域/鉴权约束），
+//    后端 ping 无需 token，只确认 HTTP 真在监听。
+//  - handleResume：唤醒后若仍认为后端在运行（pythonProc != null），先重新 armReadiness（token
+//    已存在则立即推送，把渲染端从睡眠中可能误置的 failed/starting 态拉回 ready），再探活；
+//    后端无响应则按崩溃路径处理（kill 僵尸引用，由 exit 处理器走限频自动重启）。
+// ============================================================================
+function pingBackend(timeoutMs = 4000) {
+  return new Promise(resolve => {
+    let done = false;
+    const finish = ok => { if (!done) { done = true; resolve(ok); } };
+    try {
+      const req = net.request(`http://127.0.0.1:${HTTP_PORT}/api/v1/ping`);
+      const timer = setTimeout(() => { try { req.abort(); } catch { /* ignore */ } finish(false); }, timeoutMs);
+      req.on('response', res => { clearTimeout(timer); finish(res.statusCode >= 200 && res.statusCode < 500); res.on('data', () => {}); });
+      req.on('error', () => { clearTimeout(timer); finish(false); });
+      req.end();
+    } catch {
+      finish(false);
+    }
+  });
+}
+
+async function handleResume() {
+  if (appQuitting) return;
+  // 唤醒时后端本就不在跟踪（未启动 / 之前已失败）：不擅自拉起，保留用户手动启动入口。
+  if (!pythonProc) return;
+  // 先重新侦测就绪：token 已存在会立即推送，修复「睡眠跨过启动窗口 → 渲染端停在 failed」。
+  armReadiness();
+  // 再探活 HTTP；无响应说明后端实际已死（睡眠期间被系统回收等），按崩溃路径处理：
+  // kill 僵尸引用触发其 'exit' → 走限频自动重启。手动停止/重启进行中（killPending）时不介入。
+  const alive = await pingBackend();
+  if (alive || appQuitting || killPending || !pythonProc) return;
+  console.warn('[aas-electron] 唤醒后后端无响应，按崩溃路径重启');
+  killPython();
 }
 
 // ============================================================================
@@ -439,16 +554,46 @@ async function createWindow() {
   });
 
   win.on('close', e => {
+    // 缩托盘前先兜底解析挂起的原生蓝牙请求：扫描 modal 开着却直接关窗口时，
+    // 否则 native 扫描会一直挂起、渲染层 scanning 卡 true（详见 resolvePendingBleRequests）。
+    resolvePendingBleRequests();
     if (!appQuitting) {
       e.preventDefault();
       win.hide();
     }
   });
+  // 窗口真正销毁时再兜底一次（直接退出/异常销毁路径）
+  win.on('closed', resolvePendingBleRequests);
+  // 重载（dev HMR / webContents.reload）：旧页面随导航销毁，其 pending requestDevice 的 callback
+  // 不会被渲染层调用，须在主帧开始导航时兜底解析，释放扫描状态。
+  win.webContents.on('did-start-navigation', (_e, _url, isInPlace, isMainFrame) => {
+    if (isMainFrame && !isInPlace) resolvePendingBleRequests();
+  });
 
-  // 外链用系统浏览器打开，不在 Electron 内部跳转
+  // 外链用系统浏览器打开，不在 Electron 内部跳转。
+  // 协议白名单：AI 资讯专区把外部 RSS/接口返回的 item.url 直接渲染为 <a target="_blank">，
+  // 数据源不受本机控制。若上游 feed 被投毒/中间人篡改，url 可能是 file:///、UNC 路径 \\evil\share\x.exe
+  // 或已注册的自定义协议（ms-msdt: 类）——一旦 openExternal 这类 url，点击资讯条目即在本机触发程序执行。
+  // 故仅放行 http/https，其余一律丢弃（不打开、不报错）。
   win.webContents.setWindowOpenHandler(({ url }) => {
-    shell.openExternal(url);
+    try {
+      const u = new URL(url);
+      if (u.protocol === 'https:' || u.protocol === 'http:') shell.openExternal(url);
+    } catch { /* 非法 url 直接忽略 */ }
     return { action: 'deny' };
+  });
+
+  // 阻止渲染进程整页跳转到外部站点：preload 暴露的 AAS_SERVICE/AAS_FILES（含读任意 yaml 的 pickConfigFile）
+  // 等桥接 API 会随窗口可用，若渲染进程被诱导导航到远程页面，这些能力将暴露给该远程页面。
+  // 只允许停留在本应用页面（dev=Vite dev server，prod=本地 dist 的 file://），其余一律拦截改用外部浏览器打开。
+  win.webContents.on('will-navigate', (e, url) => {
+    const allowed = IS_DEV ? url.startsWith(DEV_SERVER_URL) : url.startsWith('file://');
+    if (allowed) return;
+    e.preventDefault();
+    try {
+      const u = new URL(url);
+      if (u.protocol === 'https:' || u.protocol === 'http:') shell.openExternal(url);
+    } catch { /* 非法 url 直接忽略 */ }
   });
 
   if (IS_DEV) {
@@ -482,6 +627,25 @@ function createTray() {
   ]);
   tray.setContextMenu(menu);
   tray.on('double-click', () => { if (mainWindow) { mainWindow.show(); mainWindow.focus(); } });
+}
+
+// 兜底解析挂起的原生蓝牙请求（修复 E17）：
+//  Chromium 的 select-bluetooth-device / setBluetoothPairingHandler 在拿到 callback 后，
+//  必须调用一次该 callback 原生请求才会结束；否则 native 蓝牙扫描状态泄漏（持续耗电/占用适配器），
+//  且渲染层 store.scanning 卡在 true（下次 openScan 被 `if (scanning) return` 吞掉，再也打不开扫描）。
+//  窗口关闭(缩托盘)/销毁/重载时，渲染页的 modal 可能未选/未取消就消失，须在此统一兜底：
+//  设备选择回空串(=取消)、配对确认回 { confirmed:false }，确保挂起的 native 请求被解析、扫描状态释放。
+function resolvePendingBleRequests() {
+  if (bluetoothRequest) {
+    const cb = bluetoothRequest.callback;
+    bluetoothRequest = null;
+    try { cb(''); } catch { /* 请求可能已失效，忽略 */ }
+  }
+  if (pairingRequest) {
+    const cb = pairingRequest.callback;
+    pairingRequest = null;
+    try { cb({ confirmed: false }); } catch { /* 请求可能已失效，忽略 */ }
+  }
 }
 
 // 设备列表去重 + 原样透传名称（空串=无名设备，由渲染端决定过滤/隐藏）
@@ -613,23 +777,37 @@ ipcMain.handle('service:get-status', () => {
 });
 
 ipcMain.handle('service:start', () => {
+  // 上一次 kill 尚未收到 exit：拒绝并发，避免旧进程未真正退出就被当作已停止而再 spawn 出双进程。
+  if (killPending) return { success: false, message: '正在停止上一个进程，请稍候再试' };
   if (pythonProc) return { success: true, message: '已在运行' };
   manualStop = false;
   restarting = false;
+  // 手动启动优先：取消任何挂起的（崩溃/重启）定时器，统一由本次 spawn 接管，杜绝定时器到点后再 spawn。
+  clearPendingRestart();
   spawnPython(); // 成功会在 spawnPython 末尾推 service:status running=true
   return { success: true };
 });
 
 ipcMain.handle('service:stop', () => {
+  if (killPending) return { success: false, message: '正在处理上一个请求，请稍候再试' };
+  // 主动停止：先取消挂起的自动重启定时器，否则停止后定时器到点仍会把后端重新拉起。
+  clearPendingRestart();
   if (!pythonProc) { pushServiceStatus(false); return { success: true, message: '未在运行' }; }
   manualStop = true; // 标记为主动停止：exit handler 不会自动重启
+  killPending = true; // 等待该进程 exit 期间拒绝并发的 service:* 请求
   killPython();
   return { success: true };
 });
 
 ipcMain.handle('service:restart', () => {
-  if (!pythonProc) { manualStop = false; spawnPython(); return { success: true }; }
+  if (killPending) return { success: false, message: '正在处理上一个请求，请稍候再试' };
+  // 取消挂起的崩溃/重启定时器，由本次重启流程统一接管，避免旧定时器额外 spawn。
+  clearPendingRestart();
+  // 此分支等价于一次直接启动：除 manualStop 外也复位 restarting，避免上一轮残留的 restarting
+  // 被本次 spawn 出的新进程继承——否则新进程将来崩溃会误入 exit 的 restarting 分支绕过限频。
+  if (!pythonProc) { manualStop = false; restarting = false; spawnPython(); return { success: true }; }
   restarting = true; // 标记为主动重启：exit handler 退出后会再 spawn（这里不二次 spawn，避免双进程竞态）
+  killPending = true; // 等待该进程 exit 期间拒绝并发的 service:* 请求
   killPython();
   return { success: true };
 });
@@ -663,6 +841,30 @@ function migrateLegacyDataIfNeeded() {
 }
 
 // ============================================================================
+// 单实例锁（修复 M28）
+//  托盘化设计下关窗只是 hide 到托盘（见 win.on('close')），用户极易误以为已退出而再次
+//  双击快捷方式 → 第二个 Electron 实例正常启动并再 spawn 一个 python main.py --gui：
+//  两个后端抢 8765/8766 端口、第二实例 unlink 掉第一实例正在用的 .gui_token、
+//  Telegram bot 双 polling 触发 409、punch_records JSON 被两进程并发写。
+//  这里抢单实例锁：抢不到说明已有实例在运行，本进程直接退出；已有实例收到
+//  second-instance 事件时把窗口显示并聚焦，等价于「二次启动只唤起已有窗口」。
+// ============================================================================
+const gotInstanceLock = app.requestSingleInstanceLock();
+if (!gotInstanceLock) {
+  // 抢锁失败：已有实例在运行，本进程立即退出（不创建窗口、不 spawn 后端）
+  app.exit(0);
+} else {
+  app.on('second-instance', () => {
+    // 二次启动被本（首个）实例接管：把主窗口从托盘唤起并聚焦
+    if (mainWindow) {
+      if (mainWindow.isMinimized()) mainWindow.restore();
+      mainWindow.show();
+      mainWindow.focus();
+    }
+  });
+}
+
+// ============================================================================
 // 生命周期
 // ============================================================================
 app.on('ready', async () => {
@@ -688,6 +890,9 @@ app.on('ready', async () => {
   spawnPython();
   await createWindow();
   createTray();
+  // 监听系统唤醒：睡眠跨过启动/探活窗口后，唤醒重新侦测就绪 + 探活后端（详见 handleResume）。
+  // powerMonitor 须在 app ready 后注册。
+  powerMonitor.on('resume', () => { void handleResume(); });
 });
 
 app.on('window-all-closed', () => {
@@ -700,6 +905,7 @@ app.on('window-all-closed', () => {
 
 app.on('before-quit', () => {
   appQuitting = true;
+  clearPendingRestart(); // 退出前取消挂起的重启定时器，防止其到点后又把后端拉起
   flushGuiSettings();
   killPython();
 });

@@ -167,9 +167,13 @@ def refresh():
     返回最新契约 dict；拉取彻底失败时回退旧缓存的 items（count 同步）；
     彻底无数据时 updated_at:null、count:0、items:[]。
     """
+    # 网络请求挪到锁外执行：_fetch_from_aihot 只做网络拉取+解析，不触碰共享缓存，
+    # 因此最长 ~20s 的慢网络不会持锁阻塞 get_ai_news 的 TTL 快速读路径，
+    # 避免 waitress 工作线程被一并卡死（M66，与 exchange_rate_service 同款改造）。
+    items = _fetch_from_aihot()
+
     with _lock:
         cache = _load_cache()
-        items = _fetch_from_aihot()
 
         if items is None:
             # 本次彻底失败：回退旧缓存

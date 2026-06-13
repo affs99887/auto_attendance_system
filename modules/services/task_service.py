@@ -66,10 +66,19 @@ async def create_scheduled_punch_task(
             last_id = max((t.get('id', 0) for t in tasks if t.get('type') == 'punch_out'), default=None)
             return True, f'已设置下班打卡任务 @ {time_str}', last_id
         else:
-            # punch_in: 用 task_manager.add_task + 简单 schedule（沿用 bot 内同等逻辑）
-            task_id = attendance_system.task_manager.add_task('punch_in', time_str, username=username)
-            # 由 schedule_manager 在下次循环时拾起；这里只入库
-            return True, f'已设置上班打卡任务 @ {time_str}', task_id
+            # punch_in: 与 punch_out 分支对齐——调用 schedule_punch_in 真正注册 schedule job。
+            # 此前只 add_task 入库、注释称由 schedule_manager 下次循环拾起，但 run_schedule
+            # 全程只执行 schedule 库已注册的 job、从不读 task_manager，scheduled_tasks.json 里的
+            # 任务仅在进程启动时 init_schedule_tasks 加载一次，导致 GUI 设置的上班卡在重启前
+            # 永不触发（静默漏打卡）。schedule_punch_in 内部已 add_task 并注册带工作日/任务存在性
+            # 守卫、执行后自删的 punch_in_scheduled job，故这里不再单独 add_task。
+            ok = await attendance_system.schedule_punch_in(target_h, target_m)
+            if not ok:
+                return False, '调度上班打卡任务失败', None
+            # schedule_punch_in 内部已 add_task；取最近的 punch_in task_id（与 punch_out 分支对称）
+            tasks = attendance_system.task_manager.get_tasks()
+            last_id = max((t.get('id', 0) for t in tasks if t.get('type') == 'punch_in'), default=None)
+            return True, f'已设置上班打卡任务 @ {time_str}', last_id
     except Exception as e:
         logging.exception('create_scheduled_punch_task failed')
         return False, f'内部错误: {e}', None

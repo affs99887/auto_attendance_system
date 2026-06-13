@@ -11,6 +11,7 @@ Web 服务模块 — 为 GUI（Electron）提供 REST + WebSocket 接口
 """
 
 import os
+import sys
 import json
 import time
 import asyncio
@@ -19,6 +20,8 @@ import threading
 import secrets
 import functools
 import tempfile
+import getpass
+import subprocess
 import re
 from concurrent.futures import TimeoutError as FuturesTimeoutError
 from typing import Any, Optional, Set
@@ -120,15 +123,47 @@ class AsyncioBridge:
 # Token auth
 # ----------------------------------------------------------------------------
 
+def _restrict_token_acl(path: str) -> None:
+    """[M72 修复] 收紧 token 文件 ACL，使同机其它账户无法读取。
+
+    os.chmod(path, 0o600) 在 Windows 上只切换只读位、完全不影响 ACL —— 项目位于
+    C:\\auto_attendance_system（非用户 profile），logs\\.gui_token 继承的默认 ACL 通常允许
+    本机所有用户读取，拿到 token 即可调 PATCH /api/v1/config 改写 .env 凭据。故在 Windows 下
+    用内置 icacls 断继承并仅授予当前用户完全控制（icacls 始终随系统存在，不依赖 pywin32，
+    与项目"无 pywin32 也能跑"的约束一致）。非 Windows 维持 chmod 0600 即可。
+    """
+    if sys.platform != 'win32':
+        try:
+            os.chmod(path, 0o600)
+        except OSError:
+            pass
+        return
+    # Windows：chmod 仅作只读位兜底，真正的访问控制交给 icacls
+    try:
+        os.chmod(path, 0o600)
+    except OSError:
+        pass
+    try:
+        user = os.environ.get('USERNAME') or getpass.getuser()
+        domain = os.environ.get('USERDOMAIN')
+        principal = f'{domain}\\{user}' if domain else user
+        # /inheritance:r 移除继承的 ACE（断掉默认放给本机用户组的读权限）；
+        # /grant:r 重置并仅授予当前用户完全控制。失败不阻断启动，仅告警。
+        subprocess.run(
+            ['icacls', path, '/inheritance:r', '/grant:r', f'{principal}:F'],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            check=False, timeout=10,
+        )
+    except Exception:
+        logging.warning("收紧 token 文件 ACL 失败（icacls 不可用？），同机其它账户可能可读 %s", path)
+
+
 def _ensure_token() -> str:
     os.makedirs(os.path.dirname(TOKEN_FILE), exist_ok=True)
     token = secrets.token_urlsafe(32)
     with open(TOKEN_FILE, 'w', encoding='utf-8') as f:
         f.write(token)
-    try:
-        os.chmod(TOKEN_FILE, 0o600)
-    except OSError:
-        pass
+    _restrict_token_acl(TOKEN_FILE)
     return token
 
 
@@ -349,10 +384,31 @@ def _build_flask_app(attendance_system, bridge: AsyncioBridge,
     app = Flask(__name__)
     require_token = _make_require_token(token)
 
-    # CORS（仅 localhost 自由放行，便于 Electron 渲染进程跨源调用）
+    # CORS（仅 localhost / file:// 白名单放行，便于 Electron 渲染进程跨源调用）
+    # [M72 修复] 原先恒发 Access-Control-Allow-Origin: '*'（注释却写"仅 localhost 放行"，名实不符），
+    # 任意外部网页 JS 都能跨源读取本机服务响应、探测服务存在。改为按 Origin 白名单回显：
+    # 仅放行 Electron 渲染进程的来源——生产 file://（fetch 时 Origin 为字面量 'null'）、
+    # 开发 Vite http://localhost:* / http://127.0.0.1:*。非白名单 Origin 不回显 ACAO，浏览器即拦下
+    # 跨源读取。无 Origin 头的请求（同源资源加载、非浏览器调用，如截图 <img>）不受影响。
+    def _origin_allowed(origin: str) -> bool:
+        if not origin:
+            return False
+        if origin == 'null':  # file:// 页面发起的 fetch，Origin 为字面量 'null'
+            return True
+        return (
+            origin.startswith('http://localhost')
+            or origin.startswith('http://127.0.0.1')
+            or origin.startswith('https://localhost')
+            or origin.startswith('https://127.0.0.1')
+            or origin.startswith('file://')
+        )
+
     @app.after_request
     def _cors(resp):
-        resp.headers['Access-Control-Allow-Origin'] = '*'
+        origin = request.headers.get('Origin', '')
+        if _origin_allowed(origin):
+            resp.headers['Access-Control-Allow-Origin'] = origin
+            resp.headers['Vary'] = 'Origin'
         resp.headers['Access-Control-Allow-Headers'] = 'Authorization, Content-Type'
         resp.headers['Access-Control-Allow-Methods'] = 'GET, POST, PUT, PATCH, DELETE, OPTIONS'
         return resp
@@ -393,6 +449,36 @@ def _build_flask_app(attendance_system, bridge: AsyncioBridge,
             logging.exception("logs tail failed")
             return jsonify({'error': str(e)}), 500
 
+    def _abort_launched_punch(reason: str):
+        """[M23 修复] 打卡接口 bridge.call 超时后，强行中断"可能已被派出"的打卡子任务。
+
+        bridge.call 超时只会 fut.cancel() 父 future，但 start_punch_operation 在锁空闲时
+        其 prologue 会跑完并 create_task 出一个 detached 的 punch_in/out_internal 子任务——
+        该子任务不受父 future 取消影响，会在循环解锁后照常完成打卡，形成用户已见 500、
+        实际仍打卡的"幽灵打卡"。这里复用 operation_stop 的强停路径切断真实执行：
+        (1) force_stop_operation 同步置 _cancel_flag 并 quit 活跃 driver（内部各打卡分支在
+            checkpoint 检查 _is_cancelled→_cancel_flag 即会中止）；
+        (2) call_soon_threadsafe 置 operation_cancel_event 覆盖 driver 尚未创建的窗口；
+        (3) 排清理状态到主循环，不 .result() 干等。
+        """
+        try:
+            attendance_system.force_stop_operation()
+        except Exception:
+            logging.exception("_abort_launched_punch force_stop 失败")
+        ev = getattr(attendance_system, 'operation_cancel_event', None)
+        if ev is not None:
+            try:
+                bridge._loop.call_soon_threadsafe(ev.set)
+            except Exception:
+                logging.exception("_abort_launched_punch call_soon_threadsafe(ev.set) 失败")
+        try:
+            asyncio.run_coroutine_threadsafe(
+                attendance_system._cleanup_operation_state(), bridge._loop
+            )
+        except Exception:
+            logging.exception("_abort_launched_punch schedule _cleanup_operation_state 失败")
+        logging.warning("打卡接口超时已中断可能派出的打卡子任务：%s", reason)
+
     @app.post('/api/v1/punch/in')
     @require_token
     def punch_in():
@@ -404,6 +490,11 @@ def _build_flask_app(attendance_system, bridge: AsyncioBridge,
                 timeout=15,
             )
             return jsonify({'success': bool(ok), 'message': msg})
+        except FuturesTimeoutError:
+            # [M23 修复] 超时不仅 fut.cancel()（bridge 内已做），还要切断已 detach 的打卡子任务，
+            # 否则循环解锁后仍会真正打卡（不可幂等）。
+            _abort_launched_punch('punch_in 15s 超时')
+            return jsonify({'success': False, 'error': '打卡请求超时，已尝试中断本次打卡'}), 500
         except Exception as e:
             logging.exception("punch_in failed")
             return jsonify({'success': False, 'error': str(e)}), 500
@@ -419,6 +510,10 @@ def _build_flask_app(attendance_system, bridge: AsyncioBridge,
                 timeout=15,
             )
             return jsonify({'success': bool(ok), 'message': msg})
+        except FuturesTimeoutError:
+            # [M23 修复] 同 punch_in：超时切断已 detach 的下班打卡子任务，避免幽灵下班卡/迟到生效。
+            _abort_launched_punch('punch_out 15s 超时')
+            return jsonify({'success': False, 'error': '打卡请求超时，已尝试中断本次打卡'}), 500
         except Exception as e:
             logging.exception("punch_out failed")
             return jsonify({'success': False, 'error': str(e)}), 500
@@ -488,14 +583,26 @@ def _build_flask_app(attendance_system, bridge: AsyncioBridge,
         task = attendance_system.task_manager.get_task_by_id(task_id)
         ptype = (task or {}).get('type')
         ok = attendance_system.task_manager.remove_task_by_id(task_id)
-        # 按类型清除对应 tag 的 schedule job：调度器设计上同类至多一个（schedule_punch_in/out
-        # 创建前都会清掉同类旧任务），故按 tag 清除是精确的。schedule 作业运行在主 loop，
-        # 用 call_soon_threadsafe 投递清除，避免与 loop 迭代 jobs 竞态。
-        tag = {'punch_in': 'punch_in_scheduled', 'punch_out': 'punch_out_scheduled'}.get(ptype)
-        if ok and tag:
+        # [M24/M35 修复] 按类型清除对应 tag 的 schedule job。注意：同一 type='punch_out' 的任务
+        # 可能由两条路径注册，tag 不同——schedule_punch_out 用 'punch_out_scheduled'，而
+        # schedule_retry_punch_out（下班重试）用 'punch_out_retry'。若只清 'punch_out_scheduled'，
+        # 重试 job（其内部 punch_out_job 无任务存在性校验，直接 await punch_out）在用户删除任务后
+        # 仍会到点打下班卡。故删除 punch_out 任务时两 tag 一并清。
+        type_tags = {
+            'punch_in': ('punch_in_scheduled',),
+            'punch_out': ('punch_out_scheduled', 'punch_out_retry'),
+        }.get(ptype, ())
+        # [M35 修复] Telegram _schedule_punch 创建的 job 除类型 tag 外还带 per-task tag
+        # 'task_{id}'。这里按本任务 id 精准清掉对应 job，既覆盖 Telegram 任务，又避免仅按
+        # 类型 tag 清除时误伤同类型但用户未删除的其它 job（schedule.clear 对不存在的 tag 是 no-op）。
+        all_tags = type_tags + (f'task_{task_id}',)
+        if ok and all_tags:
             import schedule
+            # schedule 作业运行在主 loop，用 call_soon_threadsafe 投递清除，避免与 loop 迭代 jobs 竞态。
             try:
-                bridge._loop.call_soon_threadsafe(lambda t=tag: schedule.clear(t))
+                bridge._loop.call_soon_threadsafe(
+                    lambda ts=all_tags: [schedule.clear(t) for t in ts]
+                )
             except Exception:
                 logging.exception("del_task 取消 schedule job 失败")
         event_bus.publish_threadsafe('task:changed', {'op': 'delete', 'id': task_id})
@@ -607,17 +714,31 @@ def _build_flask_app(attendance_system, bridge: AsyncioBridge,
         """
         body = request.get_json(silent=True) or {}
         username = body.get('username')
-        recs = attendance_system.today_punch_records or {}
+        # [M56 修复] 浅拷贝后再遍历：本接口在 Flask 线程读 today_punch_records，与主循环
+        # _set_user_punch_time 的写入并发，直接遍历活字典可能抛 RuntimeError: dictionary changed
+        # size during iteration（500）。dict(...) 拿到一份稳定快照即可。
+        recs = dict(attendance_system.today_punch_records or {})
+        # [M56 修复] 跨日重置只由 check_punch_status 在工作日的偶数整点触发，周末/假日全天及工作日
+        # 清晨首个偶数整点前，记录里仍是昨天的数据。复用 get_status_snapshot 同款过滤：仅当归属日期
+        # rec['date'] == 今天 时才采用 punch_in_time，否则视为"今日无上班记录"转登录识别/兜底，
+        # 避免用昨天的上班时间算出错误下班时间并误走"内存已有记录"分支跳过识别。
+        from datetime import datetime as _dt
+        _today = _dt.now().date()
+
+        def _today_punch_in(rec: dict):
+            rec = rec or {}
+            if rec.get('date') != _today:
+                return None
+            return rec.get('punch_in_time')
 
         target_user = None
         target_in = None
         if username:
-            rec = recs.get(username) or {}
-            target_in = rec.get('punch_in_time')
+            target_in = _today_punch_in(recs.get(username))
             target_user = username
         else:
             for u, r in recs.items():
-                t = (r or {}).get('punch_in_time')
+                t = _today_punch_in(r)
                 if t and (target_in is None or t < target_in):
                     target_in = t
                     target_user = u
@@ -628,6 +749,16 @@ def _build_flask_app(attendance_system, bridge: AsyncioBridge,
             # 内存(today_punch_records)已有今日上班时间，直接用
             in_str = target_in.strftime('%H:%M:%S') if hasattr(target_in, 'strftime') else str(target_in)
         else:
+            # [M57 修复] 仅在需要登录识别（内存无今日记录）时才检查互斥：打卡进行中再对同一账号发起
+            # 第二次登录，考勤系统可能互踢会话导致打卡失败；且此期间用户点"停止"会 quit 全部活跃
+            # driver，把本识别任务连带杀死。与 fetch_punch_status 同款保护——有进行中操作直接 409 拒绝。
+            # （注：此线程侧检查与主循环操作启动间仍存在 TOCTOU 窗口，彻底消除需主循环内的统一互斥锁，
+            #  见 cross_file_notes 中对 attendance_system 的依赖说明。）
+            if attendance_system.current_operation is not None:
+                return jsonify({
+                    'success': False,
+                    'error': f'当前有 {attendance_system.current_operation} 操作进行中，请等待完成后再计算下班时间',
+                }), 409
             # 内存无记录 → 登录系统识别真实上班时间（对齐 Telegram /auto_byebye：Selenium 模式走
             # get_today_punch_in_time_via_selenium 的 DOM 解析、仅识别首个用户 users[0]；传统模式走 OCR）。
             # 登录识别耗时较长（与「获取打卡情况」量级一致），给足超时；超时/异常都不阻断，转兜底。
@@ -714,6 +845,11 @@ def _build_flask_app(attendance_system, bridge: AsyncioBridge,
                     'message': str(v.get('message', '')),
                 }
             return jsonify({'success': True, 'count': len(normalized), 'results': normalized})
+        except FuturesTimeoutError:
+            # [M88 修复] bridge.call 超时已 fut.cancel()，会把 CancelledError 投递进读取协程，
+            # 在其下一个 await 检查点切断登录流程、释放占用的 driver（read 类无 detach 子任务，
+            # 无需 force_stop）。明确返回 504 让前端区分"超时"而非泛化 500。
+            return jsonify({'success': False, 'error': '读取打卡情况超时，已尝试取消本次读取'}), 504
         except Exception as e:
             logging.exception("fetch_punch_status failed")
             return jsonify({'success': False, 'error': str(e)}), 500
@@ -942,6 +1078,15 @@ def _build_flask_app(attendance_system, bridge: AsyncioBridge,
     @require_token
     def parallel_login_test():
         try:
+            # [M57 修复] 该接口会对全部用户发起 120s 全量登录；打卡进行中再对同账号登录会与正在进行的
+            # 打卡争抢会话（考勤系统可能互踢），且用户点"停止"会 quit 全部 driver 把本测试连带杀死。
+            # 与 fetch_punch_status / auto_byebye_calc 同款保护——有进行中操作直接 409 拒绝。
+            # （线程侧检查仍有 TOCTOU 窗口，彻底消除需主循环统一互斥锁，见 cross_file_notes。）
+            if attendance_system.current_operation is not None:
+                return jsonify({
+                    'success': False,
+                    'error': f'当前有 {attendance_system.current_operation} 操作进行中，请等待完成后再测试并行登录',
+                }), 409
             users_config = attendance_system.prepare_users_config_from_env()
             if not users_config:
                 return jsonify({'success': False, 'error': '未配置任何用户'}), 400

@@ -80,7 +80,11 @@ export async function sendCanvasToEpd(
       throw new Error('当前固件不支持此颜色模式。');
     }
 
-    await client.write(EpdCmd.REFRESH);
+    // 检查 REFRESH 返回值：所有分块碰巧发完、但连接恰在刷新命令前/时断开时，
+    // write() 会因 epdCharacteristic 置空或写入抛错返回 false（不 throw），
+    // 此处必须抛错，否则会正常 resolve 返回合理耗时，令调用方误报「发送完成」实则屏幕未刷新
+    const ok = await client.write(EpdCmd.REFRESH);
+    if (!ok) throw new Error('刷新命令发送失败，连接可能已断开');
     return (new Date().getTime() - startTime) / 1000.0;
   } finally {
     sendingLock = false;

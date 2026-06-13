@@ -49,6 +49,9 @@ def python_subprocess_env():
     encoding = getattr(sys.stdout, "encoding", None)
     if encoding:
         env['PYTHONIOENCODING'] = f'{encoding}:replace'
+    # [M37 修复] 标记子进程运行在看门狗监管之下：main.py 内 restart_program 据此改用 sys.exit
+    # 让看门狗拉起新实例，而非进程内 os.execl 自重启（后者会与看门狗的重启逻辑撞车产生双实例）。
+    env['AAS_SUPERVISED'] = '1'
     return env
 
 
@@ -84,6 +87,14 @@ def is_process_running():
     2. cmdline 中存在某个参数，其归一化绝对路径正好是本项目根目录下的 main.py
        （绝对路径/相对路径启动均可命中，且排除其他项目的同名 main.py）；
     3. 排除看门狗自身 PID，避免自匹配恒为 True。
+
+    [M89 补全] 额外把"任意 main.py --gui 进程"视为系统已在运行而直接返回 True：
+    watchdog 与 GUI 互斥（GUI 模式下崩溃重启由 Electron 接管，见 start.py）。
+    打包态 GUI 的 main.py 位于 resources\\backend\\main.py，与源码树 watchdog 锚定的
+    MAIN_SCRIPT_PATH 是不同绝对路径，仅按路径相等判断会漏检 → watchdog 误判"未运行"
+    再拉起一份无 GUI 后端的 headless main.py，造成双 Telegram bot polling 冲突 +
+    共享文件竞争。故对带 '--gui' 的 main.py 放宽为仅按 basename 命中即认定在运行，
+    避免看门狗与已运行的 GUI 后端撞车产生双实例。
     """
     self_pid = os.getpid()
     for proc in psutil.process_iter(['pid', 'name', 'cmdline']):
@@ -94,6 +105,17 @@ def is_process_running():
             if not name.startswith('python'):
                 continue
             cmdline = proc.info['cmdline'] or []
+            # 该进程是否为 main.py（按 basename 命中，路径归属在下方再细判）
+            has_main_py = any(
+                arg and os.path.basename(arg).lower() == 'main.py'
+                for arg in cmdline
+            )
+            if not has_main_py:
+                continue
+            # GUI 模式的 main.py：不论绝对路径是否等于本项目（打包态路径不同），
+            # 都视为系统已运行，避免 watchdog 再拉起一份 headless 实例造成双实例。
+            if '--gui' in cmdline:
+                return True
             for arg in cmdline:
                 if not arg or os.path.basename(arg).lower() != 'main.py':
                     continue
@@ -108,8 +130,21 @@ def is_process_running():
     return False
 
 def start_main_program():
-    """启动主程序"""
+    """启动主程序（headless CLI 变体，不带 --gui）
+
+    [M89 补全说明] 看门狗刻意只拉起不带 --gui 的 main.py：
+    看门狗模式与 GUI 模式互斥——GUI 模式下后端由 Electron 直接 spawn 并负责崩溃重启
+    （见 start.py / main.cjs），不需要也不应由看门狗再拉起 GUI 后端。
+    为防止与已运行的 GUI 后端撞车，进入此函数前会先 is_process_running() 拦截：
+    该函数已把"任意 main.py --gui 进程"识别为系统在运行（含打包态不同绝对路径），
+    故看门狗不会在 GUI 后端已起时再拉起一份 headless 实例。
+    """
     try:
+        # 双重保险：若此刻已有 GUI 后端在运行，绝不再拉起 headless 实例，
+        # 避免双 Telegram bot polling 冲突 + 共享文件竞争（打包态路径不同时尤为关键）。
+        if is_process_running():
+            logging.info("检测到主程序(含 GUI 后端)已在运行，跳过本次启动以避免双实例")
+            return True
         # 使用 Python 解释器启动主程序：用绝对路径并指定 cwd，消除对启动目录的依赖
         subprocess.Popen(
             [sys.executable, MAIN_SCRIPT_PATH],

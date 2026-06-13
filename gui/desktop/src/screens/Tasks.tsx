@@ -6,6 +6,7 @@ import { Icon } from '../lib/icons';
 import { USERS } from '../lib/data';
 import { api, ApiError } from '../lib/api';
 import { useSystemStore } from '../store/system';
+import { useToastStore } from '../store/toast';
 
 interface TaskRow {
   id: number;
@@ -202,13 +203,24 @@ export function TasksScreen() {
     return () => window.clearInterval(id);
   }, []);
 
+  const toast = (type: 'ok' | 'err', text: string) => useToastStore.getState().push(type, text);
+
   const handleDelete = async (id: number) => {
+    setConfirmDel(null);
     try {
-      await api.deleteTask(id);
-      setConfirmDel(null);
+      const r = await api.deleteTask(id);
+      // 后端可能返回 success === false（任务已不存在等），需显式提示而非静默关闭
+      if (r.success === false) {
+        toast('err', `删除任务 #${id} 失败`);
+      } else {
+        toast('ok', `任务 #${id} 已删除`);
+      }
+    } catch (e) {
+      // 网络错误 / 4xx 等：弹 toast 告知用户，避免误以为定时打卡已取消
+      toast('err', e instanceof ApiError ? `${e.status} ${e.message}` : (e as Error).message);
+    } finally {
+      // 无论成败都刷新，确保列表与后端真实状态一致
       void refresh();
-    } catch {
-      setConfirmDel(null);
     }
   };
 

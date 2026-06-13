@@ -71,8 +71,10 @@ def setup_logging():
 def check_environment():
     """检查运行环境"""
     # 检查Python版本
-    if sys.version_info < (3, 6):
-        print("错误: 需要Python 3.6或更高版本")
+    # 提升到 3.10：electron-builder.yml 声明用户机器需 Python 3.10+，且 requirements.txt
+    # 的依赖（numpy>=1.26 等）只对 3.10+ 提供 wheel，3.6 的旧提示会误导首装用户。
+    if sys.version_info < (3, 10):
+        print("错误: 需要Python 3.10或更高版本")
         return False
     
     # 检查必要文件

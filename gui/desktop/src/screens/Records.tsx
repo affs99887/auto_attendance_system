@@ -1,13 +1,13 @@
-// 打卡记录 — 接真实后端 API，mock 兜底。
+// 打卡记录 — 接真实后端 API。打卡记录是核心数据，API 失败时不再静默退回
+// data.ts 写死的 mock 假记录（会让用户把假打卡当真，误判漏打卡），改为显示
+// 醒目错误条 + 重试，日历/明细/统计走真实空态。
 import * as React from 'react';
 import { useApp } from '../App';
 import { Icon } from '../lib/icons';
 import {
   buildMonthGrid,
-  computeStats,
   dateStr,
   fmtDuration,
-  getUserRecords,
 } from '../lib/data';
 import type { PunchRec } from '../lib/types';
 import { api, ApiError } from '../lib/api';
@@ -129,8 +129,10 @@ export function RecordsScreen() {
   const [apiRecs, setApiRecs] = React.useState<Record<string, PunchRec> | null>(null);
   const [loading, setLoading] = React.useState(false);
   const [error, setError] = React.useState<string | null>(null);
+  // 重试触发器：点「重试」自增，重新执行加载 effect（不改 currentUser/ym 也能重拉）
+  const [reloadKey, setReloadKey] = React.useState(0);
 
-  // 拉 API 数据 — 用 epoch 防 race
+  // 拉 API 数据 — cancelled 标志防 race
   React.useEffect(() => {
     const [year, month] = ym.split('-').map(Number);
     let cancelled = false;
@@ -143,42 +145,39 @@ export function RecordsScreen() {
       })
       .catch(e => {
         if (cancelled) return;
-        // 静默退到 mock；error 只在调试时展示
+        // 失败不再退回 mock 假记录（会误导用户核对考勤）：清空数据并展示醒目错误条
         setApiRecs(null);
-        setError(e instanceof ApiError ? `${e.status}` : (e as Error).message);
+        setError(e instanceof ApiError ? `HTTP ${e.status} · ${e.message}` : (e as Error).message);
       })
       .finally(() => {
         if (!cancelled) setLoading(false);
       });
     return () => { cancelled = true; };
-  }, [currentUser, ym]);
+  }, [currentUser, ym, reloadKey]);
 
-  // 优先 API，fallback mock
-  const recs: Record<string, PunchRec> = apiRecs ?? getUserRecords(currentUser, ym);
+  // 数据源：仅用真实 API 结果；失败/未加载时为空对象（不再 mock 兜底）
+  const recs: Record<string, PunchRec> = apiRecs ?? {};
   const cells = React.useMemo(() => buildMonthGrid(ym), [ym]);
 
-  // stats：用 recs 直接算（apiRecs 时算真实，mock 时同 mock）
+  // stats：基于真实 recs 计算；无数据时为空统计（依赖 apiRecs 避免 recs 每次新建引用导致重算）
   const stats = React.useMemo(() => {
-    if (apiRecs) {
-      const entries = Object.values(apiRecs);
-      const total = entries.length;
-      const both = entries.filter(r => r.in && r.out).length;
-      const inOnly = entries.filter(r => r.in && !r.out).length;
-      const inTimes = entries.map(r => r.in).filter((x): x is string => Boolean(x));
-      const outTimes = entries.map(r => r.out).filter((x): x is string => Boolean(x));
-      const avg = (arr: string[]) => {
-        if (!arr.length) return '—';
-        const secs = arr.map(t => {
-          const [h, m, s] = t.split(':').map(Number);
-          return h * 3600 + m * 60 + (s || 0);
-        });
-        const a = Math.round(secs.reduce((x, y) => x + y, 0) / secs.length);
-        return `${String(Math.floor(a / 3600)).padStart(2, '0')}:${String(Math.floor((a % 3600) / 60)).padStart(2, '0')}`;
-      };
-      return { total, both, inOnly, avgIn: avg(inTimes), avgOut: avg(outTimes) };
-    }
-    return computeStats(currentUser, ym);
-  }, [apiRecs, currentUser, ym]);
+    const entries = Object.values(apiRecs ?? {});
+    const total = entries.length;
+    const both = entries.filter(r => r.in && r.out).length;
+    const inOnly = entries.filter(r => r.in && !r.out).length;
+    const inTimes = entries.map(r => r.in).filter((x): x is string => Boolean(x));
+    const outTimes = entries.map(r => r.out).filter((x): x is string => Boolean(x));
+    const avg = (arr: string[]) => {
+      if (!arr.length) return '—';
+      const secs = arr.map(t => {
+        const [h, m, s] = t.split(':').map(Number);
+        return h * 3600 + m * 60 + (s || 0);
+      });
+      const a = Math.round(secs.reduce((x, y) => x + y, 0) / secs.length);
+      return `${String(Math.floor(a / 3600)).padStart(2, '0')}:${String(Math.floor((a % 3600) / 60)).padStart(2, '0')}`;
+    };
+    return { total, both, inOnly, avgIn: avg(inTimes), avgOut: avg(outTimes) };
+  }, [apiRecs]);
 
   return (
     <div className="col gap-6">
@@ -206,12 +205,39 @@ export function RecordsScreen() {
             <span className="pill pill-info"><span className="dot" />加载中</span>
           ) : apiRecs ? (
             <span className="pill pill-success"><span className="dot" />API 已加载</span>
-          ) : (
-            <span className="pill pill-warning" title={error ?? ''}><span className="dot" />Mock 数据</span>
-          )}
+          ) : error ? (
+            <span className="pill pill-danger" title={error}><span className="dot" />加载失败</span>
+          ) : null}
           <button className="btn"><Icon.Download size={12} />导出 JSON</button>
         </div>
       </div>
+
+      {/* 加载失败醒目错误条 + 重试：不再静默退回 mock 假记录，避免误导考勤核对 */}
+      {!loading && !apiRecs && error && (
+        <div
+          className="row spread"
+          style={{
+            padding: '12px 16px',
+            borderRadius: 'var(--radius-lg)',
+            background: 'var(--danger-bg)',
+            border: '1px solid var(--danger-border)',
+            color: 'var(--danger)',
+          }}
+        >
+          <div className="row gap-2" style={{ minWidth: 0 }}>
+            <Icon.AlertTriangle size={16} />
+            <div className="col" style={{ minWidth: 0 }}>
+              <div style={{ fontWeight: 500, fontSize: 13 }}>打卡记录加载失败</div>
+              <div className="mono" style={{ fontSize: 11, opacity: 0.85, wordBreak: 'break-all' }}>
+                {error} — 后端不可用，已暂停显示以免误判漏打卡
+              </div>
+            </div>
+          </div>
+          <button className="btn btn-danger" onClick={() => setReloadKey(k => k + 1)}>
+            <Icon.Refresh size={12} />重试
+          </button>
+        </div>
+      )}
 
       <div className="grid grid-4">
         <div className="kpi">
@@ -252,21 +278,28 @@ export function RecordsScreen() {
             </div>
           </div>
           <div className="card-body">
-            <div className="cal-grid" style={{ marginBottom: 6 }}>
-              {['一', '二', '三', '四', '五', '六', '日'].map(d => (
-                <div key={d} className="cal-head">{d}</div>
-              ))}
-            </div>
-            <div className="cal-grid">
-              {cells.map((d, i) => (
-                <RecordCell
-                  key={i}
-                  d={d}
-                  recs={recs}
-                  isToday={Boolean(d) && dateStr(d) === todayStr}
-                />
-              ))}
-            </div>
+            {!loading && !apiRecs && error ? (
+              // 加载失败时不渲染整月「无记录」格子（会被误读为真实漏打卡），改为空态提示
+              <div className="empty-state">打卡记录加载失败，无法显示月历 — 请用上方「重试」重新加载</div>
+            ) : (
+              <>
+                <div className="cal-grid" style={{ marginBottom: 6 }}>
+                  {['一', '二', '三', '四', '五', '六', '日'].map(d => (
+                    <div key={d} className="cal-head">{d}</div>
+                  ))}
+                </div>
+                <div className="cal-grid">
+                  {cells.map((d, i) => (
+                    <RecordCell
+                      key={i}
+                      d={d}
+                      recs={recs}
+                      isToday={Boolean(d) && dateStr(d) === todayStr}
+                    />
+                  ))}
+                </div>
+              </>
+            )}
           </div>
         </div>
       ) : (
@@ -278,7 +311,9 @@ export function RecordsScreen() {
                 punch_records/{currentUser}/{ym.replace('-', '_')}.json
               </div>
             </div>
-            <button className="btn btn-sm"><Icon.Refresh size={11} />刷新</button>
+            <button className="btn btn-sm" onClick={() => setReloadKey(k => k + 1)}>
+              <Icon.Refresh size={11} />刷新
+            </button>
           </div>
           <table className="table">
             <thead>
@@ -293,6 +328,18 @@ export function RecordsScreen() {
               </tr>
             </thead>
             <tbody>
+              {Object.keys(recs).length === 0 && (
+                // 无真实记录时给明确空态，避免空表被误读为「本月零打卡」
+                <tr>
+                  <td colSpan={7} className="empty-state">
+                    {loading
+                      ? '加载中…'
+                      : error
+                        ? '打卡记录加载失败 — 请用上方「重试」重新加载'
+                        : '本月暂无打卡记录'}
+                  </td>
+                </tr>
+              )}
               {Object.entries(recs)
                 .sort((a, b) => b[0].localeCompare(a[0]))
                 .map(([date, r]) => {

@@ -61,6 +61,7 @@ exchange_rate_cache.json
 ai_news_cache.json
 window-state.json
 gui-settings.json
+.main.lock
 
 # 桌面端打包产物（electron-builder 输出到项目根 release/）
 /release/
