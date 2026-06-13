@@ -79,17 +79,30 @@ def acquire_single_instance_lock():
     - 取不到（已有实例持锁）：读出占用 PID 提示后返回 False，由调用方退出；
     - 若锁文件残留但持有者已不在（旧进程崩溃未释放），OS 层独占锁本就不会拦截，可正常抢占。
 
-    [M70] 锁必须锚定到“真正被争用的资源”所在目录，而非脚本目录。真实争用资源是
-    Telegram bot token——它由 config.py 的 load_dotenv()（无参）从当前工作目录(CWD)加载。
-    打包态 GUI 的 main.py 副本在 resources/backend/ 但 CWD=DATA_DIR；从仓库手动 python main.py
-    （或 watchdog→仓库 main.py）脚本目录不同但 CWD 相同，会加载同一 .env/同一 token。
-    若按脚本目录(__file__)放锁，两份副本锁文件落在不同目录、互斥不触发，仍会双轮询 409 并各跑
-    一份定时打卡。故改用 CWD（load_dotenv 解析 .env 的同一目录）作为锁锚点，使任何加载同一
-    token 的实例都竞争同一把锁。
+    [M70] 锁必须锚定到“真正被争用的资源”——Telegram bot token 本身，而非脚本目录、也不是 CWD。
+    实测 config.py 的 load_dotenv()（无参）走 python-dotenv 的 find_dotenv：以真实脚本运行时
+    （python main.py，非 REPL/frozen）它从“调用者文件(config.py)所在目录”向上回溯找 .env，
+    而不是从 CWD 找。于是打包态 GUI 的 main.py 副本(resources/backend/)与仓库手动启动/watchdog 的
+    main.py 即便 CWD 相同(DATA_DIR)，也各自解析到不同目录的 .env——既不能按 __file__、也不能按
+    CWD 放锁来兜住“同一 token 双实例”。故直接用最终加载到的 token 派生系统级命名互斥：把锁文件放在
+    系统临时目录（对同一用户、与 CWD/脚本位置无关地稳定一致），文件名带 token 哈希。这样任何最终
+    用到同一 token 的实例——无论从哪个目录、哪份副本启动——都竞争同一把锁，409 与重复打卡被根除。
+    未配置 token 时退回固定通用名，保持“同机仅一份 main.py”的原有单实例语义。
     """
     global _instance_lock_handle
-    # 锁文件放在 CWD（load_dotenv 加载 .env 的目录），与“同一 token”争用范围对齐
-    lock_path = os.path.join(os.getcwd(), '.main.lock')
+    import hashlib
+    import tempfile
+    # 用最终加载到的 bot token 派生锁名（token 才是被争用的真实资源）；
+    # 锁文件落在系统临时目录——它对同一用户稳定、且与 CWD/脚本目录无关，
+    # 任何加载同一 token 的实例都会指向同一把锁。
+    _token = getattr(config, 'TELEGRAM_BOT_TOKEN', None)
+    if _token:
+        _token_sig = hashlib.sha1(_token.encode('utf-8', 'ignore')).hexdigest()[:16]
+        lock_name = f'aas-main-{_token_sig}.lock'
+    else:
+        # 未配置 token：无 409 风险，但仍保持单实例语义，退回固定通用名
+        lock_name = 'aas-main-no-token.lock'
+    lock_path = os.path.join(tempfile.gettempdir(), lock_name)
     try:
         # 以读写方式打开（不截断），便于失败时读取占用方 PID
         handle = open(lock_path, 'a+')

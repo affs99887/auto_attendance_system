@@ -221,7 +221,10 @@ export function EpaperScreen() {
     if (!canvasRef.current || !ctxRef.current) return;
     ctxRef.current.putImageData(finalImageData, 0, 0);
 
-    paint.saveToHistory();
+    // 抖动烘焙后的画面无法由笔迹重建，须存全量快照；finalImageData 已是本次最终像素的
+    // 独立副本（worker 回包/同步回退均 new ImageData，写回后不再使用其 buffer），直接复用为快照，
+    // 省掉 saveToHistory 内部对整张画布再做一次 getImageData（消除审计 E16 指出的冗余整张拷贝）。
+    paint.saveToHistory(finalImageData);
   }, [addLog]);
 
   const applyDither = React.useCallback(() => {
@@ -450,7 +453,9 @@ export function EpaperScreen() {
       return;
     }
 
-    const holidays = parseHolidayData(holidayData, line => addLog(`警告: 跳过无效数据 "${line}"`));
+    // 传入 holidayYear（已校验为 2020-2050 的合法年份）使日期校验按实际闰年判定，
+    // 杜绝非闰年(如2026)中 2-29 等不存在的日期被编码下发
+    const holidays = parseHolidayData(holidayData, line => addLog(`警告: 跳过无效数据 "${line}"`), holidayYear);
 
     if (holidays.length === 0) {
       await appAlert('没有有效的假期数据！');

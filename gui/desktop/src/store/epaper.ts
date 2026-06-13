@@ -641,6 +641,20 @@ if (typeof window !== 'undefined' && window.AAS_EPD) {
       window.AAS_EPD?.pairingResponse(ok);
     })();
   });
+
+  // 窗口隐藏（缩托盘）时主动复位扫描 / 一键重连态（修复 E18 渲染层一致性）：
+  // 主进程已在窗口 close/closed/导航时兜底解析挂起的 native 蓝牙请求（见 main.cjs
+  // resolvePendingBleRequests），但那条路径直接在主进程调 callback('')，不会回传 epd:ble-select，
+  // 渲染层 store 的 scanning/quickConnecting/scanDevices 会被原样保留（下次 openScan 被
+  // `if (scanning) return` 吞掉而打不开扫描）。这里在 document 转入隐藏时复位渲染态，
+  // 与主进程释放保持两端一致；closeScan/cancelQuickReconnect 再发一次 select('') 对主进程幂等
+  // （epd:ble-select 见 !bluetoothRequest 即 return）。
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState !== 'hidden') return;
+    const st = useEpaperStore.getState();
+    if (st.scanning) st.closeScan();
+    if (st.quickConnecting) st.cancelQuickReconnect();
+  });
 }
 
 // ===== 启动回灌：主进程 gui-settings.json → store =====

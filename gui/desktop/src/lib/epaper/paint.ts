@@ -18,7 +18,10 @@ type LineSegment =
   | { type: 'line'; x1: number; y1: number; x2: number; y2: number; color: string; size: number };
 
 interface CanvasState {
-  imageData: ImageData;
+  // 整张位图快照：仅"全量"步保留（空白基线/抖动烘焙/旋转等无法由笔迹重建的画面）。
+  // 笔迹/文字这类"增量"步不存位图（imageData 为 undefined），靠回放 lineSegments/textElements 重建，
+  // 从而省掉大画布下每存一次的整张 getImageData 同步分配（逐笔卡顿根因）。
+  imageData?: ImageData;
   textElements: TextElement[];
   lineSegments: LineSegment[];
 }
@@ -64,8 +67,13 @@ export class PaintManager {
   private historyStack: CanvasState[] = [];
   private historyStep = -1;
   private readonly MAX_HISTORY = 50;
-  // 历史快照总字节上限（约 64MB），大画布下据此动态下调实际步数，避免内存膨胀
+  // 历史快照总字节上限（约 64MB），据此淘汰最旧全量快照，避免大画布满栈位图常驻撑爆内存
   private readonly MAX_HISTORY_BYTES = 64 * 1024 * 1024;
+  // 增量步连续累计到该步数时强制补一张全量位图基线，原因有二：
+  //   1) 撤销到很旧的增量步时回放笔迹数有上限，避免一次重建画太多线段；
+  //   2) 让全量基线均匀散布在栈中，淘汰最旧步时不会因唯一基线被删而整栈坍塌（撤销深度骤降）。
+  // 取 16：单张位图基线最坏占 ~2.6MB，预算 64MB 仍可容纳约 24 张基线，远超常见撤销深度。
+  private readonly REBASELINE_INTERVAL = 16;
 
   constructor(canvas: HTMLCanvasElement, ctx: CanvasRenderingContext2D, host: PaintHost) {
     this.canvas = canvas;
@@ -84,20 +92,53 @@ export class PaintManager {
     this.hideBrushCursor = this.hideBrushCursor.bind(this);
   }
 
-  // 大画布（1360×480≈2.6MB / 960×640≈2.4MB）下每次保存都会做一次整张 getImageData，
-  // 这是同步操作、跑在主线程；连续描边时每个 endPaint 都触发一次，逐笔会有可感知卡顿。
-  // 为降低"每存成本"：允许调用方把已经持有、不会再被改写的整张 ImageData 直接传进来复用，
-  // 省掉一次重复的 getImageData——例如 convertDithering 写回画布后本就持有最终像素副本，
-  // 不必让 saveToHistory 再读一遍同样大小的整张位图。未传入时仍按需 getImageData。
-  // 调用约定：传入的 snapshot 必须是调用方拥有、之后不会再 mutate/transfer 其 buffer 的副本，
-  //          否则历史快照会被破坏（故不要把会转移到 worker 的 buffer 直接传进来）。
-  // 注：单步内存仍受 MAX_HISTORY_BYTES 字节预算约束，见下方淘汰逻辑。
-  saveToHistory(snapshot?: ImageData) {
+  // 历史保存分两种"步"，对应审计 E16 列出的两个独立危害：
+  //
+  // 1) 内存膨胀（已修）：满栈整张位图 ~124MB 常驻 → 由下方 MAX_HISTORY_BYTES 字节预算淘汰收敛。
+  //
+  // 2) 逐笔卡顿（本次补全）：大画布（1360×480≈2.6MB / 960×640≈2.4MB）下每存一步都做一次整张
+  //    getImageData——这是跑在主线程的同步操作 + 一次大数组分配；连续描边时每个 endPaint 都触发，
+  //    用户逐笔可感知卡顿，且字节预算只削减"保留的栈"、对"每存的同步分配成本"零作用。
+  //    本质修复（采纳审计建议"改存增量，lineSegments/textElements 可重建"）：
+  //      - 仅"追加型"改动（endPaint 描边追加 lineSegments / placeText 追加 textElements）存为"增量"步
+  //        （显式传 reconstructable=true），完全不调用 getImageData、不分配整张位图，彻底消除大画布逐笔
+  //        的主线程像素拷贝成本；增量步回放时按基线时的数组长度切片只补"新增"部分（见 restoreFromHistory）。
+  //      - 画面无法由笔迹重建时（空白基线 / 抖动烘焙 / 旋转后的烘焙位图），以及"就地修改"型改动
+  //        （dragText 改写已存在文字的 x/y，非追加，切片回放无法体现位移）存"全量"位图快照（默认）。
+  //    撤销/重做时增量步从其前方最近的全量位图回放新增笔迹重建，恢复结果与原整张快照一致。
+  //
+  // 参数：
+  //   reconstructable=false（默认）→ 全量步，存整张位图。默认保守取全量，是为了让外部调用方
+  //                                 （Epaper.tsx 的 convertDithering 抖动烘焙 / rotate 旋转 / clearCanvas
+  //                                 清屏）无需改动即保持正确语义——这些画面都无法由笔迹重建，必须全量。
+  //   reconstructable=true        → 增量步，不存位图。仅本类内部可由笔迹/文字完整重建的保存点显式传入
+  //                                 （endPaint 描边 / placeText 放字），以消除大画布逐笔 getImageData 卡顿。
+  //   snapshot                    → 仅全量步生效：调用方若已持有最终像素副本可传入复用，省掉一次
+  //                                 重复 getImageData（如 convertDithering 写回画布后本就持有副本）。
+  //                                 约定：传入的 snapshot 必须是调用方拥有、之后不会再 mutate/transfer
+  //                                 其 buffer 的副本，否则历史快照会被破坏（勿传将转移到 worker 的 buffer）。
+  saveToHistory(snapshot?: ImageData, reconstructable: boolean = false) {
     // 撤销后再绘制时丢弃后续历史
     this.historyStack = this.historyStack.slice(0, this.historyStep + 1);
 
+    // 统计自最近一张全量位图以来已累计的连续增量步数；同时判断是否存在可作回放基线的全量位图。
+    let incrementalRun = 0;
+    let hasBaseline = false;
+    for (let i = this.historyStep; i >= 0; i--) {
+      if (this.historyStack[i].imageData != null) { hasBaseline = true; break; }
+      incrementalRun++;
+    }
+
+    // 决定本步存全量还是增量：
+    //   - 调用方声明不可重建（抖动/旋转等烘焙画面）→ 必存全量；
+    //   - 尚无任何基线（理论上 attach() 已铺，此处为防御）→ 必存全量保证可恢复；
+    //   - 连续增量步达到 REBASELINE_INTERVAL → 补一张全量基线（见常量说明），其余情况存增量。
+    const storeFull = !reconstructable || !hasBaseline || incrementalRun >= this.REBASELINE_INTERVAL;
+
     const canvasState: CanvasState = {
-      imageData: snapshot ?? this.ctx.getImageData(0, 0, this.canvas.width, this.canvas.height),
+      imageData: storeFull
+        ? (snapshot ?? this.ctx.getImageData(0, 0, this.canvas.width, this.canvas.height))
+        : undefined,
       textElements: JSON.parse(JSON.stringify(this.textElements)),
       lineSegments: JSON.parse(JSON.stringify(this.lineSegments)),
     };
@@ -105,19 +146,42 @@ export class PaintManager {
     this.historyStack.push(canvasState);
     this.historyStep++;
 
-    // 单张快照字节数 = w*h*4，据总字节预算动态算出本尺寸下允许的步数
-    const bytesPerSnapshot = this.canvas.width * this.canvas.height * 4;
-    const dynamicMax = bytesPerSnapshot > 0
-      ? Math.max(1, Math.min(this.MAX_HISTORY, Math.floor(this.MAX_HISTORY_BYTES / bytesPerSnapshot)))
-      : this.MAX_HISTORY;
+    this.enforceHistoryBudget();
+    this.notifyHistoryChange();
+  }
 
-    // 超出动态上限则淘汰最旧快照（可能一次淘汰多张）
-    while (this.historyStack.length > dynamicMax) {
+  // 淘汰最旧历史以同时满足两条约束（对应 E16 的两个危害维度）：
+  //   ① 内存：只有"全量"步持有整张位图，按实际保留的位图总字节数 ≤ MAX_HISTORY_BYTES 收敛，
+  //      避免大画布满栈整张快照常驻撑爆 renderer 内存（增量步几乎不占内存，不计入预算）；
+  //   ② 步数：总步数 ≤ MAX_HISTORY，保持撤销深度上限语义与原一致。
+  // 与旧版"按单张字节数推算固定步数上限"相比，这里按真实位图字节计：增量步多时撤销深度不再被
+  // 误压到 ~24 步，仍严守 64MB 内存红线。
+  private enforceHistoryBudget() {
+    const retainedBytes = () => this.historyStack.reduce(
+      (sum, s) => sum + (s.imageData ? s.imageData.data.byteLength : 0),
+      0,
+    );
+
+    // 超出步数上限或位图字节预算时，从最旧端淘汰（一次可能淘汰多步）
+    while (
+      this.historyStack.length > 0 &&
+      (this.historyStack.length > this.MAX_HISTORY || retainedBytes() > this.MAX_HISTORY_BYTES)
+    ) {
       this.historyStack.shift();
       this.historyStep--;
+
+      // 淘汰一个全量步后，紧随其后的"增量"步会失去回放基线（无法再重建），一并丢弃，
+      // 保证栈底始终是一个可作基线的全量位图，避免撤销到无基线的步导致画面错乱。
+      while (this.historyStack.length > 0 && this.historyStack[0].imageData == null) {
+        this.historyStack.shift();
+        this.historyStep--;
+      }
     }
 
-    this.notifyHistoryChange();
+    if (this.historyStep < 0 && this.historyStack.length > 0) {
+      // 边界保护：步指针被淘汰到负值但栈非空时，归位到栈底
+      this.historyStep = 0;
+    }
   }
 
   clearHistory() {
@@ -143,11 +207,58 @@ export class PaintManager {
   private restoreFromHistory() {
     if (this.historyStep >= 0 && this.historyStep < this.historyStack.length) {
       const state = this.historyStack[this.historyStep];
-      this.ctx.putImageData(state.imageData, 0, 0);
       this.textElements = JSON.parse(JSON.stringify(state.textElements));
       this.lineSegments = JSON.parse(JSON.stringify(state.lineSegments));
+
+      if (state.imageData != null) {
+        // 全量步：直接回放整张位图（与原行为一致）
+        this.ctx.putImageData(state.imageData, 0, 0);
+      } else {
+        // 增量步：向前找最近的全量位图作基线 putImageData，再回放该基线之后新增的笔迹/文字重建画面。
+        // 只回放"新增"部分（基线已把更早的笔迹烘焙进位图，重复回放会双画），故按基线时的数组长度切片。
+        let baseIdx = this.historyStep;
+        while (baseIdx >= 0 && this.historyStack[baseIdx].imageData == null) baseIdx--;
+
+        const base = baseIdx >= 0 ? this.historyStack[baseIdx] : null;
+        if (base?.imageData != null) {
+          this.ctx.putImageData(base.imageData, 0, 0);
+        }
+        const baseLineCount = base ? base.lineSegments.length : 0;
+        const baseTextCount = base ? base.textElements.length : 0;
+        this.replaySegments(state.lineSegments.slice(baseLineCount));
+        this.replayTextElements(state.textElements.slice(baseTextCount));
+      }
+
       this.notifyHistoryChange();
     }
+  }
+
+  // 回放指定笔迹（增量步重建用）。与 redrawLineSegments 逻辑一致，但只画传入的子集。
+  private replaySegments(segments: LineSegment[]) {
+    segments.forEach(segment => {
+      this.ctx.lineJoin = 'round';
+      this.ctx.lineCap = 'round';
+      this.ctx.strokeStyle = segment.color;
+      this.ctx.lineWidth = segment.size;
+      this.ctx.beginPath();
+      if (segment.type === 'dot') {
+        this.ctx.moveTo(segment.x, segment.y);
+        this.ctx.lineTo(segment.x + 0.1, segment.y + 0.1);
+      } else {
+        this.ctx.moveTo(segment.x1, segment.y1);
+        this.ctx.lineTo(segment.x2, segment.y2);
+      }
+      this.ctx.stroke();
+    });
+  }
+
+  // 回放指定文字（增量步重建用）。与 redrawTextElements 逻辑一致，但只画传入的子集。
+  private replayTextElements(items: TextElement[]) {
+    items.forEach(item => {
+      this.ctx.font = item.font;
+      this.ctx.fillStyle = item.color;
+      this.ctx.fillText(item.text, item.x, item.y);
+    });
   }
 
   private notifyHistoryChange() {
@@ -179,8 +290,8 @@ export class PaintManager {
 
     this.createBrushCursor();
 
-    // 以空白画布初始化历史
-    this.saveToHistory();
+    // 以空白画布初始化历史：基线无法由笔迹重建，必须存为全量位图快照（后续增量步的回放基线）
+    this.saveToHistory(undefined, false);
   }
 
   // 解绑全部事件并移除画笔光标（组件卸载时调用）
@@ -348,8 +459,15 @@ export class PaintManager {
   }
 
   private endPaint() {
-    if (this.painting || this.isDraggingText) {
-      this.saveToHistory();
+    if (this.painting) {
+      // 描边结束：lineSegments 仅追加（append-only），增量步回放 slice(baseLineCount) 的新增笔迹即可
+      // 完整重建，故存增量步，不做整张 getImageData —— 这是消除大画布逐笔卡顿的关键路径。
+      this.saveToHistory(undefined, true);
+    } else if (this.isDraggingText) {
+      // 文字拖动结束：dragText 是就地改写已存在文字的 x/y（非追加），增量步回放只画 slice(baseTextCount)
+      // 的"新增"文字，无法体现这次就地位移；若该文字已被先前的全量基线烘焙在旧位置，撤销/重做会丢失
+      // 拖动结果（审计 E16 上一轮重构引入的回归）。故文字拖动后存全量快照，与原整张快照语义一致。
+      this.saveToHistory(undefined, false);
     }
     this.painting = false;
     this.isDraggingText = false;
@@ -567,7 +685,8 @@ export class PaintManager {
     this.ctx.fillStyle = newText.color;
     this.ctx.fillText(newText.text, newText.x, newText.y);
 
-    this.saveToHistory();
+    // 放置文字后的画面可由 textElements 完整重建，存增量步，不做整张 getImageData
+    this.saveToHistory(undefined, true);
 
     this.host.onTextPlaced();
     this.isTextPlacementMode = false;

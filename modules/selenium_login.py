@@ -499,7 +499,10 @@ class SeleniumLoginController:
                 # 尝试清理资源
                 if hasattr(self, 'driver') and self.driver:
                     try:
-                        self.driver.quit()
+                        # [M54] 启动失败清理路径的 quit() 同样是阻塞 WebDriver 命令：driver 半死/会话挂死时
+                        # 会撞上 45s 命令超时而冻结事件循环（恰是登录页不可达等最需远程可控的失败场景），
+                        # 故与主流程一致放线程执行，避免清理动作本身把 Telegram/调度/并行打卡拖停。
+                        await self._run_blocking(self.driver.quit)
                     except:
                         pass
                     self.driver = None
