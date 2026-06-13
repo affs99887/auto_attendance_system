@@ -32,7 +32,8 @@ export function StartupOverlay() {
   }, [logLines.length, follow]);
 
   if (status === 'ready') return null;
-  if (status === 'starting' && overlayDismissed) return null;
+  // starting/failed 两态均尊重用户手动关闭（ready 上面已 return）：失败态点"我知道了"也能收起覆盖层
+  if (overlayDismissed && status !== 'ready') return null;
 
   const failed = status === 'failed';
   const tone = failed ? 'danger' : 'accent';

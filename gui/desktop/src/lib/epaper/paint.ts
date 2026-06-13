@@ -64,6 +64,8 @@ export class PaintManager {
   private historyStack: CanvasState[] = [];
   private historyStep = -1;
   private readonly MAX_HISTORY = 50;
+  // 历史快照总字节上限（约 64MB），大画布下据此动态下调实际步数，避免内存膨胀
+  private readonly MAX_HISTORY_BYTES = 64 * 1024 * 1024;
 
   constructor(canvas: HTMLCanvasElement, ctx: CanvasRenderingContext2D, host: PaintHost) {
     this.canvas = canvas;
@@ -95,7 +97,14 @@ export class PaintManager {
     this.historyStack.push(canvasState);
     this.historyStep++;
 
-    if (this.historyStack.length > this.MAX_HISTORY) {
+    // 单张快照字节数 = w*h*4，据总字节预算动态算出本尺寸下允许的步数
+    const bytesPerSnapshot = this.canvas.width * this.canvas.height * 4;
+    const dynamicMax = bytesPerSnapshot > 0
+      ? Math.max(1, Math.min(this.MAX_HISTORY, Math.floor(this.MAX_HISTORY_BYTES / bytesPerSnapshot)))
+      : this.MAX_HISTORY;
+
+    // 超出动态上限则淘汰最旧快照（可能一次淘汰多张）
+    while (this.historyStack.length > dynamicMax) {
       this.historyStack.shift();
       this.historyStep--;
     }
@@ -184,13 +193,22 @@ export class PaintManager {
   }
 
   private handleKeyboard(e: KeyboardEvent) {
+    // 焦点在文本输入控件时不拦截，避免破坏原生撤销/重做与文本编辑
+    const t = e.target as HTMLElement | null;
+    if (t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.isContentEditable)) {
+      return;
+    }
+
+    // 按住 Shift 时 e.key 上报为大写，统一转小写比较
+    const k = e.key.toLowerCase();
+
     // Ctrl+Z or Cmd+Z for undo
-    if ((e.ctrlKey || e.metaKey) && e.key === 'z' && !e.shiftKey) {
+    if ((e.ctrlKey || e.metaKey) && k === 'z' && !e.shiftKey) {
       e.preventDefault();
       this.undo();
     }
     // Ctrl+Y or Ctrl+Shift+Z or Cmd+Shift+Z for redo
-    else if ((e.ctrlKey || e.metaKey) && (e.key === 'y' || (e.shiftKey && e.key === 'z'))) {
+    else if ((e.ctrlKey || e.metaKey) && (k === 'y' || (e.shiftKey && k === 'z'))) {
       e.preventDefault();
       this.redo();
     }

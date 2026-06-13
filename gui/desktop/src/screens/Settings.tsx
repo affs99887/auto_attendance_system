@@ -50,8 +50,14 @@ function Section({ title, sub, icon, children }: SectionProps) {
   );
 }
 
-function Toggle({ on, onChange }: { on: boolean; onChange: (v: boolean) => void }) {
-  return <div className={`toggle ${on ? 'on' : ''}`} onClick={() => onChange(!on)} />;
+function Toggle({ on, onChange, disabled }: { on: boolean; onChange: (v: boolean) => void; disabled?: boolean }) {
+  return (
+    <div
+      className={`toggle ${on ? 'on' : ''}${disabled ? ' disabled' : ''}`}
+      style={disabled ? { opacity: 0.5, cursor: 'not-allowed' } : undefined}
+      onClick={() => { if (!disabled) onChange(!on); }}
+    />
+  );
 }
 
 type TabKey =
@@ -189,11 +195,20 @@ export function SettingsScreen() {
   const earlyThr = fieldVal('EARLY_LEAVE_THRESHOLD', String(snapshot?.config?.early_leave_threshold ?? '15'));
   const dailyStatus = fieldVal('DAILY_STATUS_TIME', snapshot?.config?.daily_status_time ?? '08:20');
 
-  // 本地行为开关（仅 UI，dynamic_config schema 暂未扩展）
-  const [reminder, setReminder] = React.useState(true);
-  const [autoByebye, setAutoByebye] = React.useState(true);
-  const [parallelLogin, setParallelLogin] = React.useState(true);
-  const [virtualMouse, setVirtualMouse] = React.useState(true);
+  // 本地行为开关（仅 UI 展示，dynamic_config schema 暂未扩展 → 不接后端，禁用控件避免误导）
+  const [reminder] = React.useState(true);
+  const [autoByebye] = React.useState(true);
+  const [parallelLogin] = React.useState(true);
+  const [virtualMouse] = React.useState(true);
+
+  // 当前主题（从 AAS_THEME 取真实值，使高亮态与实际主题一致；AAS_THEME 接口仅支持 light/dark）
+  const [theme, setThemeLocal] = React.useState<'light' | 'dark'>(
+    () => window.AAS_THEME?.get().theme ?? 'light',
+  );
+  const handleTheme = (t: 'light' | 'dark') => {
+    window.AAS_THEME?.setTheme(t);
+    setThemeLocal(t);
+  };
 
   return (
     <div className="col gap-4">
@@ -238,31 +253,27 @@ export function SettingsScreen() {
 
       {tab === 'general' && (
         <div className="grid grid-2">
-          <Section title="行为开关" sub="dynamic_config.json 实时生效" icon="Zap">
+          <Section title="行为开关" sub="暂未生效（展示用）· 行为由 .env / 代码常量控制" icon="Zap">
             {[
               {
                 t: '每日 8:15 提醒',
                 d: '向 Telegram 推送当日提醒，可一键 /auto_byebye',
                 v: reminder,
-                set: setReminder,
               },
               {
                 t: '自动下班调度',
                 d: '上班后按 8h15m + 随机延迟自动安排下班',
                 v: autoByebye,
-                set: setAutoByebye,
               },
               {
                 t: '并行登录',
                 d: '多账户 Selenium 模式下并发执行打卡 (最大 3)',
                 v: parallelLogin,
-                set: setParallelLogin,
               },
               {
                 t: '虚拟鼠标点击',
                 d: 'win32 PostMessage 模拟点击，避免抢占焦点',
                 v: virtualMouse,
-                set: setVirtualMouse,
               },
             ].map((r, i) => (
               <div className="toggle-row" key={i}>
@@ -270,7 +281,8 @@ export function SettingsScreen() {
                   <div className="toggle-row-title">{r.t}</div>
                   <div className="toggle-row-desc">{r.d}</div>
                 </div>
-                <Toggle on={r.v} onChange={r.set} />
+                {/* dynamic_config schema 暂未扩展，禁用以免误导用户以为已关闭自动下班等真实行为 */}
+                <Toggle on={r.v} onChange={() => { /* 展示用，未接后端 */ }} disabled />
               </div>
             ))}
             <div className="divider" />
@@ -285,16 +297,16 @@ export function SettingsScreen() {
             <div className="field">
               <div className="field-label">主题</div>
               <div className="row gap-2">
-                {['浅色', '深色', '跟随系统'].map((t, i) => (
+                {([
+                  { l: '浅色', v: 'light' },
+                  { l: '深色', v: 'dark' },
+                ] as { l: string; v: 'light' | 'dark' }[]).map(t => (
                   <button
-                    key={t}
-                    className={`btn btn-sm ${i === 0 ? 'btn-primary' : ''}`}
-                    onClick={() => {
-                      const map = ['light', 'dark', 'light'] as const;
-                      window.AAS_THEME?.setTheme(map[i]);
-                    }}
+                    key={t.v}
+                    className={`btn btn-sm ${theme === t.v ? 'btn-primary' : ''}`}
+                    onClick={() => handleTheme(t.v)}
                   >
-                    {t}
+                    {t.l}
                   </button>
                 ))}
               </div>

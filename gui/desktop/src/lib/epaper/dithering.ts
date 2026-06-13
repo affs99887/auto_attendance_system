@@ -86,15 +86,29 @@ function labDistance(lab1: { l: number; a: number; b: number }, lab2: { l: numbe
   return Math.sqrt(0.2 * dl * dl + 3 * da * da + 3 * db * db);
 }
 
+// 调色板固定不变，其 Lab 值只需算一次：预计算并缓存，避免在 findClosestColor 里
+// 对每个像素都重复对整张调色板现算 rgbToLab（含多次 Math.pow），是大画布抖动的主要开销之一。
+interface LabPaletteColor extends PaletteColor {
+  lab: { l: number; a: number; b: number };
+}
+
+function buildLabPalette(palette: PaletteColor[]): LabPaletteColor[] {
+  return palette.map(c => ({ ...c, lab: rgbToLab(c.r, c.g, c.b) }));
+}
+
+const rgbPaletteLab: LabPaletteColor[] = buildLabPalette(rgbPalette);
+const fourColorPaletteLab: LabPaletteColor[] = buildLabPalette(fourColorPalette);
+const threeColorPaletteLab: LabPaletteColor[] = buildLabPalette(threeColorPalette);
+
 function findClosestColor(r: number, g: number, b: number, mode: DitherMode): PaletteColor {
-  let palette: PaletteColor[];
+  let palette: LabPaletteColor[];
 
   if (mode === 'fourColor') {
-    palette = fourColorPalette;
+    palette = fourColorPaletteLab;
   } else if (mode === 'threeColor') {
-    palette = threeColorPalette;
+    palette = threeColorPaletteLab;
   } else {
-    palette = rgbPalette;
+    palette = rgbPaletteLab;
   }
 
   // 蓝色特殊情况（仅限非三色、四色模式）
@@ -115,11 +129,10 @@ function findClosestColor(r: number, g: number, b: number, mode: DitherMode): Pa
 
   const inputLab = rgbToLab(r, g, b);
   let minDistance = Infinity;
-  let closestColor = palette[0];
+  let closestColor: PaletteColor = palette[0];
 
   for (const color of palette) {
-    const colorLab = rgbToLab(color.r, color.g, color.b);
-    const distance = labDistance(inputLab, colorLab);
+    const distance = labDistance(inputLab, color.lab); // 复用预计算的调色板 Lab
     if (distance < minDistance) {
       minDistance = distance;
       closestColor = color;

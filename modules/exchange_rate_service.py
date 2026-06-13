@@ -183,9 +183,14 @@ def refresh(range_=None):
     返回最新契约 dict；失败时返回回退后的旧缓存契约（彻底无数据则 latest:null、points:[]）。
     """
     range_ = _normalize_range(range_)
+
+    # 网络请求挪到锁外执行：_fetch_from_yahoo 只做网络拉取+解析，不触碰共享缓存，
+    # 因此最长 ~20s 的慢网络不会持锁阻塞 get_exchange_rate 的 TTL 快速读路径，
+    # 避免 waitress 工作线程被一并卡死（M66）。
+    latest, points = _fetch_from_yahoo(range_)
+
     with _lock:
         cache = _load_cache()
-        latest, points = _fetch_from_yahoo(range_)
 
         if latest is None and not points:
             # 本次彻底失败：回退旧缓存

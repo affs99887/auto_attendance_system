@@ -20,6 +20,7 @@ export class CropManager {
   private lastPanX = 0;
   private lastPanY = 0;
   private lastTouchDistance = 0;
+  private bgUrl: string | null = null; // 背景图 ObjectURL，退出裁剪时需 revoke 防泄漏
 
   constructor(canvas: HTMLCanvasElement, ctx: CanvasRenderingContext2D, host: CropHost) {
     this.canvas = canvas;
@@ -54,6 +55,11 @@ export class CropManager {
       this.host.onCropModeChange(false);
       this.host.setCanvasTitle('');
     }
+    // 释放背景图 ObjectURL 后再清空 style，避免反复换图累积内存
+    if (this.bgUrl) {
+      URL.revokeObjectURL(this.bgUrl);
+      this.bgUrl = null;
+    }
     this.canvas.style.backgroundImage = '';
     this.canvas.style.cursor = 'default';
 
@@ -83,7 +89,8 @@ export class CropManager {
     this.exitCropMode();
     this.resetStates();
 
-    this.canvas.style.backgroundImage = `url(${URL.createObjectURL(imageFile)})`;
+    this.bgUrl = URL.createObjectURL(imageFile);
+    this.canvas.style.backgroundImage = `url(${this.bgUrl})`;
     this.canvas.style.backgroundSize = '100%';
     this.canvas.style.backgroundPosition = '';
     this.canvas.style.backgroundRepeat = 'no-repeat';

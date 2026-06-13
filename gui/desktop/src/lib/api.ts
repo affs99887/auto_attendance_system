@@ -154,7 +154,12 @@ export interface ApiOptions {
   method?: 'GET' | 'POST' | 'PUT' | 'PATCH' | 'DELETE';
   body?: unknown;
   signal?: AbortSignal;
+  /** 单次请求超时（毫秒）；不传走默认 DEFAULT_TIMEOUT_MS，防 fetch 永久挂起卡死 UI */
+  timeoutMs?: number;
 }
+
+// 默认请求超时：防半死后端 accept 后不响应导致 fetch 永久 pending（loading/busy 永不复位）
+const DEFAULT_TIMEOUT_MS = 15_000;
 
 export class ApiError extends Error {
   status: number;
@@ -173,12 +178,28 @@ async function request<T>(path: string, opts: ApiOptions = {}): Promise<T> {
   if (token) headers.Authorization = `Bearer ${token}`;
   if (opts.body !== undefined) headers['Content-Type'] = 'application/json';
 
-  const resp = await fetch(url, {
-    method: opts.method ?? 'GET',
-    headers,
-    body: opts.body !== undefined ? JSON.stringify(opts.body) : undefined,
-    signal: opts.signal,
-  });
+  // 默认超时 signal；若调用方自带 signal 则用 AbortSignal.any 合并（任一触发即中止）
+  const timeoutSignal = AbortSignal.timeout(opts.timeoutMs ?? DEFAULT_TIMEOUT_MS);
+  const signal = opts.signal ? AbortSignal.any([opts.signal, timeoutSignal]) : timeoutSignal;
+
+  let resp: Response;
+  try {
+    resp = await fetch(url, {
+      method: opts.method ?? 'GET',
+      headers,
+      body: opts.body !== undefined ? JSON.stringify(opts.body) : undefined,
+      signal,
+    });
+  } catch (e) {
+    // 超时/主动取消归一化为 ApiError（status=0），让 loading/busy 能正常复位
+    if (e instanceof DOMException && e.name === 'TimeoutError') {
+      throw new ApiError(0, null, 'timeout');
+    }
+    if (e instanceof DOMException && e.name === 'AbortError') {
+      throw new ApiError(0, null, 'aborted');
+    }
+    throw e; // 其余网络错误（断网/连接拒绝）保持原样抛出
+  }
 
   const contentType = resp.headers.get('content-type') ?? '';
   const payload: unknown = contentType.includes('application/json')

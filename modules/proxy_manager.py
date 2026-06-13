@@ -163,6 +163,11 @@ class ProxyManager:
         self.proc = None
         self._job = None  # Windows Job Object 句柄（KILL_ON_JOB_CLOSE）；非 Windows/降级时为 None
         self._last_traffic = None  # (ts, up_total, down_total)
+        # [M26] 启动即把存量 local 正文迁出 dynamic_config.json（幂等；失败不致命，不阻断构造）
+        try:
+            self._migrate_local_content_out()
+        except Exception:
+            logger.warning('迁出本地代理配置正文失败（忽略，不影响运行）', exc_info=True)
 
     # ------------------------------------------------------------------ 路径
     def _bin_dir(self):
@@ -188,6 +193,49 @@ class ProxyManager:
 
     def _profile_cache_path(self, profile_id):
         return os.path.join(self._profiles_dir(), f'{profile_id}.yaml')
+
+    # ------------------------------------------------------------------ local 正文落盘
+    # [M26] local profile 正文（用户粘贴的整份 Clash 配置，常达数百 KB）只存 profiles/<id>.yaml，
+    # 绝不再写进 dynamic_config.json —— 避免每次切节点/改端口都全量重写约 500KB JSON、放大损坏窗口。
+    def _read_local_content(self, prof):
+        """读取 local profile 正文：优先 profiles/<id>.yaml，缺失则回退内联 content（兼容未迁移的旧数据）。"""
+        pid = prof.get('id') if isinstance(prof, dict) else None
+        if pid:
+            cache = self._profile_cache_path(pid)
+            if os.path.isfile(cache):
+                try:
+                    with open(cache, 'r', encoding='utf-8') as f:
+                        return f.read()
+                except OSError:
+                    logger.warning('读取本地 profile 缓存失败: %s', pid, exc_info=True)
+        return (prof.get('content') if isinstance(prof, dict) else None) or ''
+
+    def _write_local_content(self, profile_id, content):
+        """把 local profile 正文落到 profiles/<id>.yaml。失败记日志不抛（与既有缓存写入风格一致）。"""
+        os.makedirs(self._profiles_dir(), exist_ok=True)
+        try:
+            with open(self._profile_cache_path(profile_id), 'w', encoding='utf-8') as f:
+                f.write(content or '')
+        except OSError:
+            logger.warning('落地本地 profile 失败: %s', profile_id, exc_info=True)
+
+    def _migrate_local_content_out(self):
+        """一次性迁移：把存量 local profile 的内联 content 搬到 profiles/<id>.yaml 并从 JSON 删除，
+        立即把 dynamic_config.json 收缩回 KB 级。幂等：无 content 字段时不写盘。"""
+        profiles, _ = self._get_profiles()
+        changed = False
+        for p in profiles:
+            if not isinstance(p, dict) or p.get('type') != 'local':
+                continue
+            content = p.get('content')
+            if content:  # 仅当 JSON 里仍带正文时才搬迁
+                self._write_local_content(p['id'], content)
+            if 'content' in p:
+                p.pop('content', None)
+                changed = True
+        if changed:
+            config.set_proxy_config({'profiles': profiles})
+            logger.info('已将本地代理配置正文迁出 dynamic_config.json（仅保留元数据）')
 
     def _pid_path(self):
         return os.path.join(self.runtime_dir, 'mihomo.pid')
@@ -390,14 +438,8 @@ class ProxyManager:
             raise RuntimeError('尚未配置任何代理订阅/配置文件')
 
         if prof.get('type') == 'local':
-            # 把 content 落到 profiles/<id>.yaml 再解析（数据源持久来自 profile.content）
-            os.makedirs(self._profiles_dir(), exist_ok=True)
-            content = prof.get('content') or ''
-            try:
-                with open(self._profile_cache_path(prof['id']), 'w', encoding='utf-8') as f:
-                    f.write(content)
-            except OSError:
-                logger.warning('落地本地 profile 失败: %s', prof.get('id'), exc_info=True)
+            # [M26] 数据源持久来自 profiles/<id>.yaml（不再依赖 JSON 内联 content）
+            content = self._read_local_content(prof)
             text, group = self._build_config_from_text(cfg, content)
             if group != cfg.get('group'):
                 cfg = config.set_proxy_config({'group': group})
@@ -408,6 +450,26 @@ class ProxyManager:
         return cfg
 
     # ------------------------------------------------------------------ 进程
+    def _pid_is_mihomo(self, pid):
+        """[M59] 杀前校验：确认该 PID 当前进程映像确实是 mihomo（防 Windows PID 复用误杀无辜进程树）。
+        无法判定时保守返回 False（宁可漏杀也不误杀）。"""
+        exe = 'mihomo.exe' if os.name == 'nt' else 'mihomo'
+        try:
+            if os.name == 'nt':
+                # tasklist 输出 CSV；首列为 ImageName。无该 PID 时输出 "INFO: No tasks..."（不含进程名）
+                out = subprocess.run(
+                    ['tasklist', '/FI', f'PID eq {pid}', '/FO', 'CSV', '/NH'],
+                    capture_output=True, timeout=8,
+                )
+                text = (out.stdout or b'').decode('utf-8', errors='replace').lower()
+                return exe.lower() in text
+            else:
+                # 用 /proc/<pid>/comm 读进程名（comm 可能被截断，故用 startswith 容错）
+                with open(f'/proc/{pid}/comm', 'r') as f:
+                    return f.read().strip().startswith(exe)
+        except Exception:
+            return False
+
     def _kill_orphan(self):
         """按 pid 文件清理上一次遗留的 mihomo（watchdog 重启等场景）。"""
         pid_file = self._pid_path()
@@ -418,7 +480,9 @@ class ProxyManager:
                 pid = int((f.read() or '').strip())
         except Exception:
             pid = 0
-        if pid > 0:
+        # [M59] 仅当该 PID 当前确实是 mihomo 时才强杀（taskkill /T /F 会连带杀子树，
+        # PID 复用下盲杀会误伤用户浏览器/IDE/系统进程）；不匹配则只删陈旧 pidfile。
+        if pid > 0 and self._pid_is_mihomo(pid):
             try:
                 if os.name == 'nt':
                     subprocess.run(['taskkill', '/PID', str(pid), '/T', '/F'],
@@ -746,7 +810,8 @@ class ProxyManager:
                 return False, None, '本地配置需提供名称'
             if not (content or '').strip():
                 return False, None, '配置内容为空'
-            prof['content'] = content
+            # [M26] 正文只落 profiles/<id>.yaml，JSON 不存 content（仅元数据）
+            self._write_local_content(prof['id'], content)
             prof['node_count'] = self._count_nodes(content)
             prof['updated_at'] = int(time.time())
 
@@ -850,7 +915,9 @@ class ProxyManager:
                 return False, None, '仅本地配置可编辑内容'
             if not content.strip():
                 return False, None, '配置内容为空'
-            prof['content'] = content
+            # [M26] 正文只落 profiles/<id>.yaml，JSON 不再内联 content（避免全量重写约 500KB）
+            self._write_local_content(prof['id'], content)
+            prof.pop('content', None)  # 清掉可能残留的旧内联正文
             prof['node_count'] = self._count_nodes(content)
             prof['updated_at'] = int(time.time())
         config.set_proxy_config({'profiles': profiles})
@@ -869,7 +936,8 @@ class ProxyManager:
         if prof is None:
             return ''
         if prof.get('type') == 'local':
-            return prof.get('content') or ''
+            # [M26] 正文从 profiles/<id>.yaml 读，回退内联 content（兼容未迁移旧数据）
+            return self._read_local_content(prof)
         # subscription：优先缓存，缺失则抓取并落盘
         cache = self._profile_cache_path(profile_id)
         if os.path.isfile(cache):

@@ -106,7 +106,14 @@ class AsyncioBridge:
 
     def call(self, coro, timeout: float = 15.0):
         fut = asyncio.run_coroutine_threadsafe(coro, self._loop)
-        return fut.result(timeout=timeout)
+        try:
+            return fut.result(timeout=timeout)
+        except FuturesTimeoutError:
+            # 超时后必须取消 future，否则协程仍排在（可能被同步 Selenium 阻塞的）事件
+            # 循环里等待执行：HTTP 已报错返回，几分钟后循环解锁却仍会真正打卡，
+            # 形成用户不知情的"幽灵打卡"。打卡类不可幂等操作尤其需要在此切断。
+            fut.cancel()
+            raise
 
 
 # ----------------------------------------------------------------------------
@@ -274,31 +281,63 @@ def _tail_file(path: str, n: int):
     return out
 
 
+def _decode_log_line(raw: bytes) -> str:
+    """把一行原始日志字节按多编码尝试解码（兜底 replace）。"""
+    for enc in ('utf-8', 'gbk', 'gb18030', 'latin1'):
+        try:
+            return raw.decode(enc).rstrip('\r\n')
+        except UnicodeDecodeError:
+            continue
+    return raw.decode('utf-8', errors='replace').rstrip('\r\n')
+
+
 async def _log_follower(event_bus: EventBus, stop_event: asyncio.Event):
-    """异步追踪日志文件末尾，新行推送到 ``log:stream`` 通道。"""
-    if not os.path.exists(LOG_FILE):
-        logging.warning("log file not found, follower will idle: %s", LOG_FILE)
-        return
-    try:
-        with open(LOG_FILE, 'rb') as f:
-            f.seek(0, os.SEEK_END)
-            while not stop_event.is_set():
-                line = f.readline()
-                if not line:
-                    await asyncio.sleep(0.5)
-                    continue
-                text = None
-                for enc in ('utf-8', 'gbk', 'gb18030', 'latin1'):
-                    try:
-                        text = line.decode(enc).rstrip('\r\n')
-                        break
-                    except UnicodeDecodeError:
-                        continue
-                if text is None:
-                    text = line.decode('utf-8', errors='replace').rstrip('\r\n')
-                await event_bus.publish('log:stream', {'line': text})
-    except Exception:
-        logging.exception("log follower crashed")
+    """异步追踪日志文件末尾，新行推送到 ``log:stream`` 通道。
+
+    轮询式 tail：每轮短暂 open→seek(offset)→read→close，绝不长期持有文件句柄。
+    原因：Windows 下普通 open 不带 FILE_SHARE_DELETE，长持句柄会让同进程
+    RotatingFileHandler 的 os.rename 轮转抛 PermissionError，导致日志达 5MB 后
+    文件日志永久断流、GUI 日志流随之死掉。
+    - 文件不存在/被删 → 继续等待而非 return；
+    - 文件变小（被轮转/截断）→ offset 归零从头重读，跟上新文件。
+    """
+    offset = 0
+    primed = False  # 首轮只定位到末尾、不回放历史
+    while not stop_event.is_set():
+        try:
+            if not os.path.exists(LOG_FILE):
+                # 文件尚未生成或刚被轮转替换的瞬间：重置游标，等待下一轮
+                offset = 0
+                primed = False
+                await asyncio.sleep(0.5)
+                continue
+
+            size = os.path.getsize(LOG_FILE)
+            if not primed:
+                # 启动时不回放整段历史日志，仅从当前末尾开始跟踪
+                offset = size
+                primed = True
+                await asyncio.sleep(0.5)
+                continue
+
+            if size < offset:
+                # 文件变小：被 RotatingFileHandler 轮转或被清空 → 从头重读新文件
+                offset = 0
+
+            if size == offset:
+                await asyncio.sleep(0.5)
+                continue
+
+            with open(LOG_FILE, 'rb') as f:
+                f.seek(offset)
+                chunk = f.read()
+                offset = f.tell()
+
+            for raw in chunk.splitlines():
+                await event_bus.publish('log:stream', {'line': _decode_log_line(raw)})
+        except Exception:
+            logging.exception("log follower iteration failed")
+            await asyncio.sleep(1.0)
 
 
 # ----------------------------------------------------------------------------
@@ -444,7 +483,21 @@ def _build_flask_app(attendance_system, bridge: AsyncioBridge,
     @app.delete('/api/v1/tasks/<int:task_id>')
     @require_token
     def del_task(task_id):
+        # 删除前先取类型，用于同步取消对应 schedule job（仅删 JSON 记录的话，
+        # 已注册的 job 仍会到点触发一次才靠存在性校验自删，期间可能在错误时间打卡）。
+        task = attendance_system.task_manager.get_task_by_id(task_id)
+        ptype = (task or {}).get('type')
         ok = attendance_system.task_manager.remove_task_by_id(task_id)
+        # 按类型清除对应 tag 的 schedule job：调度器设计上同类至多一个（schedule_punch_in/out
+        # 创建前都会清掉同类旧任务），故按 tag 清除是精确的。schedule 作业运行在主 loop，
+        # 用 call_soon_threadsafe 投递清除，避免与 loop 迭代 jobs 竞态。
+        tag = {'punch_in': 'punch_in_scheduled', 'punch_out': 'punch_out_scheduled'}.get(ptype)
+        if ok and tag:
+            import schedule
+            try:
+                bridge._loop.call_soon_threadsafe(lambda t=tag: schedule.clear(t))
+            except Exception:
+                logging.exception("del_task 取消 schedule job 失败")
         event_bus.publish_threadsafe('task:changed', {'op': 'delete', 'id': task_id})
         return jsonify({'success': bool(ok), 'task_id': task_id})
 
@@ -1308,7 +1361,11 @@ async def start(attendance_system,
     def _serve_http():
         try:
             logging.info("GUI HTTP server listening on 127.0.0.1:%s", http_port)
-            waitress.serve(app, host='127.0.0.1', port=http_port, ident='aas-gui')
+            # threads 默认仅 4：auto_byebye_calc(240s)/fetch_punch_status(180s)/
+            # parallel_login_test(120s)/bot_reconnect(90s) 这类长接口经 bridge.call 同步
+            # 等待主 loop 时会长时间占住工作线程，4 个被占满后连无鉴权的 /ping 都排队无响应，
+            # GUI 端表现为后端整体失联。提到 16 以缓解长接口对短接口（含打卡/状态/ping）的饥饿。
+            waitress.serve(app, host='127.0.0.1', port=http_port, ident='aas-gui', threads=16)
         except Exception:
             logging.exception("waitress server crashed")
 

@@ -131,60 +131,47 @@ class EmailService:
             # 发送邮件
             context = ssl.create_default_context()
             
+            # sent 标志：仅在 send_message 成功返回后置 True。
+            # 只有 sent=True 时，退出 with 块（quit/close 阶段）抛出的异常才视为发送成功；
+            # 若异常发生在建连/SSL握手/login/send_message 之前或之中，sent 仍为 False，必须按失败处理。
+            sent = False
             try:
                 # 尝试SSL连接
-                with smtplib.SMTP_SSL(self.email_smtp_server, self.email_smtp_port, 
+                with smtplib.SMTP_SSL(self.email_smtp_server, self.email_smtp_port,
                                     context=context, timeout=30) as server:
                     server.login(self.email_sender, self.email_password)
                     result = server.send_message(msg)
+                    sent = True
                     self.logger.info(f"邮件发送成功 (SSL): {subject}")
                     # 邮件发送成功，忽略连接关闭时的潜在错误
                     return True
-                    
+
             except Exception as ssl_error:
-                # 检查是否是SMTP服务器正常关闭连接的响应
-                error_str = str(ssl_error)
-                if (
-                    "(-1, b'\\x00\\x00\\x00')" in error_str or
-                    "Connection broken" in error_str or
-                    "Connection closed" in error_str or
-                    "EOF occurred" in error_str or
-                    "success" in error_str.lower() or
-                    "邮件发送成功" in error_str
-                ):
-                    # 这些都是邮件发送成功后的正常连接关闭响应
-                    self.logger.info(f"邮件发送成功 (SSL): {subject}")
+                # 邮件已成功投递，异常仅来自连接关闭阶段（quit/close），视为成功
+                if sent:
+                    self.logger.info(f"邮件发送成功 (SSL，忽略连接关闭异常): {subject}")
                     return True
-                else:
-                    # 真正的发送失败，尝试TLS
-                    self.logger.warning(f"SSL发送失败，尝试TLS: {ssl_error}")
-                
+                # 真正的发送失败（建连/握手/login/send_message 阶段），尝试TLS
+                self.logger.warning(f"SSL发送失败，尝试TLS: {ssl_error}")
+
+                sent = False
                 try:
                     # 尝试TLS连接
                     with smtplib.SMTP(self.email_smtp_server, 587, timeout=30) as server:
                         server.starttls()
                         server.login(self.email_sender, self.email_password)
                         result = server.send_message(msg)
+                        sent = True
                         self.logger.info(f"邮件发送成功 (TLS): {subject}")
                         return True
                 except Exception as tls_error:
-                    # 检查是否是SMTP服务器正常关闭连接的响应
-                    error_str = str(tls_error)
-                    if (
-                        "(-1, b'\\x00\\x00\\x00')" in error_str or
-                        "Connection broken" in error_str or
-                        "Connection closed" in error_str or
-                        "EOF occurred" in error_str or
-                        "success" in error_str.lower() or
-                        "邮件发送成功" in error_str
-                    ):
-                        # 这些都是邮件发送成功后的正常连接关闭响应
-                        self.logger.info(f"邮件发送成功 (TLS): {subject}")
+                    # 邮件已成功投递，异常仅来自连接关闭阶段，视为成功
+                    if sent:
+                        self.logger.info(f"邮件发送成功 (TLS，忽略连接关闭异常): {subject}")
                         return True
-                    else:
-                        # 真正的发送失败
-                        self.logger.error(f"TLS发送也失败: {tls_error}")
-                        return False
+                    # 真正的发送失败
+                    self.logger.error(f"TLS发送也失败: {tls_error}")
+                    return False
                     
         except Exception as e:
             self.logger.error(f"邮件发送失败: {e}")

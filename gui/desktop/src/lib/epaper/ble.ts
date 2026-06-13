@@ -149,6 +149,11 @@ export class EpdBleClient {
     opts: { mtuSize: number; interleavedCount: number; startTime: number; onStatus: (text: string) => void },
   ): Promise<void> {
     const chunkSize = opts.mtuSize - 2;
+    // 防御畸形 MTU：chunkSize<1 时 for 循环步长为 0/负，会死循环卡死 BLE 发送（sendingLock 永久占用），
+    // 直接抛错中断，由上层捕获并解锁，避免应用假死
+    if (!Number.isFinite(chunkSize) || chunkSize < 1) {
+      throw new Error(`MTU 过小或无效 (mtu=${opts.mtuSize})，无法发送图像`);
+    }
     const interleavedCount = opts.interleavedCount;
     const count = Math.round(data.length / chunkSize);
     let chunkIdx = 0;
@@ -161,13 +166,17 @@ export class EpdBleClient {
         (step === 'bw' ? 0x0f : 0x00) | (i === 0 ? 0x00 : 0xf0),
         ...data.slice(i, i + chunkSize),
       ];
+      // 检查每块写入返回值：断连后 epdCharacteristic 被置空或 BLE 写入抛错时 write() 返回 false，
+      // 此处必须抛错中断循环，否则会静默发送残缺图像并误报成功
+      let ok: boolean;
       if (noReplyCount > 0) {
-        await this.write(EpdCmd.WRITE_IMG, payload, false);
+        ok = await this.write(EpdCmd.WRITE_IMG, payload, false);
         noReplyCount--;
       } else {
-        await this.write(EpdCmd.WRITE_IMG, payload, true);
+        ok = await this.write(EpdCmd.WRITE_IMG, payload, true);
         noReplyCount = interleavedCount;
       }
+      if (!ok) throw new Error('图像分块写入失败，连接可能已断开');
       chunkIdx++;
     }
   }
@@ -186,8 +195,14 @@ export class EpdBleClient {
       this.log(msg, '⇓');
       if (msg.startsWith('mtu=') && msg.length > 4) {
         const mtuSize = parseInt(msg.substring(4));
-        this.events.onMtuUpdate(mtuSize);
-        this.log(`MTU 已更新为: ${mtuSize}`);
+        // 校验固件回传的 MTU：必须为有限数且 > 2（chunkSize=mtu-2 需 >= 1），
+        // 否则畸形值会污染 store.mtu 并令 writeImage 卡死/发空块，此处仅记录日志并忽略
+        if (Number.isFinite(mtuSize) && mtuSize > 2) {
+          this.events.onMtuUpdate(mtuSize);
+          this.log(`MTU 已更新为: ${mtuSize}`);
+        } else {
+          this.log(`忽略非法 MTU: ${msg}`);
+        }
       } else if (msg.startsWith('t=') && msg.length > 2) {
         const t = parseInt(msg.substring(2)) + new Date().getTimezoneOffset() * 60;
         this.log(`远端时间: ${new Date(t * 1000).toLocaleString()}`);

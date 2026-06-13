@@ -7,6 +7,11 @@ from logging.handlers import RotatingFileHandler
 import subprocess
 from datetime import datetime
 
+# 看门狗所在目录即项目根目录，所有路径锚定于此，避免依赖启动目录
+PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
+# 本项目主程序绝对路径（归一化后用于进程归属校验）
+MAIN_SCRIPT_PATH = os.path.normcase(os.path.normpath(os.path.join(PROJECT_ROOT, 'main.py')))
+
 
 def configure_console_encoding():
     """保留当前终端编码，并替换无法编码的字符。"""
@@ -53,9 +58,9 @@ def setup_logging():
     """配置日志记录"""
     log_formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
     
-    # 配置文件处理器
+    # 配置文件处理器（日志固定写到项目根目录，不随启动目录漂移）
     file_handler = RotatingFileHandler(
-        'watchdog.log',
+        os.path.join(PROJECT_ROOT, 'watchdog.log'),
         maxBytes=5*1024*1024,  # 5MB
         backupCount=3
     )
@@ -71,13 +76,33 @@ def setup_logging():
     root_logger.addHandler(file_handler)
     root_logger.addHandler(console_handler)
 
-def is_process_running(process_name="python"):
-    """检查指定进程是否在运行"""
-    for proc in psutil.process_iter(['name', 'cmdline']):
+def is_process_running():
+    """检查本项目主程序(main.py)是否在运行
+
+    同时校验三点，避免跨平台/绝对路径漏检与无关进程误检：
+    1. 进程可执行文件名以 'python' 开头（兼容 Windows 的 python.exe）；
+    2. cmdline 中存在某个参数，其归一化绝对路径正好是本项目根目录下的 main.py
+       （绝对路径/相对路径启动均可命中，且排除其他项目的同名 main.py）；
+    3. 排除看门狗自身 PID，避免自匹配恒为 True。
+    """
+    self_pid = os.getpid()
+    for proc in psutil.process_iter(['pid', 'name', 'cmdline']):
         try:
-            if proc.info['name'] == process_name or \
-               (proc.info['cmdline'] and 'main.py' in proc.info['cmdline']):
-                return True
+            if proc.info['pid'] == self_pid:
+                continue
+            name = (proc.info['name'] or '').lower()
+            if not name.startswith('python'):
+                continue
+            cmdline = proc.info['cmdline'] or []
+            for arg in cmdline:
+                if not arg or os.path.basename(arg).lower() != 'main.py':
+                    continue
+                # 相对路径参数按本项目根目录解析，再归一化比对，确保归属本项目
+                arg_path = os.path.normcase(os.path.normpath(
+                    os.path.join(PROJECT_ROOT, arg) if not os.path.isabs(arg) else arg
+                ))
+                if arg_path == MAIN_SCRIPT_PATH:
+                    return True
         except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
             pass
     return False
@@ -85,12 +110,50 @@ def is_process_running(process_name="python"):
 def start_main_program():
     """启动主程序"""
     try:
-        # 使用 Python 解释器启动主程序
-        subprocess.Popen([sys.executable, 'main.py'], env=python_subprocess_env())
+        # 使用 Python 解释器启动主程序：用绝对路径并指定 cwd，消除对启动目录的依赖
+        subprocess.Popen(
+            [sys.executable, MAIN_SCRIPT_PATH],
+            cwd=PROJECT_ROOT,
+            env=python_subprocess_env()
+        )
         logging.info("主程序已启动")
         return True
     except Exception as e:
         logging.error(f"启动主程序失败: {str(e)}")
+        return False
+
+
+def send_watchdog_alert(message):
+    """看门狗自身告警：直接调用 Telegram sendMessage 通知用户。
+
+    凭据从 .env 读取（与 config 一致），不引入额外依赖。
+    任何失败都仅记日志，避免影响看门狗主流程。
+    """
+    try:
+        from dotenv import load_dotenv
+        load_dotenv(os.path.join(PROJECT_ROOT, '.env'))
+    except Exception:
+        pass
+
+    token = os.getenv('TELEGRAM_BOT_TOKEN')
+    chat_id = os.getenv('TELEGRAM_CHAT_ID')
+    if not token or not chat_id:
+        logging.error("未配置 TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID，无法发送看门狗告警")
+        return False
+    try:
+        import requests
+        resp = requests.post(
+            f"https://api.telegram.org/bot{token}/sendMessage",
+            data={'chat_id': chat_id, 'text': message},
+            timeout=10
+        )
+        if resp.status_code == 200:
+            logging.info("看门狗告警已通过 Telegram 发送")
+            return True
+        logging.error(f"看门狗告警发送失败，HTTP {resp.status_code}: {resp.text}")
+        return False
+    except Exception as e:
+        logging.error(f"看门狗告警发送异常: {str(e)}")
         return False
 
 def main():
@@ -124,6 +187,11 @@ def main():
                         logging.error("主程序重启失败")
                 else:
                     logging.critical(f"重启次数过多 ({restart_count}/{max_restarts})，停止重试")
+                    # 监控链即将退出，发出 Telegram 告警避免静默死亡导致漏打卡
+                    send_watchdog_alert(
+                        f"[看门狗告警] 主程序 1 小时内重启已达 {restart_count}/{max_restarts} 次，"
+                        f"看门狗停止重试并退出，请尽快人工检查（存在漏打卡风险）。"
+                    )
                     break
             
             # 检查系统资源使用情况

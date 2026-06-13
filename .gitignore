@@ -78,3 +78,6 @@ proxy_runtime/
 
 # ai
 .claude
+
+# 审计报告（含真实姓名/内网地址等敏感描述，仅本地参考，勿入库）
+AUDIT_REPORT.md

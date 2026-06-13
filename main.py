@@ -66,6 +66,63 @@ from modules.schedule_manager import run_schedule
 # 全局变量
 attendance_system_global = None
 
+# 单实例锁文件句柄（全局持有，进程存活期间不释放；进程退出由 OS 自动释放）
+_instance_lock_handle = None
+
+
+def acquire_single_instance_lock():
+    """获取项目根下的单实例独占锁，防止重复启动 main.py。
+
+    重复启动会导致两个进程用同一 bot token 同时 getUpdates（Telegram 409 互踢），
+    且定时打卡任务在两份进程里各跑一遍、对同一账号重复打卡。这里用锁文件 + PID 校验：
+    - 取到独占锁：写入当前 PID，返回 True；
+    - 取不到（已有实例持锁）：读出占用 PID 提示后返回 False，由调用方退出；
+    - 若锁文件残留但持有者已不在（旧进程崩溃未释放），OS 层独占锁本就不会拦截，可正常抢占。
+    """
+    global _instance_lock_handle
+    # 锁文件固定放在 main.py 所在目录（项目根），不随 CWD 漂移
+    lock_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), '.main.lock')
+    try:
+        # 以读写方式打开（不截断），便于失败时读取占用方 PID
+        handle = open(lock_path, 'a+')
+        try:
+            if sys.platform == 'win32':
+                import msvcrt
+                # 非阻塞独占锁定首字节；已被占用立即抛 OSError
+                handle.seek(0)
+                msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+            else:
+                import fcntl
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            # 已有实例持锁：尝试读出其 PID 给出更友好的提示
+            try:
+                handle.seek(0)
+                holder = handle.read().strip()
+            except Exception:
+                holder = ''
+            handle.close()
+            holder_hint = f"（已有实例 PID={holder}）" if holder else "（已有实例正在运行）"
+            print(f"\n[ERROR] 检测到自动打卡系统已在运行 {holder_hint}，本次启动已终止。")
+            logging.error(f"单实例锁获取失败，已有实例在运行 {holder_hint}")
+            return False
+
+        # 抢锁成功：写入当前 PID 供他人提示参考
+        try:
+            handle.seek(0)
+            handle.truncate(0)
+            handle.write(str(os.getpid()))
+            handle.flush()
+        except Exception:
+            pass
+        # 句柄必须全局持有，关闭即释放锁
+        _instance_lock_handle = handle
+        return True
+    except Exception as e:
+        # 锁文件本身无法创建/打开（权限等）时不阻断启动，仅记录告警，保持原有可用性
+        logging.warning(f"单实例锁初始化异常，跳过互斥保护: {e!r}")
+        return True
+
 
 def print_welcome():
     """显示欢迎界面"""
@@ -308,6 +365,40 @@ async def initialize_system(fast_boot=False):
     return attendance_system, schedule_task, monitor_task
 
 
+async def _bot_recovery_loop(attendance_system):
+    """bot 初始化降级后的后台自动恢复（指数退避重连）。
+
+    背景：控制台/watchdog 模式没有 GUI 重连端点，若启动时代理未就绪导致 bot 初始化失败，
+    进程会"活着但远程命令/提醒/通知全失效"，而 watchdog 只看进程存在性永远不会修复。
+    这里在降级时挂一个后台任务，不断尝试 bot.reconnect()（与 GUI 端点共用 _reconnect_lock，
+    不会并发冲突）；成功后回写 bot_available=True 并启动连接监控，使后续抖动也能自愈。
+    """
+    backoff_seq = [30, 60, 120, 300]  # 退避秒数，封顶 5 分钟
+    attempt = 0
+    while True:
+        delay = backoff_seq[min(attempt, len(backoff_seq) - 1)]
+        await asyncio.sleep(delay)
+        attempt += 1
+        try:
+            ok, msg = await attendance_system.bot.reconnect()
+        except Exception as e:
+            logging.warning(f"bot 后台恢复第 {attempt} 次重连异常，稍后重试: {e!r}")
+            continue
+        if ok:
+            attendance_system.bot_available = True
+            attendance_system.bot_error = None
+            logging.info(f"Telegram Bot 后台自动恢复成功（第 {attempt} 次尝试）")
+            # 恢复后补启动连接监控，使之后的连接抖动同样可自愈
+            try:
+                asyncio.create_task(attendance_system.bot.monitor_connection())
+            except Exception:
+                logging.exception("恢复后启动连接监控失败")
+            return
+        else:
+            attendance_system.bot_error = str(msg)[:500]
+            logging.warning(f"bot 后台恢复第 {attempt} 次重连失败，{backoff_seq[min(attempt, len(backoff_seq) - 1)]} 秒后重试: {msg}")
+
+
 def _parse_args():
     """解析主程序命令行参数。
 
@@ -416,6 +507,9 @@ async def main(args=None):
 
 if __name__ == "__main__":
     cli_args = _parse_args()
+    # 启动早期获取单实例锁；已有实例在运行则直接退出，避免双轮询 409 与重复打卡
+    if not acquire_single_instance_lock():
+        sys.exit(1)
     try:
         asyncio.run(main(cli_args))
     except KeyboardInterrupt:

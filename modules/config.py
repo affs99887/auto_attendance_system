@@ -9,10 +9,36 @@ import json
 import socket
 import secrets
 import logging
+import threading
+import time
 from dotenv import load_dotenv
 
 # 加载环境变量
 load_dotenv()
+
+
+def _int_env(name, default):
+    """安全解析整型环境变量：缺失/空串回退默认值，非法值告警后回退（避免 import 阶段崩溃）。"""
+    v = os.getenv(name)
+    if v is None or v.strip() == '':
+        return default
+    try:
+        return int(v.strip())
+    except ValueError:
+        logging.warning(f"环境变量 {name}={v!r} 不是合法整数，使用默认值 {default}")
+        return default
+
+
+def _float_env(name, default):
+    """安全解析浮点型环境变量：缺失/空串回退默认值，非法值告警后回退。"""
+    v = os.getenv(name)
+    if v is None or v.strip() == '':
+        return default
+    try:
+        return float(v.strip())
+    except ValueError:
+        logging.warning(f"环境变量 {name}={v!r} 不是合法数字，使用默认值 {default}")
+        return default
 
 
 class Config:
@@ -33,7 +59,7 @@ class Config:
     EMAIL_SENDER = os.getenv('EMAIL_SENDER', '')
     EMAIL_PASSWORD = os.getenv('EMAIL_PASSWORD', '')
     EMAIL_SMTP_SERVER = os.getenv('EMAIL_SMTP_SERVER', 'smtp.qq.com')
-    EMAIL_SMTP_PORT = int(os.getenv('EMAIL_SMTP_PORT', '465'))
+    EMAIL_SMTP_PORT = _int_env('EMAIL_SMTP_PORT', 465)
     EMAIL_RECIPIENTS = os.getenv('EMAIL_RECIPIENTS', '').split(',') if os.getenv('EMAIL_RECIPIENTS') else []
 
     # Tesseract配置
@@ -42,8 +68,8 @@ class Config:
     # 工作时间配置
     WORK_START_TIME = os.getenv('WORK_START_TIME', "09:00")
     WORK_END_TIME = os.getenv('WORK_END_TIME', "17:30")
-    LATE_THRESHOLD = int(os.getenv('LATE_THRESHOLD', "15"))  # 分钟
-    EARLY_LEAVE_THRESHOLD = int(os.getenv('EARLY_LEAVE_THRESHOLD', "15"))  # 分钟
+    LATE_THRESHOLD = _int_env('LATE_THRESHOLD', 15)  # 分钟
+    EARLY_LEAVE_THRESHOLD = _int_env('EARLY_LEAVE_THRESHOLD', 15)  # 分钟
     DAILY_STATUS_TIME = os.getenv('DAILY_STATUS_TIME', "08:20")
 
     # 系统配置
@@ -89,7 +115,7 @@ class Config:
         if p.strip().isdigit()
     ]
     TELEGRAM_PROXY_SCHEME = os.getenv('TELEGRAM_PROXY_SCHEME', 'http')
-    TELEGRAM_PROXY_PROBE_TIMEOUT = float(os.getenv('TELEGRAM_PROXY_PROBE_TIMEOUT', '1.0'))
+    TELEGRAM_PROXY_PROBE_TIMEOUT = _float_env('TELEGRAM_PROXY_PROBE_TIMEOUT', 1.0)
 
     # 图像识别配置
     MATCH_THRESHOLD = 0.8
@@ -100,31 +126,49 @@ class Config:
     
     # Selenium配置 - 支持动态配置
     _dynamic_config = None
-    
+    # [M58/M64] dynamic_config.json 跨线程读改写保护：waitress HTTP 线程、asyncio 主循环、
+    # 汇率/AI 资讯 executor 线程都可能并发触发写入，必须串行化 _load/_save 与所有 set_*，
+    # 避免两线程同时 json.dump 同一文件或迭代字典时被改而产出截断/残破 JSON。
+    _config_lock = threading.RLock()
+
     @classmethod
     def _load_dynamic_config(cls):
         """加载动态配置"""
-        if cls._dynamic_config is None:
-            if os.path.exists(cls.DYNAMIC_CONFIG_FILE):
-                try:
-                    with open(cls.DYNAMIC_CONFIG_FILE, 'r', encoding='utf-8') as f:
-                        cls._dynamic_config = json.load(f)
-                except Exception as e:
-                    print(f"加载动态配置失败: {e}")
+        with cls._config_lock:
+            if cls._dynamic_config is None:
+                if os.path.exists(cls.DYNAMIC_CONFIG_FILE):
+                    try:
+                        with open(cls.DYNAMIC_CONFIG_FILE, 'r', encoding='utf-8') as f:
+                            cls._dynamic_config = json.load(f)
+                    except Exception as e:
+                        # [M58/M64] 解析失败时把损坏文件改名留档（.corrupt-时间戳），便于人工恢复 secret /
+                        # 代理 profiles；不静默丢弃后让后续 set_* 用空配置覆盖掉可手工修复的原文件。
+                        print(f"加载动态配置失败: {e}")
+                        try:
+                            backup = f"{cls.DYNAMIC_CONFIG_FILE}.corrupt-{int(time.time())}"
+                            os.replace(cls.DYNAMIC_CONFIG_FILE, backup)
+                            logging.warning(f"动态配置损坏，已备份为 {backup}")
+                        except Exception as be:
+                            print(f"备份损坏动态配置失败: {be}")
+                        cls._dynamic_config = {}
+                else:
                     cls._dynamic_config = {}
-            else:
-                cls._dynamic_config = {}
-        return cls._dynamic_config
-    
+            return cls._dynamic_config
+
     @classmethod
     def _save_dynamic_config(cls):
-        """保存动态配置"""
-        try:
-            with open(cls.DYNAMIC_CONFIG_FILE, 'w', encoding='utf-8') as f:
-                json.dump(cls._dynamic_config, f, ensure_ascii=False, indent=2)
-        except Exception as e:
-            print(f"保存动态配置失败: {e}")
-    
+        """保存动态配置（先写临时文件再 os.replace 原子替换，避免写入中途崩溃留下截断 JSON）"""
+        with cls._config_lock:
+            try:
+                tmp_path = f"{cls.DYNAMIC_CONFIG_FILE}.tmp"
+                with open(tmp_path, 'w', encoding='utf-8') as f:
+                    json.dump(cls._dynamic_config, f, ensure_ascii=False, indent=2)
+                    f.flush()
+                    os.fsync(f.fileno())
+                os.replace(tmp_path, cls.DYNAMIC_CONFIG_FILE)
+            except Exception as e:
+                print(f"保存动态配置失败: {e}")
+
     @classmethod
     def get_selenium_config(cls, key, default_value):
         """获取Selenium配置，优先使用动态配置"""
@@ -134,13 +178,14 @@ class Config:
         # 回退到环境变量
         env_value = os.getenv(key, str(default_value)).lower()
         return env_value == 'true' if isinstance(default_value, bool) else env_value
-    
+
     @classmethod
     def set_selenium_config(cls, key, value):
         """设置Selenium配置"""
-        dynamic_config = cls._load_dynamic_config()
-        dynamic_config[key] = value
-        cls._save_dynamic_config()
+        with cls._config_lock:
+            dynamic_config = cls._load_dynamic_config()
+            dynamic_config[key] = value
+            cls._save_dynamic_config()
     
     @classmethod
     def get_use_selenium_login(cls):
@@ -235,36 +280,40 @@ class Config:
     @classmethod
     def get_proxy_config(cls):
         """获取内置加速配置（补默认值；secret 缺失则生成并持久化；首次迁移旧字段为 profiles）。"""
-        dynamic = cls._load_dynamic_config()
-        cfg = dict(cls.PROXY_DEFAULTS)
-        stored = dynamic.get('PROXY')
-        if isinstance(stored, dict):
-            cfg.update(stored)
-        patch = {}
-        if not cfg.get('secret'):
-            cfg['secret'] = secrets.token_hex(16)
-            patch['secret'] = cfg['secret']
-        cfg, migrated = cls._migrate_proxy_profiles(cfg)
-        if migrated:
-            patch['profiles'] = cfg['profiles']
-            patch['active_profile_id'] = cfg['active_profile_id']
-        if patch:
-            cls.set_proxy_config(patch)
-        return cfg
+        # [M64] 整段读改写加锁：避免首次并发调用时两线程各自生成不同 secret、后写者覆盖。
+        with cls._config_lock:
+            dynamic = cls._load_dynamic_config()
+            cfg = dict(cls.PROXY_DEFAULTS)
+            stored = dynamic.get('PROXY')
+            if isinstance(stored, dict):
+                cfg.update(stored)
+            patch = {}
+            if not cfg.get('secret'):
+                cfg['secret'] = secrets.token_hex(16)
+                patch['secret'] = cfg['secret']
+            cfg, migrated = cls._migrate_proxy_profiles(cfg)
+            if migrated:
+                patch['profiles'] = cfg['profiles']
+                patch['active_profile_id'] = cfg['active_profile_id']
+            if patch:
+                cls.set_proxy_config(patch)
+            return cfg
 
     @classmethod
     def set_proxy_config(cls, patch):
         """合并更新 PROXY 子对象并持久化，返回最新配置。"""
         if not isinstance(patch, dict):
             return cls.get_proxy_config()
-        dynamic = cls._load_dynamic_config()
-        cur = dynamic.get('PROXY')
-        if not isinstance(cur, dict):
-            cur = {}
-        cur.update(patch)
-        dynamic['PROXY'] = cur
-        cls._save_dynamic_config()
-        return cls.get_proxy_config()
+        # [M58/M64] 读-改-写串行化，防止并发 cur.update 与 json.dump 撕裂文件。
+        with cls._config_lock:
+            dynamic = cls._load_dynamic_config()
+            cur = dynamic.get('PROXY')
+            if not isinstance(cur, dict):
+                cur = {}
+            cur.update(patch)
+            dynamic['PROXY'] = cur
+            cls._save_dynamic_config()
+            return cls.get_proxy_config()
 
     @classmethod
     def get_proxy_enabled(cls):
