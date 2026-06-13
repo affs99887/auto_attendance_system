@@ -67,6 +67,10 @@ export function ProxyScreen() {
 
   const [busy, setBusy] = React.useState(false);
   const [testing, setTesting] = React.useState<string | null>(null);
+  // 「测全部延迟」运行态：禁用按钮防重入；ref 标志用于在卸载/再次点击时中断循环
+  const [testingAll, setTestingAll] = React.useState(false);
+  const testingAllRef = React.useRef(false);
+  const unmountedRef = React.useRef(false);
   const [dragOver, setDragOver] = React.useState(false);
   const fileInputRef = React.useRef<HTMLInputElement>(null);
 
@@ -85,6 +89,8 @@ export function ProxyScreen() {
   const [editLoading, setEditLoading] = React.useState(false);
 
   React.useEffect(() => {
+    // 重置卸载标志（兼容 StrictMode 卸载→重挂、以及正常切回本页）
+    unmountedRef.current = false;
     void refreshConfig();
     void refreshNodes();
     void refreshProfiles();
@@ -92,7 +98,12 @@ export function ProxyScreen() {
       void refreshTraffic();
       void refreshNodes();
     }, 3000);
-    return () => window.clearInterval(id);
+    return () => {
+      window.clearInterval(id);
+      // 卸载（切页）后置位，testAll 循环据此中断，不再向后端发请求
+      unmountedRef.current = true;
+      testingAllRef.current = false;
+    };
   }, [refreshConfig, refreshNodes, refreshTraffic, refreshProfiles]);
 
   // 增删改 / 切换后统一刷新：配置文件 + 状态 + 节点
@@ -250,20 +261,43 @@ export function ProxyScreen() {
     } catch (e) { toast('err', errText(e)); }
   };
 
-  const testDelay = async (name: string) => {
+  // silent=true 时不逐节点弹 toast（批量模式由 testAll 汇总），返回是否测得有效延迟
+  const testDelay = async (name: string, silent = false): Promise<boolean> => {
     setTesting(name);
     try {
       const r = await api.testProxyDelay(name);
-      toast(r.delay != null ? 'ok' : 'err', r.delay != null ? `${name}: ${r.delay}ms` : `${name}: 超时`);
+      if (!silent) {
+        toast(r.delay != null ? 'ok' : 'err', r.delay != null ? `${name}: ${r.delay}ms` : `${name}: 超时`);
+      }
       await refreshNodes();
-    } catch (e) { toast('err', errText(e)); }
+      return r.delay != null;
+    } catch (e) {
+      if (!silent) toast('err', errText(e));
+      return false;
+    }
     finally { setTesting(null); }
   };
 
   const testAll = async () => {
-    for (const n of nodes) {
-      // eslint-disable-next-line no-await-in-loop
-      await testDelay(n.name);
+    // 重入保护：已在测全部时直接忽略，避免两轮循环交叉执行、testing 状态互相覆盖
+    if (testingAllRef.current) return;
+    testingAllRef.current = true;
+    setTestingAll(true);
+    let ok = 0;
+    let total = 0;
+    try {
+      for (const n of nodes) {
+        // 卸载或被再次触发时中断循环，停止继续向后端发请求
+        if (!testingAllRef.current || unmountedRef.current) break;
+        total++;
+        // eslint-disable-next-line no-await-in-loop
+        if (await testDelay(n.name, true)) ok++;
+      }
+      // 批量模式汇总一条 toast，避免逐节点 toast 轰炸
+      if (!unmountedRef.current) toast('ok', `测速完成：${ok}/${total} 个节点可用`);
+    } finally {
+      testingAllRef.current = false;
+      if (!unmountedRef.current) setTestingAll(false);
     }
   };
 
@@ -448,7 +482,7 @@ export function ProxyScreen() {
       <div className="card">
         <div className="card-header">
           <div className="card-title">节点（{nodes.length}）· 分组 {config?.group || '-'}</div>
-          <button className="btn btn-sm" disabled={!running || nodes.length === 0} onClick={testAll}>测全部延迟</button>
+          <button className="btn btn-sm" disabled={!running || nodes.length === 0 || testingAll} onClick={testAll}>{testingAll ? '测试中…' : '测全部延迟'}</button>
         </div>
         <table className="table">
           <thead>

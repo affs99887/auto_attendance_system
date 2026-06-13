@@ -91,7 +91,9 @@ export function useBackendBootstrap() {
       if (p.state === 'failed') { st.setFailed(p.reason); return; }
       // p.state === 'token'
       setBackendOverride({ token: p.token, httpUrl: p.httpUrl, wsUrl: p.wsUrl });
-      if (p.token === st.currentToken) return; // 去重（did-finish-load 补推 / 重复推送）
+      // 去重（did-finish-load 补推 / 重复推送）；但失败态须放行——否则重试后唯一的
+      // 恢复路径（同一 token 的补推）也被丢弃，UI 永久卡在 starting。
+      if (p.token === st.currentToken && st.status !== 'failed') return;
       const wasReady = st.status === 'ready';
       st.setCurrentToken(p.token);
       if (wasReady) {
@@ -107,6 +109,19 @@ export function useBackendBootstrap() {
 
     const off = startup.onStatus(handle);
     void startup.getStatus().then(handle).catch(() => { /* ignore */ });
+
+    // 监听 store：失败态点"重试"会调用 setStarting（status→starting 且 epoch+1）。
+    // setStarting 仅作废在途探活而不会重发探活，故这里订阅 status 边沿——
+    // 当 failed→starting 且已握有 token 时，主动以新 epoch 重启探活循环，
+    // 让重试成为真正的恢复入口（后端随后就绪即可进入 ready，无需重启整个应用）。
+    let prevStatus = useStartupStore.getState().status;
+    const offStore = useStartupStore.subscribe(s => {
+      if (cancelled) return;
+      if (prevStatus === 'failed' && s.status === 'starting' && s.currentToken) {
+        void probeReady(s.epoch);
+      }
+      prevStatus = s.status;
+    });
 
     // 启动日志：订阅 Electron 转发的 python stdout/stderr + 拉一次全量兜底（注册晚于早期日志）
     const log = window.AAS_LOG;
@@ -124,6 +139,7 @@ export function useBackendBootstrap() {
       cancelled = true;
       if (pingTimer !== null) window.clearTimeout(pingTimer);
       off();
+      offStore();
       offLog?.();
     };
   }, []);
@@ -171,6 +187,22 @@ export function useBackendBootstrap() {
     window.addEventListener('focus', onFocus);
 
     const unsubs: Array<() => void> = [];
+
+    // 断线重连补偿：onStatus 在每次状态变化时回调（订阅时也会先回放当前状态）。
+    // 断线期间错过的 status:update / log:stream 推送只能靠这里追回——
+    //   refresh() 立即校正 current_operation（避免 LegacyModeOverlay 滞后至多 15s 才出现/消失）；
+    //   loadTail(500) 重拉日志尾部填补断流期的空洞（在途流式行由 loadTail 内部合并保留）。
+    // 仅在"已建立过一次 open 之后又重新 open"时补刷，首连不触发（首连已由上方 refresh/loadTail 覆盖）。
+    let everOpened = false;
+    unsubs.push(wsClient.onStatus(s => {
+      if (s !== 'open') return;
+      if (everOpened) {
+        void useSystemStore.getState().refresh();
+        void useLogsStore.getState().loadTail(500);
+      }
+      everOpened = true;
+    }));
+
     wsClient.start();
 
     unsubs.push(wsClient.subscribe('log:stream', data => {

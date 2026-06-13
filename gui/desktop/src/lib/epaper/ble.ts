@@ -241,6 +241,12 @@ export class EpdBleClient {
         this.log('• 电脑: Chrome/Edge');
         this.log('• Android: Chrome/Edge');
         this.log('• iOS: Bluefy 浏览器');
+        // 修复 E12：非取消类失败（权限被拒/无设备/API 不可用）时 requestDevice 直接 reject，
+        // 既不触发 gattserverdisconnected 也无后续连接，store 的 scanning/quickConnecting 会永久卡住。
+        // 此处主动发一次连接态变化（resetVariables 已置空 gattServer → connected=false），
+        // 复用 store onConnectionChange 的断开分支无条件复位扫描 modal / 一键重连态。
+        // 取消类失败由 store 侧 closeScan/cancelQuickReconnect 已同步复位，无需再 emit（避免覆盖新扫描）。
+        this.emitConnectionChange();
       }
       return;
     }

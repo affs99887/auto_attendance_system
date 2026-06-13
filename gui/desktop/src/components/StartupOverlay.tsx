@@ -32,8 +32,9 @@ export function StartupOverlay() {
   }, [logLines.length, follow]);
 
   if (status === 'ready') return null;
-  // starting/failed 两态均尊重用户手动关闭（ready 上面已 return）：失败态点"我知道了"也能收起覆盖层
-  if (overlayDismissed && status !== 'ready') return null;
+  // starting/failed 两态均尊重用户手动关闭（ready 上面已 return，此处 status 必为 starting/failed）：
+  // 失败态点"我知道了"也能收起覆盖层
+  if (overlayDismissed) return null;
 
   const failed = status === 'failed';
   const tone = failed ? 'danger' : 'accent';
@@ -43,7 +44,9 @@ export function StartupOverlay() {
     if (err) useToastStore.getState().push('err', '无法打开日志目录：' + err);
   };
 
-  // 重试：重新进入"启动中"并重发探活（不重启 python，由 bootstrap 依 epoch 重新探活）。
+  // 重试：重新进入"启动中"并重发探活（不重启 python）。setStarting 会把 status 置回
+  // starting 并 epoch+1；bootstrap effect1 订阅 store 监听到 failed→starting 边沿后，
+  // 以新 epoch 重启探活循环（详见 bootstrap.ts 的 offStore 订阅）。
   // 适用于"HTTP 未在超时内就绪"；若是进程级失败需重启程序。
   const retry = () => setStarting('正在重新确认服务可用…');
 

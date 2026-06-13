@@ -14,8 +14,8 @@ from typing import Optional, List, Dict
 
 # Telegram相关
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, CallbackQueryHandler
-from telegram.error import RetryAfter
+from telegram.ext import Application, CommandHandler, MessageHandler, TypeHandler, filters, ContextTypes, CallbackQueryHandler
+from telegram.error import RetryAfter, BadRequest
 
 # 图像处理
 import cv2
@@ -92,6 +92,11 @@ class TelegramBot:
         builder = (
             Application.builder()
             .token(self.token)
+            # M19：PTB 默认串行处理更新（concurrent_updates=False），一旦某个 handler 内联
+            # await 长耗时流程（Selenium 完整打卡可达数分钟、sleep(10)+punch、并行登录等），
+            # 后续所有更新（含 /stop、/status）都会排队不处理，bot 表现为"假死"。
+            # 启用并发更新让命令彼此独立调度，作为不改各 handler 的兜底修复。
+            .concurrent_updates(True)
             .pool_timeout(self.pool_timeout)
             .connect_timeout(self.connect_timeout)
             .read_timeout(self.read_timeout)
@@ -173,7 +178,12 @@ class TelegramBot:
                             self.last_update_time = datetime.now()
                             self.connection_error_count = 0  # 重置错误计数
 
-                        self.app.add_handler(MessageHandler(filters.ALL, update_handler))
+                        # M52/M92: PTB 同一 group 内一个 update 只会被第一个匹配的 handler 处理；
+                        # 此前 update_handler 与命令/回调/文本 handler 同在 group 0 且注册靠后，
+                        # 命令、按钮回调、文本消息全部被前面的 handler 消费，update_handler 仅对贴纸/图片等无人处理的消息生效，
+                        # 导致 last_update_time 形同常量、监控误判超时。
+                        # 改用 TypeHandler 注册到独立 group（各 group 独立分发），确保每个 update 都刷新心跳。
+                        self.app.add_handler(TypeHandler(Update, update_handler), group=1)
 
                         # 注册全局错误处理器，统一记录 Telegram 更新处理过程中的未捕获异常
                         self.app.add_error_handler(self._on_error)
@@ -589,6 +599,16 @@ class TelegramBot:
                         if next_run < current_time:
                             next_run = next_run + timedelta(days=1)
                         status_text += f"➤ [任务 #{task['id']}] 上班打卡：{next_run.strftime('%Y-%m-%d %H:%M')}\n"
+                    elif task['type'] == 'selenium_punch_out':
+                        # M16/M17：让 Selenium 自动下班任务在 /status 中可见
+                        next_run = datetime.strptime(task['scheduled_time'], "%H:%M").replace(
+                            year=current_time.year,
+                            month=current_time.month,
+                            day=current_time.day
+                        )
+                        if next_run < current_time:
+                            next_run = next_run + timedelta(days=1)
+                        status_text += f"➤ [任务 #{task['id']}] Selenium下班打卡：{next_run.strftime('%Y-%m-%d %H:%M')}\n"
             else:
                 status_text += "\n⏱ 暂无定时任务\n"
 
@@ -771,7 +791,13 @@ class TelegramBot:
             reply_markup = InlineKeyboardMarkup(keyboard) if keyboard else None
 
             # 发送消息
-            await update.message.reply_text(log_message, parse_mode='Markdown', reply_markup=reply_markup)
+            # M51: 日志原文常含不成对的 _ * [ 字符（函数名/路径/异常 repr），Markdown 解析会 400 失败，
+            # 导致 /errors 在最需要时（确有错误日志）反而不可用。捕获 BadRequest 后降级为无 parse_mode 重发一次。
+            try:
+                await update.message.reply_text(log_message, parse_mode='Markdown', reply_markup=reply_markup)
+            except BadRequest as md_err:
+                logging.warning(f"错误日志 Markdown 解析失败，降级为纯文本重发: {md_err!r}")
+                await update.message.reply_text(log_message, reply_markup=reply_markup)
         except Exception as e:
             error_msg = f"获取错误日志时发生异常: {str(e)}"
             logging.error(error_msg)
@@ -905,6 +931,22 @@ class TelegramBot:
                             callback_data=f"kill_{task['id']}"
                         )
                     ])
+                elif task['type'] == 'selenium_punch_out':
+                    # M16/M17：Selenium 自动下班任务此前不显示、无法通过 UI 删除，这里补上
+                    next_run = datetime.strptime(task['scheduled_time'], "%H:%M").replace(
+                        year=datetime.now().year,
+                        month=datetime.now().month,
+                        day=datetime.now().day
+                    )
+                    if next_run < datetime.now():
+                        next_run = next_run + timedelta(days=1)
+                    message_text += f"➤ [任务 #{task['id']}] Selenium下班打卡：{next_run.strftime('%Y-%m-%d %H:%M')}\n"
+                    keyboard.append([
+                        InlineKeyboardButton(
+                            f"删除任务 #{task['id']}",
+                            callback_data=f"kill_{task['id']}"
+                        )
+                    ])
 
             reply_markup = InlineKeyboardMarkup(keyboard)
             await update.message.reply_text(message_text, reply_markup=reply_markup)
@@ -922,20 +964,11 @@ class TelegramBot:
             return
 
         if self.attendance_system.task_manager.remove_task_by_id(task_id):
-            # 清除schedule中的任务
-            schedule.clear()
-
-            # 重新加载剩余的任务
-            saved_tasks = self.attendance_system.task_manager.get_tasks()
-            for saved_task in saved_tasks:
-                if saved_task['type'] == 'punch_out':
-                    async def retry_punch_out_job():
-                        await self.attendance_system.punch_out()
-                    schedule.every().day.at(saved_task['scheduled_time']).do(lambda: asyncio.create_task(retry_punch_out_job()))
-                elif saved_task['type'] == 'punch_in':
-                    async def retry_punch_in_job():
-                        await self.attendance_system.punch_in()
-                    schedule.every().day.at(saved_task['scheduled_time']).do(lambda: asyncio.create_task(retry_punch_in_job()))
+            # M17：只精准取消被删任务对应的 schedule job（按 per-task tag=task_{id} 定位），
+            # 不再裸 clear 全类型后重建——避免重建版丢失 username、缺工作日/创建日守卫、
+            # 不返回 CancelJob 导致每日重复打卡、以及 selenium_punch_out 任务被静默漏掉。
+            # 其余任务的 job 原封不动留在 schedule 中，无需重载。
+            schedule.clear(f'task_{task_id}')
 
             await message.reply_text(
                 f"已删除任务:\n"
@@ -1271,20 +1304,13 @@ class TelegramBot:
                     return
 
                 if self.attendance_system.task_manager.remove_task_by_id(task_id):
-                    # 清除schedule中的任务
-                    schedule.clear()
+                    # M17：只精准取消被删任务对应的 schedule job（按 per-task tag=task_{id} 定位），
+                    # 不再裸 clear 全类型后重建——避免重建版丢失 username、缺工作日/创建日守卫、
+                    # 不返回 CancelJob 导致每日重复打卡、以及 selenium_punch_out 任务被静默漏掉。
+                    schedule.clear(f'task_{task_id}')
 
-                    # 重新加载剩余的任务
+                    # 重新读取剩余任务，仅用于刷新下方任务列表展示（不再重载 schedule）
                     saved_tasks = self.attendance_system.task_manager.get_tasks()
-                    for saved_task in saved_tasks:
-                        if saved_task['type'] == 'punch_out':
-                            async def retry_punch_out_job():
-                                await self.attendance_system.punch_out()
-                            schedule.every().day.at(saved_task['scheduled_time']).do(lambda: asyncio.create_task(retry_punch_out_job()))
-                        elif saved_task['type'] == 'punch_in':
-                            async def retry_punch_in_job():
-                                await self.attendance_system.punch_in()
-                            schedule.every().day.at(saved_task['scheduled_time']).do(lambda: asyncio.create_task(retry_punch_in_job()))
 
                     # 发送删除成功的消息
                     await query.message.reply_text(
@@ -1335,6 +1361,22 @@ class TelegramBot:
                                     callback_data=f"kill_{remaining_task['id']}"
                                 )
                             ])
+                        elif remaining_task['type'] == 'selenium_punch_out':
+                            # M16/M17：刷新列表时同样展示 Selenium 自动下班任务
+                            next_run = datetime.strptime(remaining_task['scheduled_time'], "%H:%M").replace(
+                                year=datetime.now().year,
+                                month=datetime.now().month,
+                                day=datetime.now().day
+                            )
+                            if next_run < datetime.now():
+                                next_run = next_run + timedelta(days=1)
+                            message_text += f"➤ [任务 #{remaining_task['id']}] Selenium下班打卡：{next_run.strftime('%Y-%m-%d %H:%M')}\n"
+                            keyboard.append([
+                                InlineKeyboardButton(
+                                    f"删除任务 #{remaining_task['id']}",
+                                    callback_data=f"kill_{remaining_task['id']}"
+                                )
+                            ])
 
                     if keyboard:
                         reply_markup = InlineKeyboardMarkup(keyboard)
@@ -1346,7 +1388,13 @@ class TelegramBot:
             elif query.data.startswith('settime_use_last_'):
                 # 处理使用上次配置的回调
                 punch_type = query.data.split('_')[-1]
-                last_config = self.setting_time_state[self.chat_id].get('last_config')
+                # M53: 60 秒超时后 setting_time_state 已被清理，但旧按钮仍可点击，
+                # 直接下标访问会 KeyError 并报泛化错误。改为 .get() 判空后提示重新 /set_time 并移除旧按钮。
+                state = self.setting_time_state.get(self.chat_id)
+                if state is None:
+                    await query.message.edit_text("⏰ 设置已超时，请重新使用 /set_time 设置")
+                    return
+                last_config = state.get('last_config')
 
                 if last_config:
                     # 获取上次配置的用户名
@@ -1508,7 +1556,12 @@ class TelegramBot:
 
             elif query.data.startswith('settime_type_'):
                 punch_type = query.data.split('_')[-1]
-                self.setting_time_state[self.chat_id]['type'] = punch_type
+                # M53: 超时清理后点旧按钮会 KeyError，先判空提示
+                state = self.setting_time_state.get(self.chat_id)
+                if state is None:
+                    await query.message.edit_text("⏰ 设置已超时，请重新使用 /set_time 设置")
+                    return
+                state['type'] = punch_type
 
                 # 创建设置模式选择按钮
                 keyboard = [
@@ -1529,7 +1582,12 @@ class TelegramBot:
                 mode = parts[2]
                 punch_type = parts[3]
 
-                self.setting_time_state[self.chat_id].update({
+                # M53: 超时清理后点旧按钮会 KeyError，先判空提示
+                state = self.setting_time_state.get(self.chat_id)
+                if state is None:
+                    await query.message.edit_text("⏰ 设置已超时，请重新使用 /set_time 设置")
+                    return
+                state.update({
                     'mode': mode,
                     'step': 'input_delay' if mode == 'delay' else 'input_hour'
                 })
@@ -1568,7 +1626,11 @@ class TelegramBot:
                     username = parts[2]
 
                 # 从状态中获取配置信息
-                state = self.setting_time_state[self.chat_id]
+                # M53: 超时清理后点旧按钮会 KeyError，先判空提示
+                state = self.setting_time_state.get(self.chat_id)
+                if state is None:
+                    await query.message.edit_text("⏰ 设置已超时，请重新使用 /set_time 设置")
+                    return
                 punch_type = state['type']
                 mode = state['mode']
                 hour = state['hour']
@@ -1609,8 +1671,13 @@ class TelegramBot:
                 punch_type = parts[3]
 
                 # 计算目标时间并保存到状态
+                # M53: 超时清理后点旧按钮会 KeyError，先判空提示
+                state = self.setting_time_state.get(self.chat_id)
+                if state is None:
+                    await query.message.edit_text("⏰ 设置已超时，请重新使用 /set_time 设置")
+                    return
                 target_time = datetime.now() + timedelta(minutes=delay_minutes)
-                self.setting_time_state[self.chat_id].update({
+                state.update({
                     'delay_minutes': delay_minutes,
                     'hour': target_time.hour,
                     'minute': target_time.minute,
@@ -1661,7 +1728,12 @@ class TelegramBot:
             # 处理手动输入延时回调
             elif query.data.startswith('delay_manual_'):
                 punch_type = query.data.split('_')[2]
-                self.setting_time_state[self.chat_id]['step'] = 'input_delay'
+                # M53: 超时清理后点旧按钮会 KeyError，先判空提示
+                state = self.setting_time_state.get(self.chat_id)
+                if state is None:
+                    await query.message.edit_text("⏰ 设置已超时，请重新使用 /set_time 设置")
+                    return
+                state['step'] = 'input_delay'
                 await query.message.edit_text("请输入要延迟的分钟数：")
 
             # 处理查看打卡图片的回调
@@ -1959,8 +2031,12 @@ class TelegramBot:
             logging.error(error_msg)
             await query.message.reply_text(error_msg)
 
-    async def start_polling(self):
-        """启动消息轮询"""
+    async def start_polling(self, drop_pending_updates=True):
+        """启动消息轮询
+
+        drop_pending_updates: 首次启动丢弃积压更新（默认 True）；
+        重启场景（restart_polling）传 False，避免丢弃重启窗口内用户发出的打卡命令（见 M52）。
+        """
         if self.is_polling:
             return
 
@@ -1969,7 +2045,7 @@ class TelegramBot:
             # 使用更大的连接池和更长的超时时间
             await self.app.updater.start_polling(
                 allowed_updates=Update.ALL_TYPES,
-                drop_pending_updates=True,
+                drop_pending_updates=drop_pending_updates,
                 poll_interval=1.0,
                 timeout=self.connection_timeout,
                 read_timeout=self.read_timeout,
@@ -2057,7 +2133,8 @@ class TelegramBot:
 
                 if self.app:
                     await self.app.start()
-                    await self.start_polling()
+                    # M52: 重启窗口内用户可能已发出打卡命令，drop_pending_updates=False 避免被直接丢弃
+                    await self.start_polling(drop_pending_updates=False)
                 else:
                     logging.error("重启轮询失败：应用初始化失败")
 
@@ -2114,6 +2191,21 @@ class TelegramBot:
             try:
                 # 仅在 bot 可用且 app 存在时自愈，避免与 GUI 重连端点(reconnect)抢同一 app
                 if getattr(self.attendance_system, 'bot_available', True) and self.app is not None and self.last_update_time:
+                    # M92: get_me() 成功只证明 API 出口可达，不能证明 getUpdates 轮询任务存活。
+                    # 若该后台任务因非 NetworkError 异常死亡，updater.running 会变为 False 而 is_polling 仍为 True，
+                    # 监控会一直探测成功、永不重启，bot 永久失聪。此处主动比对二者状态，发现僵死立即强制重启。
+                    updater = getattr(self.app, 'updater', None)
+                    if self.is_polling and updater is not None and not updater.running:
+                        logging.warning("检测到 updater 已停止但 is_polling 仍为 True（getUpdates 轮询任务僵死），强制重启轮询...")
+                        try:
+                            await self.restart_polling()
+                        except Exception as e:
+                            logging.error(f"重启轮询失败: {str(e)}")
+                            self._is_initialized = False
+                            self.app = None
+                        await asyncio.sleep(60)
+                        continue
+
                     time_since_last_update = (datetime.now() - self.last_update_time).total_seconds()
 
                     if time_since_last_update > self.update_timeout:
@@ -2549,8 +2641,21 @@ class TelegramBot:
                     f"开始执行Selenium自动下班打卡（预计时间：{estimated_time}）"
                 )
 
-                # 使用现有的Selenium下班命令逻辑
-                await self.selenium_complete_punch_out_command(None)
+                # M16：原来到点调用 selenium_complete_punch_out_command(None)，
+                # 该处理器签名为 (update, context)，少传一个参数必抛 TypeError；即便补上，
+                # update=None 也会在 update.message.chat_id 处抛 AttributeError —— 定时
+                # Selenium 自动下班从未成功过。改为直接调用与 update 无关的内部执行函数
+                # _execute_selenium_complete_flow，并传入一个能向本聊天 reply/编辑消息的
+                # 载体（_ScheduledMessageCarrier），与手动命令走同一套流程逻辑。
+                await self._ensure_app_initialized()
+                if not self.app:
+                    raise RuntimeError("Telegram 应用未初始化，无法执行 Selenium 自动下班")
+                carrier = self._ScheduledMessageCarrier(self, self.chat_id)
+                await self._execute_selenium_complete_flow(
+                    carrier,
+                    flow_type="punch_out",
+                    special_handler=self._handle_punch_out_time_confirmation
+                )
 
             except Exception as e:
                 error_msg = f"Selenium自动下班执行失败: {str(e)}"
@@ -2559,11 +2664,37 @@ class TelegramBot:
             finally:
                 # 执行完后删除任务
                 self.attendance_system.task_manager.remove_task_by_id(task_id)
+                # M16：schedule.every().day 会每天重复触发，故执行后按 per-task tag 自清，
+                # 避免每日同一时间重复执行失败/打卡（CancelJob 在本仓 create_task 包装下不生效）。
+                schedule.clear(f'task_{task_id}')
 
-        # 使用schedule库设置定时任务
-        schedule.every().day.at(time_str).do(lambda: asyncio.create_task(selenium_punch_out_job()))
+        # 使用schedule库设置定时任务（打上类型 tag + per-task tag，使 /kill 可见可删，
+        # 且 attendance_system 的按 tag 清理不会误伤——本任务用独立 tag selenium_punch_out_scheduled）
+        schedule.every().day.at(time_str).do(lambda: asyncio.create_task(selenium_punch_out_job())).tag('selenium_punch_out_scheduled', f'task_{task_id}')
 
         logging.info(f"已设置Selenium自动下班任务: {target_time.strftime('%Y-%m-%d %H:%M')}")
+
+    class _ScheduledMessageCarrier:
+        """定时 Selenium 流程用的轻量消息载体（M16）。
+
+        _execute_selenium_complete_flow 依赖 update.message.reply_text / reply_photo，
+        且把 reply_text 的返回值当作可 edit_text 的消息使用。定时任务无 update 对象，
+        故用本载体把这些调用转发到 self.app.bot，并让 reply_text 返回真实的 Telegram
+        Message（其自带 edit_text），从而完全复用手动命令的流程。
+        """
+
+        def __init__(self, bot, chat_id):
+            self._bot = bot
+            self._chat_id = chat_id
+            # 暴露 message 属性，行为与 Update.message 一致（reply_text/reply_photo）
+            self.message = self
+
+        async def reply_text(self, text, **kwargs):
+            # 返回真实 Message 对象，后续 .edit_text(...) 可直接生效
+            return await self._bot.app.bot.send_message(chat_id=self._chat_id, text=text, **kwargs)
+
+        async def reply_photo(self, photo, **kwargs):
+            return await self._bot.app.bot.send_photo(chat_id=self._chat_id, photo=photo, **kwargs)
 
     async def _schedule_punch(self, punch_type, hour, minute, username=None):
         """设置定时打卡任务
@@ -2603,8 +2734,11 @@ class TelegramBot:
             if task['type'] == task_type:
                 self.attendance_system.task_manager.remove_task_by_id(task['id'])
 
-        # 清除schedule中的任务并重新加载
-        schedule.clear()
+        # 仅清除本类型(上班/下班)已注册的定时打卡 job，避免裸 schedule.clear() 误杀
+        # daily_status / exchange_rate_update / ai_news_update / daily_reminder /
+        # 以及另一类型(上班/下班)的定时打卡 job（否则会静默漏打卡）。
+        # tag 命名与 attendance_system.init_schedule_tasks 保持一致。
+        schedule.clear('punch_in_scheduled' if task_type == 'punch_in' else 'punch_out_scheduled')
 
         # 如果是"全部一起"，为每个用户创建独立任务
         if username == 'all':
@@ -2623,6 +2757,10 @@ class TelegramBot:
                     task_ids.append((task_id, user_name))
 
             # 创建统一的任务执行函数
+            # 额外为该 job 打上每个用户任务的 per-task tag（task_{id}），
+            # 使 /kill 删除单个任务时只需 schedule.clear(f'task_{id}') 精准取消本 job，
+            # 不再裸 clear 全类型后重建（M17：重建会丢 username/守卫且漏 selenium 任务）。
+            per_task_tags = [f'task_{tid}' for tid, _ in task_ids]
             if task_type == "punch_in":
                 async def punch_in_job():
                     # 调用punch_in()不传username参数，表示为所有用户打卡
@@ -2630,8 +2768,11 @@ class TelegramBot:
                     # 执行完后删除所有任务
                     for task_id, _ in task_ids:
                         self.attendance_system.task_manager.remove_task_by_id(task_id)
-                    schedule.clear()
-                schedule.every().day.at(time_str).do(lambda: asyncio.create_task(punch_in_job()))
+                    # 一次性任务：执行后按本类型 tag 自删。注意 return schedule.CancelJob 在本仓
+                    # do(lambda: asyncio.create_task(...)) 包装下不生效（scheduler 拿到的是 Task），
+                    # 故用 schedule.clear(本类型 tag) 自清，既实现一次性语义又不误伤其它 job。
+                    schedule.clear('punch_in_scheduled')
+                schedule.every().day.at(time_str).do(lambda: asyncio.create_task(punch_in_job())).tag('punch_in_scheduled', *per_task_tags)
             else:
                 async def punch_out_job():
                     # 调用punch_out()不传username参数，表示为所有用户打卡
@@ -2639,8 +2780,11 @@ class TelegramBot:
                     # 执行完后删除所有任务
                     for task_id, _ in task_ids:
                         self.attendance_system.task_manager.remove_task_by_id(task_id)
-                    schedule.clear()
-                schedule.every().day.at(time_str).do(lambda: asyncio.create_task(punch_out_job()))
+                    # 一次性任务：执行后按本类型 tag 自删。注意 return schedule.CancelJob 在本仓
+                    # do(lambda: asyncio.create_task(...)) 包装下不生效（scheduler 拿到的是 Task），
+                    # 故用 schedule.clear(本类型 tag) 自清，既实现一次性语义又不误伤其它 job。
+                    schedule.clear('punch_out_scheduled')
+                schedule.every().day.at(time_str).do(lambda: asyncio.create_task(punch_out_job())).tag('punch_out_scheduled', *per_task_tags)
 
             user_list = "、".join([name for _, name in task_ids])
             await self.send_message("设置成功", f"已为所有用户（{user_list}）设置在 {target_time.strftime('%Y-%m-%d %H:%M')} 自动{display_type}打卡")
@@ -2661,22 +2805,30 @@ class TelegramBot:
                 username=username
             )
 
+            # 同样打上 per-task tag（task_{id}），供 /kill 精准取消本 job（M17）。
+            per_task_tag = f'task_{task_id}'
             if task_type == "punch_in":
                 async def punch_in_job():
                     # 传递username参数，只为指定用户打卡
                     await self.attendance_system.punch_in(username)
                     # 执行完后删除任务
                     self.attendance_system.task_manager.remove_task_by_id(task_id)
-                    schedule.clear()
-                schedule.every().day.at(time_str).do(lambda: asyncio.create_task(punch_in_job()))
+                    # 一次性任务：执行后按本类型 tag 自删。注意 return schedule.CancelJob 在本仓
+                    # do(lambda: asyncio.create_task(...)) 包装下不生效（scheduler 拿到的是 Task），
+                    # 故用 schedule.clear(本类型 tag) 自清，既实现一次性语义又不误伤其它 job。
+                    schedule.clear('punch_in_scheduled')
+                schedule.every().day.at(time_str).do(lambda: asyncio.create_task(punch_in_job())).tag('punch_in_scheduled', per_task_tag)
             else:
                 async def punch_out_job():
                     # 传递username参数，只为指定用户打卡
                     await self.attendance_system.punch_out(username)
                     # 执行完后删除任务
                     self.attendance_system.task_manager.remove_task_by_id(task_id)
-                    schedule.clear()
-                schedule.every().day.at(time_str).do(lambda: asyncio.create_task(punch_out_job()))
+                    # 一次性任务：执行后按本类型 tag 自删。注意 return schedule.CancelJob 在本仓
+                    # do(lambda: asyncio.create_task(...)) 包装下不生效（scheduler 拿到的是 Task），
+                    # 故用 schedule.clear(本类型 tag) 自清，既实现一次性语义又不误伤其它 job。
+                    schedule.clear('punch_out_scheduled')
+                schedule.every().day.at(time_str).do(lambda: asyncio.create_task(punch_out_job())).tag('punch_out_scheduled', per_task_tag)
 
             user_info = f"（{username}）" if username else ""
             await self.send_message("设置成功", f"已设置在 {target_time.strftime('%Y-%m-%d %H:%M')} 自动{display_type}打卡{user_info}")
@@ -2853,10 +3005,9 @@ class TelegramBot:
                 message_content += "⚠️ 无法获取截图\n"
                 await status_message.edit_text(message_content)
 
-            # 关闭浏览器
+            # 关闭浏览器（正常路径提示；真正的释放统一放到 finally 兜底，避免重复关闭副作用）
             message_content += "🔒 正在关闭浏览器...\n"
             await status_message.edit_text(message_content)
-            selenium_controller.close()
 
             message_content += "✅ 完整流程完成！"
             await status_message.edit_text(message_content)
@@ -2871,6 +3022,14 @@ class TelegramBot:
                         await update.message.reply_photo(photo=screenshot, caption=f"Selenium完整{flow_name}流程异常截图")
             except:
                 pass
+        finally:
+            # M50: 无论正常完成还是任意一步抛异常（流程失败/截图/reply_photo/edit_text 超长或网络错误等），
+            # 都要释放 WebDriver，避免 msedgedriver/浏览器进程残留导致孤儿进程泄漏
+            if 'selenium_controller' in locals():
+                try:
+                    selenium_controller.close()
+                except Exception as close_err:
+                    logging.warning(f"关闭Selenium控制器时发生错误: {close_err!r}")
 
     async def _handle_punch_out_time_confirmation(self, update, message_content: str, flow_data: dict) -> str:
         """处理下班打卡的时间确认逻辑"""
@@ -3075,6 +3234,17 @@ class TelegramBot:
                 logging.info("8:15提醒任务触发 - 检查是否为工作日")
                 work_day_result = is_work_day()
                 logging.info(f"工作日判断结果: {work_day_result}")
+                # M91: schedule 1.2.1 唤醒后会补跑错过的任务。睡过 08:15 下午唤醒会收到「早上好」+「确认使用上次配置」按钮，
+                # 下午点击会按点击时间重算定时、排出无意义任务。此处加时间窗：偏离预定 08:15 超过 1 小时时只发提示、不触发可执行交互。
+                scheduled_today = current_time.replace(hour=8, minute=15, second=0, microsecond=0)
+                if abs((current_time - scheduled_today).total_seconds()) > 3600:
+                    logging.info("当前时间已大幅偏离 08:15（疑似睡眠唤醒补跑），仅发送提示消息，不触发每日提醒交互")
+                    if work_day_result:
+                        asyncio.create_task(self.send_message(
+                            "例行任务提示",
+                            "⏰ 已错过 8:15 每日提醒（疑似睡眠唤醒后补跑）\n如需设置今日打卡，请手动使用 /set_time"
+                        ))
+                    return None
                 if work_day_result:
                     logging.info("确认为工作日，启动每日提醒任务")
                     try:
@@ -3099,8 +3269,21 @@ class TelegramBot:
             
             # 创建16:35自动下班任务
             def auto_trigger_autobyebye_job():
+                current_time = datetime.now()
                 logging.info("16:35自动下班任务触发 - 检查是否为工作日")
-                if is_work_day():
+                work_day_result = is_work_day()
+                # M91: 睡过 16:35 深夜/次日唤醒会补跑本任务，若当日已有上班记录则给出「✅ 立即执行下班打卡」按钮，
+                # 用户在错误时段一键点击会真实打卡。此处加时间窗：偏离预定 16:35 超过 1 小时时只发提示、不带可执行按钮。
+                scheduled_today = current_time.replace(hour=16, minute=35, second=0, microsecond=0)
+                if abs((current_time - scheduled_today).total_seconds()) > 3600:
+                    logging.info("当前时间已大幅偏离 16:35（疑似睡眠唤醒补跑），仅发送提示消息，不触发自动下班检测")
+                    if work_day_result:
+                        asyncio.create_task(self.send_message(
+                            "例行任务提示",
+                            "⏰ 已错过 16:35 自动下班检测（疑似睡眠唤醒后补跑）\n如需下班打卡，请手动使用 /auto_byebye 或 /punch_out"
+                        ))
+                    return
+                if work_day_result:
                     logging.info("确认为工作日，启动16:35自动下班任务")
                     asyncio.create_task(self._auto_trigger_autobyebye())
                 else:
@@ -3387,12 +3570,16 @@ class TelegramBot:
 
             if not calc_success:
                 error_msg = f"❌ 计算下班时间失败：{calc_message}"
-                if hasattr(query_or_update, 'message'):
-                    # CallbackQuery
-                    await query_or_update.message.edit_text(error_msg)
-                else:
+                # M18：telegram.Update 同样有 message 属性，原 hasattr(x,'message') 对 Update
+                # 也为 True，会误走 CallbackQuery 分支去 edit_text 用户自己发的文本消息（Telegram
+                # 报 BadRequest），导致手动输入上班时间流程必然失败。改用 isinstance(x, Update) 区分：
+                # Update（用户消息）走 reply_text，CallbackQuery（bot 自己的消息）走 edit_text。
+                if isinstance(query_or_update, Update):
                     # Update
                     await query_or_update.message.reply_text(error_msg)
+                else:
+                    # CallbackQuery
+                    await query_or_update.message.edit_text(error_msg)
                 return
 
             # 创建确认按钮
@@ -3414,21 +3601,21 @@ class TelegramBot:
                 f"请选择操作："
             )
 
-            # 发送确认消息
-            if hasattr(query_or_update, 'message'):
-                # CallbackQuery
-                await query_or_update.message.edit_text(confirm_message, reply_markup=reply_markup)
-            else:
+            # 发送确认消息（M18：同上，用 isinstance(x, Update) 区分用户消息/回调消息）
+            if isinstance(query_or_update, Update):
                 # Update
                 await query_or_update.message.reply_text(confirm_message, reply_markup=reply_markup)
+            else:
+                # CallbackQuery
+                await query_or_update.message.edit_text(confirm_message, reply_markup=reply_markup)
 
         except Exception as e:
             error_msg = f"❌ 处理上班时间时发生错误: {str(e)}"
             logging.error(f"_process_punch_in_time_and_confirm 错误: {e}")
-            if hasattr(query_or_update, 'message'):
-                await query_or_update.message.edit_text(error_msg)
-            else:
+            if isinstance(query_or_update, Update):
                 await query_or_update.message.reply_text(error_msg)
+            else:
+                await query_or_update.message.edit_text(error_msg)
 
     async def send_message_with_reply_markup(self, title, content, reply_markup):
         """发送带有回复标记的消息"""

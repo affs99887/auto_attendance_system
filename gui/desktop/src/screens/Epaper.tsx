@@ -6,7 +6,7 @@ import * as React from 'react';
 import { Icon } from '../lib/icons';
 import { useEpaperStore, epdClient, buildStationData, sortMemos, type EpdScanDevice } from '../store/epaper';
 import { EpdCmd, canvasSizes, canvasSizeLabels, epdDrivers, hex2bytes, parseHolidayData, buildHolidayPayload, DEFAULT_HOLIDAYS_2026, DEFAULT_HOLIDAYS_2027 } from '../lib/epaper/protocol';
-import { adjustContrast, ditherImage, processImageData, decodeProcessedData, type DitherMode, type DitherAlgorithm } from '../lib/epaper/dithering';
+import { ditherImageDataAsync, processImageData, type DitherMode, type DitherAlgorithm } from '../lib/epaper/dithering';
 import { renderStation, STATION_MEMO_MAX, type StationMemoItem } from '../lib/epaper/station';
 import { sendCanvasToEpd, epdSendBusy } from '../lib/epaper/sendImage';
 import { appAlert, appConfirm } from '../lib/dialog';
@@ -78,6 +78,17 @@ const MAC_IN_NAME = /([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}/;
 const hasRealName = (name: string): boolean => {
   const n = name.trim();
   return n !== '' && !MAC_IN_NAME.test(n);
+};
+
+// SET_TIME 第 5 字节为时区（小时）。原写法 `-(getTimezoneOffset()/60)` 直接塞进 Uint8Array：
+// 1) 非整点时区（如印度 UTC+5:30，offset=-330 → 5.5）会被截断成 5，丢失半小时；
+// 2) 负偏移时区（西半球，结果为负数）写入 Uint8Array 会按 256 取模变成大正数，
+//    设备端按无符号解释时时区完全错误。
+// 这里统一：四舍五入到整小时（非整点时区按设备约定降级为最近整点），再编码为有符号字节
+// 的两补码（& 0xFF），与设备端有符号字节解释保持一致。
+const tzOffsetByte = (): number => {
+  const tzHours = Math.round(-new Date().getTimezoneOffset() / 60);
+  return tzHours & 0xFF; // 两补码截断到 1 字节：正偏移原样，负偏移得 256+tzHours（如 -8 → 248/0xF8）
 };
 
 export function EpaperScreen() {
@@ -160,6 +171,9 @@ export function EpaperScreen() {
   const fileInputRef = React.useRef<HTMLInputElement>(null);
   const logBoxRef = React.useRef<HTMLDivElement>(null);
   const statusTimerRef = React.useRef<number | null>(null);
+  // 抖动滑块（强度/对比度）拖动时的去抖定时器：避免每动一格就在大画布（如 1360×480）上
+  // 同步跑一遍全图 Stucki/Jarvis 误差扩散导致主线程卡死，拖停约 200ms 后再重算一次。
+  const ditherDebounceRef = React.useRef<number | null>(null);
 
   // 管理器回调在 React 渲染周期外执行，经 ref 读取最新配置
   const optsRef = React.useRef({ ditherMode, ditherAlg, ditherStrength, ditherContrast, mtu, interleaved, textInput, fontFamily, fontSize });
@@ -176,7 +190,7 @@ export function EpaperScreen() {
     ctx.fillRect(0, 0, canvas.width, canvas.height);
   };
 
-  const convertDithering = React.useCallback(() => {
+  const convertDithering = React.useCallback(async () => {
     const canvas = canvasRef.current, ctx = ctxRef.current, paint = paintRef.current;
     if (!canvas || !ctx || !paint) return;
 
@@ -185,24 +199,47 @@ export function EpaperScreen() {
 
     const { ditherContrast, ditherAlg, ditherStrength, ditherMode } = optsRef.current;
     const currentImageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+    // 复制一份像素再交给异步流水线：ditherImageDataAsync 会转移该副本的底层 buffer 到 worker，
+    // 用副本可避免影响画布原始像素（与原同步版先深拷贝的行为一致）。
     const imageData = new ImageData(
       new Uint8ClampedArray(currentImageData.data),
       currentImageData.width,
       currentImageData.height,
     );
 
-    adjustContrast(imageData, ditherContrast);
+    // 整条流水线（对比度→抖动→打包→解包预览）改在 Web Worker 中异步执行，避免大画布
+    // 单次转换同步阻塞主线程导致窗口卡死（审计 E2 核心冻结根因）；worker 不可用时内部自动同步回退。
+    let finalImageData: ImageData;
+    try {
+      finalImageData = await ditherImageDataAsync(imageData, ditherContrast, ditherAlg, ditherStrength, ditherMode);
+    } catch (e) {
+      // worker 罕见整体异常：吞掉以免变成未处理的 promise rejection，后续调用会自动回退同步
+      addLog(`抖动处理失败: ${(e as Error).message ?? e}`);
+      return;
+    }
+    // 异步返回后画布可能已被销毁/卸载，重新校验后再写回
+    if (!canvasRef.current || !ctxRef.current) return;
+    ctxRef.current.putImageData(finalImageData, 0, 0);
 
-    const processedData = processImageData(ditherImage(imageData, ditherAlg, ditherStrength, ditherMode), ditherMode);
-    const finalImageData = decodeProcessedData(processedData, canvas.width, canvas.height, ditherMode);
-    ctx.putImageData(finalImageData, 0, 0);
-
-    paint.saveToHistory();
-  }, []);
+    // 抖动烘焙后的画面无法由笔迹重建，须存全量快照；finalImageData 已是本次最终像素的
+    // 独立副本（worker 回包/同步回退均 new ImageData，写回后不再使用其 buffer），直接复用为快照，
+    // 省掉 saveToHistory 内部对整张画布再做一次 getImageData（消除审计 E16 指出的冗余整张拷贝）。
+    paint.saveToHistory(finalImageData);
+  }, [addLog]);
 
   const applyDither = React.useCallback(() => {
-    cropRef.current?.finishCrop(() => convertDithering());
+    cropRef.current?.finishCrop(() => void convertDithering());
   }, [convertDithering]);
+
+  // 去抖版 applyDither：仅供强度/对比度滑块拖动时调用，拖停约 200ms 才重算一次，
+  // 避免连续 onChange 在大画布上反复全图重算阻塞 UI（见 ditherDebounceRef 说明）。
+  const applyDitherDebounced = React.useCallback(() => {
+    if (ditherDebounceRef.current != null) window.clearTimeout(ditherDebounceRef.current);
+    ditherDebounceRef.current = window.setTimeout(() => {
+      ditherDebounceRef.current = null;
+      applyDither();
+    }, 200);
+  }, [applyDither]);
 
   const updateImage = React.useCallback(() => {
     const canvas = canvasRef.current, ctx = ctxRef.current, paint = paintRef.current, crop = cropRef.current;
@@ -217,18 +254,29 @@ export function EpaperScreen() {
     const image = new Image();
     image.onload = () => {
       URL.revokeObjectURL(image.src);
-      if (image.width / image.height === canvas.width / canvas.height) {
-        if (crop.isCropMode()) crop.exitCropMode();
-        ctx.drawImage(image, 0, 0, image.width, image.height, 0, 0, canvas.width, canvas.height);
-        convertDithering();
+      // 解码可能在组件卸载后才回调：此时清理函数已把 paintRef/cropRef 置 null，
+      // 闭包里的 paint/crop 局部变量仍指向已弃用的旧管理器。改为重新从 ref 读取并校验
+      // 画布仍挂载，避免向已 detach 的旧画布写入并对弃用管理器做无效操作。
+      const liveCanvas = canvasRef.current, liveCtx = ctxRef.current;
+      const livePaint = paintRef.current, liveCrop = cropRef.current;
+      if (!liveCanvas || !liveCtx || !livePaint || !liveCrop) return;
+      if (image.width / image.height === liveCanvas.width / liveCanvas.height) {
+        if (liveCrop.isCropMode()) liveCrop.exitCropMode();
+        liveCtx.drawImage(image, 0, 0, image.width, image.height, 0, 0, liveCanvas.width, liveCanvas.height);
+        void convertDithering();
       } else {
         void appAlert('图片宽高比例与画布不匹配，将进入裁剪模式。\n请放大图片后移动图片使其充满画布, 再点击"完成"按钮。', { title: '进入裁剪模式' });
-        paint.setActiveTool(null, '');
-        crop.initializeCrop();
+        livePaint.setActiveTool(null, '');
+        liveCrop.initializeCrop();
       }
     };
+    // 解码失败（损坏/不支持格式）时 onload 不会触发：补 onerror 释放 ObjectURL 防永久泄漏并提示
+    image.onerror = () => {
+      URL.revokeObjectURL(image.src);
+      addLog('图片加载失败：文件可能已损坏或为不支持的格式');
+    };
     image.src = URL.createObjectURL(file);
-  }, [convertDithering]);
+  }, [convertDithering, addLog]);
 
   const updateCanvasSize = React.useCallback((name: string) => {
     const size = canvasSizes.find(s => s.name === name);
@@ -277,6 +325,7 @@ export function EpaperScreen() {
       paintRef.current = null;
       cropRef.current = null;
       if (statusTimerRef.current) window.clearTimeout(statusTimerRef.current);
+      if (ditherDebounceRef.current != null) window.clearTimeout(ditherDebounceRef.current);
     };
   }, []);
 
@@ -315,7 +364,7 @@ export function EpaperScreen() {
       (timestamp >> 16) & 0xFF,
       (timestamp >> 8) & 0xFF,
       timestamp & 0xFF,
-      -(new Date().getTimezoneOffset() / 60),
+      tzOffsetByte(), // 时区字节：整点四舍五入 + 有符号两补码编码，修复半点/负偏移时区截断
       mode,
     ]);
     if (await epdClient.write(EpdCmd.SET_TIME, data)) {
@@ -379,7 +428,7 @@ export function EpaperScreen() {
       (timestamp >> 16) & 0xFF,
       (timestamp >> 8) & 0xFF,
       timestamp & 0xFF,
-      -(new Date().getTimezoneOffset() / 60),
+      tzOffsetByte(), // 时区字节：整点四舍五入 + 有符号两补码编码，修复半点/负偏移时区截断
       mode,
     ]);
 
@@ -404,7 +453,9 @@ export function EpaperScreen() {
       return;
     }
 
-    const holidays = parseHolidayData(holidayData, line => addLog(`警告: 跳过无效数据 "${line}"`));
+    // 传入 holidayYear（已校验为 2020-2050 的合法年份）使日期校验按实际闰年判定，
+    // 杜绝非闰年(如2026)中 2-29 等不存在的日期被编码下发
+    const holidays = parseHolidayData(holidayData, line => addLog(`警告: 跳过无效数据 "${line}"`), holidayYear);
 
     if (holidays.length === 0) {
       await appAlert('没有有效的假期数据！');
@@ -693,12 +744,12 @@ export function EpaperScreen() {
   const onDitherStrengthChange = (v: number) => {
     setDitherStrength(v);
     optsRef.current.ditherStrength = v;
-    applyDither();
+    applyDitherDebounced(); // 拖动滑块去抖，避免连续全图重算卡死 UI
   };
   const onDitherContrastChange = (v: number) => {
     setDitherContrast(v);
     optsRef.current.ditherContrast = v;
-    applyDither();
+    applyDitherDebounced(); // 拖动滑块去抖，避免连续全图重算卡死 UI
   };
 
   // ===== 渲染派生 =====

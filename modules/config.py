@@ -334,15 +334,117 @@ class Config:
             return 9899
 
     @classmethod
+    def _mihomo_binary_missing(cls):
+        """检测 mihomo 二进制是否缺失（确定性失败信号）。
+
+        [M60] 二进制不存在属"重试多少次都不会好"的确定性失败——此时 mihomo 永远不会就绪，
+        若 get_telegram_proxy 仍返回内置死端口，Telegram 全链路会永久不可用。这里只做纯文件
+        存在性判断（无副作用），不导入/实例化 ProxyManager（其 __init__ 有迁移副作用，且会引入
+        与 modules.proxy_manager 的循环导入）。路径派生与 ProxyManager.mihomo_path() 保持一致：
+        <project_root>/bin/mihomo(.exe)，二者同在 modules/ 下故 __file__ 推导出的根目录相同。
+        """
+        try:
+            project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+            name = 'mihomo.exe' if os.name == 'nt' else 'mihomo'
+            return not os.path.isfile(os.path.join(project_root, 'bin', name))
+        except Exception:
+            # 探测自身异常时保守认为"未缺失"，沿用原有"等待 mihomo 启动"的行为，避免误回退。
+            return False
+
+    @classmethod
+    def _active_local_profile_content(cls, cfg):
+        """返回当前激活 local profile 的正文（str），非 local / 无激活 profile 时返回 None（无副作用）。
+
+        [M60] 判定口径与 ProxyManager._get_active_profile / _read_local_content 严格一致：
+        - active profile = 按 active_profile_id 查找，失效则兜底取 profiles[0]；
+        - local 正文优先读 proxy_runtime/profiles/<id>.yaml，缺失则回退内联 content（兼容未迁移旧数据）。
+        runtime 路径与 ProxyManager(__file__ → modules/.. + proxy_runtime/profiles) 同根。
+        仅做纯文件读取，不导入/实例化 ProxyManager，避免迁移副作用与循环导入。
+        """
+        profiles = cfg.get('profiles')
+        if not (isinstance(profiles, list) and profiles):
+            return None
+        active_id = cfg.get('active_profile_id') or ''
+        prof = next((p for p in profiles if isinstance(p, dict) and p.get('id') == active_id), None)
+        if prof is None:
+            prof = profiles[0] if isinstance(profiles[0], dict) else None
+        if prof is None or prof.get('type') != 'local':
+            return None
+        pid = prof.get('id')
+        if pid:
+            project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+            cache = os.path.join(project_root, 'proxy_runtime', 'profiles', f'{pid}.yaml')
+            if os.path.isfile(cache):
+                try:
+                    with open(cache, 'r', encoding='utf-8') as f:
+                        return f.read()
+                except OSError:
+                    # 读缓存失败时回退内联 content，与 _read_local_content 行为一致。
+                    pass
+        return prof.get('content') or ''
+
+    @classmethod
+    def _proxy_deterministic_failure(cls):
+        """检测内置加速是否处于"重试多少次都不会就绪"的确定性失败，返回原因字符串或 None（无副作用）。
+
+        [M60] 仅靠 _mihomo_binary_missing 不够：审计指出除二进制缺失外，"active profile 配置损坏 /
+        根本没有配置任何 profile"同样是确定性失败——ProxyManager.start() 会在 _write_config 抛
+        "尚未配置任何代理订阅/配置文件"或在 _build_config_from_text 抛 YAML 解析错误而永远启动
+        不了 mihomo。此时若 get_telegram_proxy 仍返回内置死端口，Telegram 全链路（打卡通知 /
+        远程控制 / 状态上报）会永久失效。故把这类无法靠等待恢复的情形统一识别出来，让
+        get_telegram_proxy 回退系统代理探测/直连。
+
+        这里只读自身配置（profiles 列表 + 激活 local profile 正文），不导入/实例化 ProxyManager
+        （其 __init__ 有迁移副作用且会引入循环导入），判定口径与 ProxyManager._get_active_profile/
+        _write_config/_build_config_from_text 保持一致：
+        - profiles 为空 → _write_config 必抛"尚未配置..."；
+        - 激活的是 local profile 且正文空白/YAML 不可解析/根节点非映射 → _build_config_from_text 必抛。
+        订阅 profile 的 URL 是否可达需联网才知（瞬时网络问题非确定性失败），故不在此判定；端口被占
+        等情形也无法在不连接的前提下无副作用地判定，均交由进程响应/Telegram 有限次重试兜底，不误判。
+        """
+        if cls._mihomo_binary_missing():
+            return 'mihomo 二进制缺失（bin/ 未打包）'
+        try:
+            cfg = cls.get_proxy_config()
+            profiles = cfg.get('profiles')
+            if not (isinstance(profiles, list) and profiles):
+                return '未配置任何代理订阅/配置文件'
+            # 激活的是 local profile 时，提前校验其正文能否被 mihomo 解析——
+            # 空白 / YAML 语法错误 / 根节点非映射都会让 _build_config_from_text 永久失败。
+            content = cls._active_local_profile_content(cfg)
+            if content is not None:
+                if not content.strip():
+                    return '激活的本地代理配置为空'
+                try:
+                    import yaml  # 懒导入：与 _build_config_from_text 一致，仅 local 模式需要
+                except ImportError:
+                    # 无 PyYAML 同样使 _build_config_from_text 直接抛错而永远启动不了。
+                    return '解析本地代理配置需要 PyYAML（未安装）'
+                try:
+                    data = yaml.safe_load(content)
+                except Exception:
+                    return '激活的本地代理配置 YAML 解析失败（已损坏）'
+                if not isinstance(data, dict):
+                    return '激活的本地代理配置根节点不是映射（已损坏）'
+        except Exception:
+            # 读配置自身异常时保守认为"非确定性失败"，沿用原有"等待 mihomo 启动"行为，避免误回退。
+            return None
+        return None
+
+    @classmethod
     def get_telegram_proxy(cls):
         """返回 Telegram 使用的代理 URL。
 
-        - 启用内置加速：**始终**直连本程序自管理的 mihomo 本地端口，完全不依赖系统代理。
+        - 启用内置加速：默认直连本程序自管理的 mihomo 本地端口，完全不依赖系统代理。
           端口暂未就绪时仍返回内置 URL（由 Telegram 初始化的有限次重试等待 mihomo 启动完成），
-          **绝不回退**到系统 Clash/VPN 端口（7897 等）——避免误用与本程序无关的系统代理。
+          不回退到系统 Clash/VPN 端口（7897 等）——避免误用与本程序无关的系统代理。
+          [M60] 例外：当检测到确定性失败（mihomo 二进制缺失、或未配置任何 profile 导致 start() 必失败）
+          时，mihomo 永远无法就绪，继续返回内置死端口会让打卡通知/远程控制/状态上报永久失效，故此时
+          回退到下方系统代理探测路径（探测不到再走直连），而非死等。
         - 未启用：按顺序探测 TELEGRAM_PROXY_PORTS（系统 Clash 等），返回首个可连通的；都不通则 None。
         """
-        if cls.get_proxy_enabled():
+        _det_fail = cls._proxy_deterministic_failure() if cls.get_proxy_enabled() else None
+        if cls.get_proxy_enabled() and _det_fail is None:
             port = cls.get_proxy_local_port()
             url = f"http://127.0.0.1:{port}"
             try:
@@ -354,6 +456,13 @@ class Config:
                     f"内置加速端口 127.0.0.1:{port} 未就绪，等待 mihomo 启动（不回退系统代理）"
                 )
             return url
+        # [M60] 启用了内置加速但属确定性失败（二进制缺失 / 未配置 profile）：落入此分支，
+        # 回退系统代理探测/直连，以免 Telegram 永久指向无人监听的回环端口。
+        if cls.get_proxy_enabled():
+            logging.warning(
+                f"已启用内置网络加速但无法就绪（{_det_fail}），回退系统代理探测/直连，"
+                "请检查 bin/ 是否已打包、是否已添加代理配置，或在 GUI 关闭内置加速开关"
+            )
         host = cls.TELEGRAM_PROXY_HOST
         scheme = cls.TELEGRAM_PROXY_SCHEME
         timeout = cls.TELEGRAM_PROXY_PROBE_TIMEOUT

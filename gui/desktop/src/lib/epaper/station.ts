@@ -51,7 +51,9 @@ const INK = '#000000';
 const PAPER = '#ffffff';
 const RED = '#ff0000';
 
-// 字体栈（app 已加载 IBM Plex Sans SC / JetBrains Mono；衬线回退系统宋体）
+// 字体栈（index.html 的 Google Fonts <link> 已加载 IBM Plex Sans / IBM Plex Sans SC /
+// JetBrains Mono 的 400;500;600;700 与 Noto Serif SC 的 700;900——本文件用到的全部字重；
+// SERIF 走 Noto Serif SC，缺字/离线时再回退 Source Han Serif SC / 系统宋体）
 const SANS = "'IBM Plex Sans SC', 'IBM Plex Sans', 'Microsoft YaHei', sans-serif";
 const MONO = "'JetBrains Mono', 'IBM Plex Mono', Consolas, 'Microsoft YaHei', monospace";
 const SERIF = "'Noto Serif SC', 'Source Han Serif SC', SimSun, serif";

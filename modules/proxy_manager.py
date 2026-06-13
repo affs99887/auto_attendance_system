@@ -18,6 +18,7 @@ import time
 import shutil
 import secrets
 import logging
+import asyncio
 import zipfile
 import platform
 import subprocess
@@ -163,6 +164,8 @@ class ProxyManager:
         self.proc = None
         self._job = None  # Windows Job Object 句柄（KILL_ON_JOB_CLOSE）；非 Windows/降级时为 None
         self._last_traffic = None  # (ts, up_total, down_total)
+        # [M41] watchdog 协程的停止开关：main.py 在关停时置 True，让巡检循环优雅退出
+        self._watchdog_stop = False
         # [M26] 启动即把存量 local 正文迁出 dynamic_config.json（幂等；失败不致命，不阻断构造）
         try:
             self._migrate_local_content_out()
@@ -660,6 +663,54 @@ class ProxyManager:
             logger.warning('热重载失败，改为重启', exc_info=True)
         self.stop()
         return self.start()
+
+    # ------------------------------------------------------------------ 健康巡检 / 自动重启
+    # [M41] mihomo 子进程无健康监控时，进程一旦退出（崩溃/被安全软件杀/唤醒后异常），
+    # config.get_telegram_proxy() 仍"绝不回退"地返回死端口 URL，telegram_bot.monitor_connection
+    # 探测失败→restart_polling→重新 build 仍指向死端口的 app→指数退避永久失败循环，
+    # 打卡通知/远程控制/截图推送全部瘫痪。这里加一个周期性巡检协程，启用代理时主动发现进程
+    # 死亡并限频自动重启 mihomo，使 Telegram 全链路能随之恢复。
+    async def watchdog(self, interval=30):
+        """周期性巡检 mihomo 进程，启用代理且进程已死时限频自动重启。
+
+        由 main.py 在启动内置加速后挂为后台任务；关停时置 self._watchdog_stop=True 使其退出。
+        - 仅在 config.get_proxy_enabled() 为真时介入（禁用代理时不重启，交还系统代理/直连）。
+        - start() 为同步阻塞方法，放进 asyncio.to_thread 执行，避免阻塞事件循环。
+        - 连续重启失败做指数退避（最长 600 秒），与 monitor_connection 的退避一致，避免刷屏。
+        """
+        fail_count = 0  # 连续自动重启失败计数，用于指数退避
+        while not self._watchdog_stop:
+            try:
+                # 未启用代理：不巡检（恢复计数即可），按基础间隔轮询配置变化
+                if not config.get_proxy_enabled():
+                    fail_count = 0
+                    await asyncio.sleep(interval)
+                    continue
+                if self.is_running():
+                    fail_count = 0
+                    await asyncio.sleep(interval)
+                    continue
+                # 启用代理但进程已死：自动重启（同步 start 丢到线程池，不卡事件循环）
+                logger.warning('巡检发现 mihomo 已退出，尝试自动重启（第 %d 次）', fail_count + 1)
+                try:
+                    ok, msg = await asyncio.to_thread(self.start)
+                except Exception:
+                    ok, msg = False, '自动重启异常'
+                    logger.error('mihomo 自动重启异常', exc_info=True)
+                if ok:
+                    fail_count = 0
+                    logger.info('mihomo 已自动重启：%s', msg)
+                    await asyncio.sleep(interval)
+                else:
+                    fail_count += 1
+                    logger.warning('mihomo 自动重启失败：%s', msg)
+                    backoff = min(interval * (2 ** fail_count), 600)
+                    await asyncio.sleep(backoff)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.error('mihomo 巡检循环异常', exc_info=True)
+                await asyncio.sleep(interval)
 
     # ------------------------------------------------------------------ API 客户端
     def _api_base(self):

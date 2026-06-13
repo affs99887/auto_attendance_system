@@ -71,8 +71,10 @@ def setup_logging():
 def check_environment():
     """检查运行环境"""
     # 检查Python版本
-    if sys.version_info < (3, 6):
-        print("错误: 需要Python 3.6或更高版本")
+    # 提升到 3.10：electron-builder.yml 声明用户机器需 Python 3.10+，且 requirements.txt
+    # 的依赖（numpy>=1.26 等）只对 3.10+ 提供 wheel，3.6 的旧提示会误导首装用户。
+    if sys.version_info < (3, 10):
+        print("错误: 需要Python 3.10或更高版本")
         return False
     
     # 检查必要文件
@@ -157,16 +159,44 @@ def show_status():
     main_running = False
     watchdog_running = False
     
+    # [M89 补全] 进程归属判断与 watchdog.is_process_running 对齐：
+    # 用 basename 命中 + 归一化绝对路径校验脚本属于本项目目录，避免把机器上任意
+    # 含 'main.py'/'watchdog.py' 参数的无关 python 进程误报为本系统在运行。
+    project_root = os.path.dirname(os.path.abspath(__file__))
+
+    def _belongs_to_project(cmdline, script_name):
+        """判断该进程的 cmdline 是否在运行本项目根目录下的指定脚本。
+
+        - 仅 main.py 的 GUI 形态（--gui）放宽为按 basename 命中即认定，
+          兼容打包态后端脚本位于不同绝对路径（resources\\backend\\main.py）的情形；
+        - 其余一律按归一化绝对路径比对，确保归属本项目。
+        """
+        target = os.path.normcase(os.path.normpath(os.path.join(project_root, script_name)))
+        if script_name == 'main.py' and '--gui' in cmdline:
+            return any(arg and os.path.basename(arg).lower() == 'main.py' for arg in cmdline)
+        for arg in cmdline:
+            if not arg or os.path.basename(arg).lower() != script_name.lower():
+                continue
+            arg_path = os.path.normcase(os.path.normpath(
+                os.path.join(project_root, arg) if not os.path.isabs(arg) else arg
+            ))
+            if arg_path == target:
+                return True
+        return False
+
     for proc in psutil.process_iter(['pid', 'name', 'cmdline']):
         try:
-            if proc.info['cmdline']:
-                cmdline = ' '.join(proc.info['cmdline'])
-                if 'main.py' in cmdline:
-                    main_running = True
-                    print(f"主程序正在运行 (PID: {proc.info['pid']})")
-                elif 'watchdog.py' in cmdline:
-                    watchdog_running = True
-                    print(f"看门狗正在运行 (PID: {proc.info['pid']})")
+            name = (proc.info['name'] or '').lower()
+            # 仅看 python 解释器进程（兼容 Windows 的 python.exe）
+            if not name.startswith('python'):
+                continue
+            cmdline = proc.info['cmdline'] or []
+            if _belongs_to_project(cmdline, 'main.py'):
+                main_running = True
+                print(f"主程序正在运行 (PID: {proc.info['pid']})")
+            elif _belongs_to_project(cmdline, 'watchdog.py'):
+                watchdog_running = True
+                print(f"看门狗正在运行 (PID: {proc.info['pid']})")
         except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
             pass
     

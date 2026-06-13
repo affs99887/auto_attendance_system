@@ -1,6 +1,12 @@
 {
   "compilerOptions": {
+    // [M99] 本项目 build 用 tsc -b，且本文件被 tsconfig.json 的 references 引用；
+    // tsc -b 强制 references 目标必须 composite=true 且不得 noEmit（TS6306/TS6310），
+    // 故无法改成纯类型检查项目。composite 强制 emit（declaration 必开），产物默认落在源码目录，
+    // 形成 vite.config.js/.d.ts 污染。这里保留 composite，并用 outDir 把发射产物移出源码目录到
+    // node_modules/.tmp（已被 .gitignore 忽略），避免污染工作树。
     "composite": true,
+    "outDir": "node_modules/.tmp",
     "skipLibCheck": true,
     "module": "ESNext",
     "moduleResolution": "bundler",

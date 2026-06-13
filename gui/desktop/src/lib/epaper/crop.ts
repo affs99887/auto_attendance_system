@@ -138,6 +138,10 @@ export class CropManager {
       this.exitCropMode();
       if (callback) callback();
     };
+    // 解码失败（损坏/不支持格式）时 onload 不会触发：补 onerror 释放 ObjectURL 防永久泄漏
+    image.onerror = () => {
+      URL.revokeObjectURL(image.src);
+    };
     image.src = URL.createObjectURL(imageFile);
   }
 

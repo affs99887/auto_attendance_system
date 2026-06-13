@@ -165,6 +165,10 @@ class AttendanceSystem:
         self.operation_cancel_event = None  # 用于取消操作的asyncio.Event
         self.operation_lock = asyncio.Lock()  # 确保互斥的锁
         self.operation_start_time = None  # 操作开始时间
+        # [M11 修复] 最近一次派出的打卡 task 引用：不被 _cleanup_operation_state 清空（web 强停会把
+        # operation_task 直接置 None 而不等待旧任务结束）。新操作启动前用它确认旧任务确实已结束，
+        # 否则旧任务可能仍阻塞在 await 中、被新操作 clear 掉取消信号后"复活"误打卡。
+        self._last_operation_task = None
 
         # send_daily_status 并发去重（并行打卡场景下 N 个用户成功后会同时触发）
         self._last_daily_status_send = None  # type: Optional[datetime]
@@ -512,9 +516,19 @@ class AttendanceSystem:
             logging.error(f"保存用户截图失败 (用户: {username}, 类型: {punch_type}): {e}")
             return None
 
+    @staticmethod
+    def _safe_filename_token(username):
+        """[M48 修复] 把用户名清洗成可安全嵌入文件名的 token（仅保留字母数字下划线连字符）。
+
+        并行多账户共用固定截图名会互相覆盖，临时文件名需带用户名区分；但用户名可能含中文/空格/
+        路径分隔符等不适合做文件名的字符，这里统一替换为下划线，空值退化为 'default'。
+        """
+        token = str(username) if username else 'default'
+        return re.sub(r'[^0-9A-Za-z_-]', '_', token)
+
     async def _send_punch_failure_screenshot(self, screen, username, punch_type, error_msg):
         """发送打卡失败截图的辅助方法
-        
+
         Args:
             screen: 截图数据
             username: 用户名
@@ -523,8 +537,15 @@ class AttendanceSystem:
         """
         screenshot_path = None  # Telegram 临时截图，发送异常时也要在 finally 清理
         try:
+            # [M48 修复] 并行多账户下班失败时多用户同时进本方法，原先写 CWD/logs 下固定文件名
+            # （punch_{type}_fail_uncertain.png / punch_{type}_fail_email.png）会互相覆盖：
+            # A 写 → B 覆盖 → A 发出去/邮件附件读到的是 B 的截图，且 finally 删共享文件时与
+            # 另一用户的 open/后台邮件 cleanup 竞争。改为文件名加入安全用户名 + 微秒时间戳，
+            # 使每个用户每次失败都落到唯一路径，彻底消除并发覆盖与删除竞态。
+            safe_username = self._safe_filename_token(username)
+            ts = datetime.now().strftime('%Y%m%d_%H%M%S_%f')
             # 保存并发送当前的浏览器窗口截图
-            screenshot_path = f'punch_{punch_type}_fail_uncertain.png'
+            screenshot_path = f'punch_{punch_type}_fail_uncertain_{safe_username}_{ts}.png'
             cv2.imwrite(screenshot_path, screen)
 
             # 保存失败截图到用户目录
@@ -541,10 +562,14 @@ class AttendanceSystem:
             # 发送电子邮件通知
             surname = self.get_surname_honorific(username)
             email_subject = f"{punch_type}打卡失败通知 - {surname} - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
-            email_body = f"{surname}您好，\n\n您的{punch_type}打卡尝试失败。\n\n原因：{error_msg}\n\n系统会在适当时间自动重试。\n\n此邮件由自动打卡系统发送，请勿回复。"
+            # [M49 修复] 去掉无条件的"系统会在适当时间自动重试"承诺——本方法被多种失败场景复用，
+            # 其中 unable_escape 但 OCR 取不到剩余时间且处于收集（多账户）模式时根本不会调度重试，
+            # 原文案会误导用户漏打下班卡。调用方已把真实结果（是否已调度重试 / 请手动补卡）写进 error_msg，
+            # 邮件正文直接以 error_msg 为准。
+            email_body = f"{surname}您好，\n\n您的{punch_type}打卡尝试失败。\n\n原因：{error_msg}\n\n此邮件由自动打卡系统发送，请勿回复。"
 
-            # 复制截图用于邮件发送
-            email_screenshot_path = f'logs/punch_{punch_type}_fail_email.png'
+            # 复制截图用于邮件发送（唯一文件名，交后台邮件线程读取后清理，绝不与他人共享）
+            email_screenshot_path = f'logs/punch_{punch_type}_fail_email_{safe_username}_{ts}.png'
             with open(screenshot_path, 'rb') as f_in:
                 img_data = f_in.read()
                 with open(email_screenshot_path, 'wb') as f_out:
@@ -1288,6 +1313,42 @@ class AttendanceSystem:
             logging.error(f"get_remaining_time异常: {e}")
             return None
 
+    def _register_self_canceling_job(self, time_str, coro_factory, tag):
+        """[M46 修复] 注册一个"执行完能把自己从 schedule 真正移除"的每日定时任务。
+
+        根因：schedule 库只在 job_func 的返回值是 schedule.CancelJob 时才移除任务，而本项目
+        所有定时打卡任务注册的 job_func 都是 `lambda: asyncio.create_task(coro())`——它永远返回
+        Task 对象，协程内部 `return schedule.CancelJob` 只是协程的返回值，scheduler 根本看不到。
+        结果：已执行完 / 任务已删除的定时 job 永久留在 scheduler 里，每天同一时刻空转触发一次，
+        靠 get_task_by_id 返回 None 的守卫跳过执行并刷"任务 #N 不存在，跳过执行"警告，长期运行下
+        任务列表持续膨胀、日志噪声放大。
+        这里改为：把注册得到的 job 对象通过 cancel_self 回调闭包给协程；协程在原本 `return
+        schedule.CancelJob` 的位置改调 cancel_self()，由它按 job 引用执行 schedule.cancel_job(job)
+        真正出队。同时显式传入 coro_factory（每次调用都新建）从根上规避 lambda 晚绑定（见 M86）。
+
+        Args:
+            time_str: 'HH:MM'
+            coro_factory: callable(cancel_self) -> coroutine，传入"取消自身"回调，返回待执行协程
+            tag: schedule tag，便于按类清理
+        Returns:
+            注册的 job 对象
+        """
+        job_box = {}
+
+        def cancel_self():
+            job = job_box.get('job')
+            if job is not None:
+                try:
+                    schedule.cancel_job(job)
+                except Exception as e:
+                    logging.error(f"取消定时任务失败（tag={tag}）: {e}")
+
+        job = schedule.every().day.at(time_str).do(
+            lambda: asyncio.create_task(coro_factory(cancel_self))
+        ).tag(tag)
+        job_box['job'] = job
+        return job
+
     async def schedule_retry_punch_out(self, delay_minutes, clear_existing=True):
         """设置定时重试下班打卡
 
@@ -1312,42 +1373,84 @@ class AttendanceSystem:
                 schedule.clear('punch_out_retry')
                 logging.info("已替换 punch_out_retry tag 下所有定时任务")
 
-            async def punch_out_job():
-                try:
-                    logging.info("执行定时下班打卡任务")
-                    await self.punch_out()
-                    # 打卡完成后发送状态信息
-                    await self.send_daily_status()
-                    # 仅删除自己 tag 的任务，保留日报等其他 tag
-                    self.task_manager.clear_tasks()
-                    schedule.clear('punch_out_retry')
-                    logging.info("定时下班打卡任务执行完成")
-                except Exception as e:
-                    logging.error(f"执行定时下班打卡任务时发生错误: {str(e)}")
-
-            # 设置定时任务（加 tag，便于后续按 tag 清除）
-            time_str = retry_time.strftime("%H:%M")
-            schedule.every().day.at(time_str).do(lambda: asyncio.create_task(punch_out_job())).tag('punch_out_retry')
-            logging.info(f"已设置定时任务: 每天{time_str}执行下班打卡 (tag=punch_out_retry)")
-
+            # [M9 修复] 把"保存任务记录到文件"提前到 job 定义之前，使 job 能闭包捕获自己的 task_id，
+            # 从而在成功后只删除"自己这条"任务，绝不再 clear_tasks() 全清（否则会连带抹掉重试失败时
+            # 新调度的下一轮重试任务和所有 punch_in 任务，导致重试链断裂、漏打下班卡）。
             # 保存定时任务到文件
-            if clear_existing:
-                self.task_manager.clear_tasks()  # 只有在明确指定时才清除所有任务
-                logging.info("已清除任务管理器中的所有任务")
-            else:
-                # 删除已有的下班打卡任务
-                saved_tasks = self.task_manager.get_tasks()
-                for task in saved_tasks:
-                    if task['type'] == 'punch_out':
-                        self.task_manager.remove_task_by_id(task['id'])
-                        logging.info(f"已从任务管理器中移除下班打卡任务 #{task['id']}")
+            # [M90 修复] 两个分支都只删除已有的 punch_out 类型任务，绝不再 clear_tasks() 全清持久化任务。
+            # 原 clear_existing=True 分支调用 clear_tasks()（task_manager.py 中是整文件清空），会连带抹掉
+            # 用户的次日 punch_in 定时任务记录——当前进程里 punch_in 的 schedule job 还在但查 task_info 为
+            # None 直接跳过，重启后也不再加载，上班定时悄无声息消失。与注释承诺"仅删自己 tag"一致，改为按
+            # 类型逐条删除，与下方（原 else）已有逻辑保持一致。
+            saved_tasks = list(self.task_manager.get_tasks())
+            for task in saved_tasks:
+                if task['type'] == 'punch_out':
+                    self.task_manager.remove_task_by_id(task['id'])
+                    logging.info(f"已从任务管理器中移除下班打卡任务 #{task['id']}")
 
             # 添加新的定时任务
             task_id = self.task_manager.add_task('punch_out', time_str)
             logging.info(f"保存定时任务到文件，任务ID: {task_id}")
 
+            # [M7 修复] 把完整 retry_datetime 闭包进 job，用于在执行入口校验日期/时间偏差。
+            # 否则 schedule.every().day 在睡过重试时刻后唤醒会立即补跑，导致次日早晨打出下班卡。
+            retry_datetime = retry_time
+
+            async def punch_out_job(cancel_self, retry_dt=retry_datetime, tid=task_id):
+                try:
+                    # [M7 修复] 入口三重守卫：偏差过大（跨天/睡过头）则清 tag、发通知并放弃，绝不跨天补打。
+                    now = datetime.now()
+                    drift = (now - retry_dt).total_seconds()
+                    # 容差 30 分钟：超过即视为已错过（含次日唤醒首 tick 触发的场景）
+                    if drift > 30 * 60:
+                        logging.warning(
+                            f"下班重试任务已过期（预定 {retry_dt.strftime('%Y-%m-%d %H:%M')}，"
+                            f"现在 {now.strftime('%Y-%m-%d %H:%M')}，偏差 {drift/60:.0f} 分钟），跳过并清除"
+                        )
+                        # [M9 修复] 任务已过期：仅删除自己这条任务记录并取消本 job，
+                        # 不再 clear_tasks() 全清，避免误删其他用户/类型的定时任务
+                        # [M46 修复] 用 cancel_self() 按 job 引用真正出队（原 return CancelJob 在协程里失效）
+                        self.task_manager.remove_task_by_id(tid)
+                        await self.send_notification(
+                            "下班打卡", f"⚠️ 下班重试时刻（{retry_dt.strftime('%H:%M')}）已过期超过容差，已取消该重试任务，请手动处理"
+                        )
+                        cancel_self()
+                        return
+
+                    logging.info("执行定时下班打卡任务")
+                    # [M9 修复] 用 punch_out() 返回值判断：只有确认成功（True 且非 'cancelled'）才清理。
+                    # 否则（工时不足返回 False / 被互斥拒绝返回 False / 被取消返回 'cancelled'）保留任务，
+                    # 让 _do_selenium_punch/_schedule_unified_retry 新调度的下一轮重试得以存活。
+                    result = await self.punch_out()
+                    # 打卡完成后发送状态信息
+                    await self.send_daily_status()
+                    if result is True:
+                        # [M9 修复] 仅删除自己这条任务记录 + 取消本 job（cancel_self 只移除当前运行的 job，
+                        # 不会动到重试失败时新注册到 punch_out_retry tag 下的下一轮 job）。
+                        # [M46 修复] cancel_self() 真正出队，替代失效的 return CancelJob。
+                        self.task_manager.remove_task_by_id(tid)
+                        logging.info(f"定时下班打卡任务执行完成（成功），已删除任务 #{tid}")
+                        cancel_self()
+                        return
+                    else:
+                        # 失败/取消：保留本任务与新调度的重试，不做任何清理
+                        logging.info(f"定时下班打卡任务未成功（result={result!r}），保留重试任务 #{tid} 不清理")
+                except Exception as e:
+                    logging.error(f"执行定时下班打卡任务时发生错误: {str(e)}")
+
+            # 设置定时任务（加 tag，便于后续按 tag 清除）
+            # [M46 修复] 经 _register_self_canceling_job 注册，使协程内 cancel_self() 能真正从 scheduler 出队
+            time_str = retry_time.strftime("%H:%M")
+            self._register_self_canceling_job(
+                time_str,
+                lambda cancel_self: punch_out_job(cancel_self),
+                'punch_out_retry'
+            )
+            logging.info(f"已设置定时任务: 每天{time_str}执行下班打卡 (tag=punch_out_retry)")
+
             if clear_existing:
-                await self.send_notification("定时设置", f"已清除之前所有的定时任务")
+                # [M90 修复] 实际只清除了已有的下班重试/下班打卡任务，文案随之修正，不再误称"所有定时任务"
+                await self.send_notification("定时设置", f"已清除之前的下班打卡定时任务")
             else:
                 await self.send_notification("定时设置", f"已替换已有的下班打卡任务")
             await self.send_notification("定时设置", f"设置新的下班打卡任务 #{task_id}: {time_str}")
@@ -1442,11 +1545,11 @@ class AttendanceSystem:
             logging.info(f"开始设置定时下班打卡，时间：{time_str}")
             
             # 清除已有的下班打卡任务
-            all_jobs = schedule.get_jobs()
-            punch_out_jobs = [job for job in all_jobs if "punch_out" in str(job.job_func)]
-            for job in punch_out_jobs:
-                schedule.cancel_job(job)
-            logging.info(f"已移除{len(punch_out_jobs)}个已有的下班打卡定时任务")
+            # [M46 修复] 原先用 `"punch_out" in str(job.job_func)` 启发式匹配——但注册的 job_func 是
+            # `lambda: asyncio.create_task(...)`，str() 里根本不含 "punch_out"，从来匹配不到、清不掉旧任务
+            # （新版经 _register_self_canceling_job 注册后更不含该字样）。改为与上班版对称的按 tag 清除。
+            schedule.clear('punch_out_scheduled')
+            logging.info("已移除已有的下班打卡定时任务 (tag=punch_out_scheduled)")
 
             # 删除已有的下班打卡任务记录
             saved_tasks = self.task_manager.get_tasks()
@@ -1459,17 +1562,39 @@ class AttendanceSystem:
             task_id = self.task_manager.add_task('punch_out', time_str)
             logging.info(f"保存定时任务到文件，任务ID: {task_id}")
 
-            async def punch_out_job():
+            async def punch_out_job(cancel_self):
                 try:
                     # 获取任务信息，检查是否应该执行
                     task_info = self.task_manager.get_task_by_id(task_id)
                     if not task_info:
                         logging.warning(f"任务 #{task_id} 不存在，跳过执行")
-                        return schedule.CancelJob
+                        # [M46 修复] 任务记录已不在：cancel_self() 真正出队（原 return CancelJob 在协程里失效）
+                        cancel_self()
+                        return
+
+                    # [M38 修复] 时间偏差守卫（双向，容差 30 分钟）：与 init_schedule_tasks 中同构。
+                    # 防止长睡眠唤醒后 next_run 停留过去时刻、本 job 在错误时间（如周一早晨补跑周五的
+                    # 17:30 任务，或当晚 23:50 补跑）打出下班卡污染考勤。偏差过大即视为错过，发通知请人工处理。
+                    now = datetime.now()
+                    try:
+                        sched_h, sched_m = (int(x) for x in time_str.split(':'))
+                        scheduled_today = now.replace(hour=sched_h, minute=sched_m, second=0, microsecond=0)
+                        drift = (now - scheduled_today).total_seconds()
+                        if abs(drift) > 30 * 60:
+                            logging.warning(
+                                f"错过定时下班打卡（预定今日 {time_str}，现在 {now.strftime('%H:%M')}，"
+                                f"偏差 {drift/60:.0f} 分钟），跳过下班打卡任务 #{task_id}（疑似唤醒补跑错时）"
+                            )
+                            await self.send_notification(
+                                "下班打卡", f"⚠️ 错过定时下班打卡（预定 {time_str}，疑似休眠唤醒错时），请手动处理"
+                            )
+                            return
+                    except Exception as drift_err:
+                        logging.error(f"下班打卡时间偏差校验异常（任务 #{task_id}）: {drift_err}")
 
                     # 检查当前日期是否为任务创建日期
                     created_date = datetime.strptime(task_info['created_at'], '%Y-%m-%d %H:%M:%S').date()
-                    current_date = datetime.now().date()
+                    current_date = now.date()
 
                     if current_date != created_date:
                         # 如果不是创建当天，检查是否为工作日
@@ -1481,6 +1606,12 @@ class AttendanceSystem:
                     else:
                         logging.info(f"任务创建当天，执行定时下班打卡任务 ({time_str})")
 
+                    # [M39 修复] 互斥占用检查：唤醒突发时多个错过任务同 tick 并发，若已有打卡操作进行中，
+                    # 直接 punch_out() 会被 start_punch_operation 拒绝并静默返回 False → 当天下班卡丢失。
+                    # 改为先探测 current_operation：被占用则发告警 + 5 分钟后一次性重试，不静默吞掉。
+                    if self.current_operation is not None:
+                        await self._handle_timed_punch_rejected('下班', time_str)
+                        return
                     # 执行打卡
                     await self.punch_out()
                     # 打卡完成后发送状态信息
@@ -1491,14 +1622,19 @@ class AttendanceSystem:
                     self.task_manager.remove_task_by_id(task_id)
                     logging.info(f"已删除已执行的下班打卡任务 #{task_id}")
 
-                    # 返回 CancelJob 以从 schedule 中移除该任务
-                    return schedule.CancelJob
+                    # [M46 修复] cancel_self() 真正从 schedule 移除该任务（替代失效的 return CancelJob）
+                    cancel_self()
 
                 except Exception as e:
                     logging.error(f"执行定时下班打卡任务时发生错误: {str(e)}")
 
             # 设置定时任务（加 tag 便于按类清除）
-            schedule.every().day.at(time_str).do(lambda: asyncio.create_task(punch_out_job())).tag('punch_out_scheduled')
+            # [M46 修复] 经 _register_self_canceling_job 注册，使协程内 cancel_self() 能真正从 scheduler 出队
+            self._register_self_canceling_job(
+                time_str,
+                lambda cancel_self: punch_out_job(cancel_self),
+                'punch_out_scheduled'
+            )
             logging.info(f"已设置定时任务: 每天{time_str}执行下班打卡（仅在创建当天或工作日执行，tag=punch_out_scheduled）")
 
             await self.send_notification("定时设置", f"设置下班打卡任务 #{task_id}: {time_str}\n任务将在今天执行，次日仅在工作日执行")
@@ -1510,6 +1646,225 @@ class AttendanceSystem:
             logging.error(traceback.format_exc())
             await self.send_notification("定时设置错误", error_msg)
             return False
+
+    async def schedule_punch_in(self, hour, minute):
+        """设置指定时间的上班打卡任务（与 schedule_punch_out 完全对称，供 task_service 调用）
+
+        新增动机：task_service 此前只把上班任务写入 scheduled_tasks.json，依赖
+        "schedule_manager 下次循环拾起"——但运行期 schedule_manager 不会重扫文件，
+        只有 init_schedule_tasks 在启动时加载，导致 GUI 设置的上班定时打卡根本没注册进 schedule。
+        这里补一个对称方法真正把上班任务挂进 schedule，并复用与下班版一致的守卫（时间偏差/工作日/创建日）。
+
+        参数:
+            hour: 小时 (0-23)
+            minute: 分钟 (0-59)
+
+        返回:
+            bool: 设置成功返回True，失败返回False
+        """
+        try:
+            # 验证时间参数
+            if not (0 <= hour <= 23) or not (0 <= minute <= 59):
+                raise ValueError(f"无效的时间参数: {hour:02d}:{minute:02d}")
+
+            time_str = f"{hour:02d}:{minute:02d}"
+            logging.info(f"开始设置定时上班打卡，时间：{time_str}")
+
+            # 清除已有的上班打卡任务（仅 punch_in_scheduled tag，不误清下班/日报）
+            schedule.clear('punch_in_scheduled')
+            logging.info("已移除已有的上班打卡定时任务 (tag=punch_in_scheduled)")
+
+            # 删除已有的上班打卡任务记录
+            saved_tasks = self.task_manager.get_tasks()
+            for task in saved_tasks:
+                if task['type'] == 'punch_in':
+                    self.task_manager.remove_task_by_id(task['id'])
+                    logging.info(f"已从任务管理器中移除上班打卡任务 #{task['id']}")
+
+            # 添加新的定时任务记录（在定义函数之前创建，以便函数可以引用task_id）
+            task_id = self.task_manager.add_task('punch_in', time_str)
+            logging.info(f"保存定时任务到文件，任务ID: {task_id}")
+
+            # 用默认参数捕获 task_id/time_str，避免共享最后一次循环值（与 init 中加载逻辑同款守卫）
+            async def punch_in_job(cancel_self, tid=task_id, ttime=time_str):
+                try:
+                    # 获取任务信息，检查是否应该执行
+                    task_info = self.task_manager.get_task_by_id(tid)
+                    if not task_info:
+                        logging.warning(f"任务 #{tid} 不存在，跳过执行")
+                        # [M46 修复] 任务记录已不在：cancel_self() 真正出队（原 return CancelJob 在协程里失效）
+                        cancel_self()
+                        return
+
+                    # 时间偏差守卫：睡过头/唤醒补跑导致偏差过大（容差 15 分钟）则跳过，避免错时上班打卡
+                    now = datetime.now()
+                    try:
+                        sched_h, sched_m = (int(x) for x in ttime.split(':'))
+                        scheduled_today = now.replace(hour=sched_h, minute=sched_m, second=0, microsecond=0)
+                        drift = (now - scheduled_today).total_seconds()
+                        if drift > 15 * 60:
+                            logging.warning(
+                                f"错过定时上班打卡（预定今日 {ttime}，现在 {now.strftime('%H:%M')}，"
+                                f"偏差 {drift/60:.0f} 分钟），跳过上班打卡任务 #{tid}"
+                            )
+                            await self.send_notification(
+                                "上班打卡", f"⚠️ 错过定时上班打卡（预定 {ttime}），请手动处理"
+                            )
+                            return
+                    except Exception as drift_err:
+                        logging.error(f"上班打卡时间偏差校验异常（任务 #{tid}）: {drift_err}")
+
+                    # 工作日守卫：非创建日且非工作日跳过
+                    current_date = now.date()
+                    created_date = datetime.strptime(task_info['created_at'], '%Y-%m-%d %H:%M:%S').date()
+                    if current_date != created_date:
+                        if not is_workday(current_date):
+                            logging.info(f"非创建日期且非工作日（创建于{created_date}），跳过上班打卡任务 #{tid}")
+                            return
+                        else:
+                            logging.info(f"非创建日期但是工作日（创建于{created_date}），继续执行上班打卡任务 #{tid}")
+                    else:
+                        logging.info(f"任务创建当天，执行定时上班打卡任务 ({ttime})")
+
+                    # [M39 修复] 互斥占用检查：被其他打卡操作占用时不再静默丢卡，改为告警 + 一次性短延迟重试
+                    if self.current_operation is not None:
+                        await self._handle_timed_punch_rejected('上班', ttime)
+                        return
+                    # 执行打卡
+                    await self.punch_in()
+                    # 打卡完成后发送状态信息
+                    await self.send_daily_status()
+                    logging.info(f"定时上班打卡任务 ({ttime}) 执行完成")
+
+                    # 执行成功后删除任务
+                    self.task_manager.remove_task_by_id(tid)
+                    logging.info(f"已删除已执行的上班打卡任务 #{tid}")
+
+                    # [M46 修复] cancel_self() 真正从 schedule 移除该任务（替代失效的 return CancelJob）
+                    cancel_self()
+
+                except Exception as e:
+                    logging.error(f"执行定时上班打卡任务时发生错误: {str(e)}")
+
+            # 设置定时任务（加 tag 便于按类清除）
+            # [M46 修复] 经 _register_self_canceling_job 注册，使协程内 cancel_self() 能真正从 scheduler 出队
+            self._register_self_canceling_job(
+                time_str,
+                lambda cancel_self: punch_in_job(cancel_self),
+                'punch_in_scheduled'
+            )
+            logging.info(f"已设置定时任务: 每天{time_str}执行上班打卡（仅在创建当天或工作日执行，tag=punch_in_scheduled）")
+
+            await self.send_notification("定时设置", f"设置上班打卡任务 #{task_id}: {time_str}\n任务将在今天执行，次日仅在工作日执行")
+
+            return True
+        except Exception as e:
+            error_msg = f"设置定时上班打卡任务失败: {str(e)}"
+            logging.error(error_msg)
+            logging.error(traceback.format_exc())
+            await self.send_notification("定时设置错误", error_msg)
+            return False
+
+    # [M39 补全] 定时打卡互斥拒绝后的最大重试次数：避免极端连续占用下无限重排，
+    # 同时把"只重试一次"扩成有界多次重试，杜绝 5 分钟后仍被占用时的二次静默丢卡。
+    _TIMED_PUNCH_MAX_RETRY = 3
+
+    # [M49 修复] 下班 unable_escape 但 OCR/计算拿不到剩余时间时的保守默认重试间隔（分钟）。
+    # 原先这种情况不调度任何重试，失败邮件却写"系统会在适当时间自动重试"——用户信了就漏打下班卡。
+    # 改为按此固定间隔兜底调度一次重试，使文案与行为一致。
+    _PUNCH_OUT_FALLBACK_RETRY_MINUTES = 45
+
+    async def _handle_timed_punch_rejected(self, punch_type, scheduled_time, attempt=1):
+        """[M39 修复] 定时打卡被互斥拒绝（current_operation 已被占用）时的补偿：发告警 + 短延迟重排。
+
+        场景：长睡眠唤醒后多个错过任务在同一 tick 并发争抢 current_operation 锁，后到的定时打卡
+        拿到 (False, '当前已有...操作正在进行中') 后原先 punch_in_job/punch_out_job 不检查返回值、
+        静默吞掉 → 当天上班/下班卡彻底丢失且无任何通知。这里改为：通知用户 + 5 分钟后重试
+        （内存级一次性 job，return CancelJob 自动移除；不写 scheduled_tasks.json，避免跨天残留）。
+
+        [M39 补全] 残留缺口修复：原 _one_shot_retry 直接 await punch_in/out 而不复探 current_operation，
+        且无论成败都只重试一次——若 5 分钟后仍被占用，punch_*() 经 start_punch_operation 返回 False 后
+        又被静默吞掉，极端连续占用下仍丢一次卡。现改为有界重试链（上限 _TIMED_PUNCH_MAX_RETRY）：
+        重试触发时先复探 current_operation，仍被占用 / punch_*() 返回 False 即视为失败并重排下一次；
+        仅在成功、偏差过期、或重试次数耗尽时停止，且耗尽时显式发失败告警，确保任何放弃都有通知不再静默。
+
+        Args:
+            punch_type: '上班' 或 '下班'
+            scheduled_time: 原定 'HH:MM'，仅用于通知文案
+            attempt: 本次属于第几次重试（从 1 计），用于有界控制与文案
+        """
+        retry_delay_min = 5
+        retry_time = datetime.now() + timedelta(minutes=retry_delay_min)
+        retry_str = retry_time.strftime("%H:%M")
+        # 用专属 tag，与工时不足的 punch_out_retry / GUI 的 punch_*_scheduled 隔离，互不误清
+        tag = 'punch_in_oneshot_retry' if punch_type == '上班' else 'punch_out_oneshot_retry'
+
+        await self.send_notification(
+            "定时打卡",
+            f"⚠️ 定时{punch_type}打卡（{scheduled_time}）因有其他打卡操作进行中被跳过，"
+            f"将于约 {retry_str} 自动重试（第 {attempt}/{self._TIMED_PUNCH_MAX_RETRY} 次）"
+        )
+        logging.warning(
+            f"定时{punch_type}打卡被互斥拒绝，安排 {retry_delay_min} 分钟后（{retry_str}）"
+            f"重试（第 {attempt}/{self._TIMED_PUNCH_MAX_RETRY} 次）"
+        )
+
+        async def _one_shot_retry(cancel_self, dt=retry_time, pt=punch_type, orig=scheduled_time, att=attempt):
+            try:
+                # 重试也加偏差守卫：若这条 job 本身又被睡眠拖到很久之后才触发，则放弃不补打
+                drift = (datetime.now() - dt).total_seconds()
+                if drift > 30 * 60:
+                    logging.warning(f"{pt}打卡重试已过期（偏差 {drift/60:.0f} 分钟），放弃")
+                    await self.send_notification(
+                        "定时打卡", f"⚠️ 定时{pt}打卡（原定 {orig}）重试已过期，已放弃补打，请手动处理"
+                    )
+                    # [M46 修复] cancel_self() 真正出队（原 return CancelJob 在协程里失效，会让一次性重试退化为每日重复）
+                    cancel_self()
+                    return
+
+                logging.info(f"执行{pt}打卡重试（原定 {orig}，第 {att}/{self._TIMED_PUNCH_MAX_RETRY} 次）")
+
+                # [M39 补全] 复探互斥：重试触发时仍被占用，则不去硬调 punch_*()（避免被静默拒绝丢卡），
+                # 而是按有界规则重排下一次或耗尽告警
+                still_busy = self.current_operation is not None
+                punch_ok = False
+                if not still_busy:
+                    # punch_in/out 经 start_punch_operation：成功返回 operation_task 结果，被拒/失败返回 False
+                    if pt == '上班':
+                        punch_ok = bool(await self.punch_in())
+                    else:
+                        punch_ok = bool(await self.punch_out())
+                    if punch_ok:
+                        await self.send_daily_status()
+                        logging.info(f"{pt}打卡重试成功（原定 {orig}，第 {att} 次）")
+                        # [M46 修复] cancel_self() 真正出队
+                        cancel_self()
+                        return
+
+                # 走到这里：要么仍被占用，要么 punch_*() 返回 False（被拒/失败）——按有界规则处理
+                if att >= self._TIMED_PUNCH_MAX_RETRY:
+                    reason = "仍有其他打卡操作进行中" if still_busy else "打卡未成功"
+                    logging.warning(f"{pt}打卡重试已达上限（{self._TIMED_PUNCH_MAX_RETRY} 次，{reason}），放弃")
+                    await self.send_notification(
+                        "定时打卡",
+                        f"❌ 定时{pt}打卡（原定 {orig}）已重试 {self._TIMED_PUNCH_MAX_RETRY} 次仍失败"
+                        f"（{reason}），已放弃自动补打，请手动处理"
+                    )
+                else:
+                    # 重排下一次：复用本方法（attempt+1），仍走告警 + 短延迟的有界重试链，绝不静默吞掉
+                    await self._handle_timed_punch_rejected(pt, orig, attempt=att + 1)
+            except Exception as e:
+                logging.error(f"{pt}打卡重试发生错误: {str(e)}")
+            # 本条一次性 job 任务完成（无论结果），cancel_self() 从 schedule 移除自身
+            # [M46 修复] 原 return CancelJob 在 `lambda: asyncio.create_task(...)` 下永远到不了 scheduler，
+            # 会让"一次性重试"退化为每日固定重复执行；改用 cancel_self() 按 job 引用真正出队。
+            cancel_self()
+
+        self._register_self_canceling_job(
+            retry_str,
+            lambda cancel_self: _one_shot_retry(cancel_self),
+            tag
+        )
 
     def init_schedule_tasks(self):
         """初始化定时任务"""
@@ -1564,17 +1919,41 @@ class AttendanceSystem:
                 task_id = task['id']
                 task_time = task['scheduled_time']
 
-                async def punch_out_job(tid=task_id, ttime=task_time):
+                async def punch_out_job(cancel_self, tid=task_id, ttime=task_time):
                     try:
                         # 获取任务信息，检查是否应该执行
                         task_info = self.task_manager.get_task_by_id(tid)
                         if not task_info:
                             logging.warning(f"任务 #{tid} 不存在，跳过执行")
-                            return schedule.CancelJob
+                            # [M46 修复] 任务记录已不在：cancel_self() 真正出队（原 return CancelJob 在协程里失效）
+                            cancel_self()
+                            return
+
+                        # [M38 修复] 时间偏差守卫（双向，容差 30 分钟）：长睡眠唤醒后 schedule 的 next_run
+                        # 可能停留在过去时刻，导致本 job 在错误时间补跑——典型为周五 17:30 任务在周一 09:00 唤醒
+                        # 首 tick 触发（now 远早于今日 17:30，drift 大负值），或当日 17:25 睡到 23:50 唤醒补跑
+                        # （drift 大正值）。两种都会污染考勤，统一拦截：偏差过大即视为错过，发通知请人工处理，
+                        # 不自动打卡。今日预定时刻与 now 同日比较（下班是固定每日时刻，按今天的 HH:MM 锚定）。
+                        now = datetime.now()
+                        try:
+                            sched_h, sched_m = (int(x) for x in ttime.split(':'))
+                            scheduled_today = now.replace(hour=sched_h, minute=sched_m, second=0, microsecond=0)
+                            drift = (now - scheduled_today).total_seconds()
+                            if abs(drift) > 30 * 60:
+                                logging.warning(
+                                    f"错过定时下班打卡（预定今日 {ttime}，现在 {now.strftime('%H:%M')}，"
+                                    f"偏差 {drift/60:.0f} 分钟），跳过下班打卡任务 #{tid}（疑似唤醒补跑错时）"
+                                )
+                                await self.send_notification(
+                                    "下班打卡", f"⚠️ 错过定时下班打卡（预定 {ttime}，疑似休眠唤醒错时），请手动处理"
+                                )
+                                return
+                        except Exception as drift_err:
+                            logging.error(f"下班打卡时间偏差校验异常（任务 #{tid}）: {drift_err}")
 
                         # 检查当前日期是否为任务创建日期
                         created_date = datetime.strptime(task_info['created_at'], '%Y-%m-%d %H:%M:%S').date()
-                        current_date = datetime.now().date()
+                        current_date = now.date()
 
                         if current_date != created_date:
                             # 如果不是创建当天，检查是否为工作日
@@ -1586,6 +1965,10 @@ class AttendanceSystem:
                         else:
                             logging.info(f"任务创建当天，执行定时下班打卡任务 ({ttime})")
 
+                        # [M39 修复] 互斥占用检查：被其他打卡操作占用时不再静默丢卡，改为告警 + 一次性短延迟重试
+                        if self.current_operation is not None:
+                            await self._handle_timed_punch_rejected('下班', ttime)
+                            return
                         # 执行打卡
                         await self.punch_out()
                         # 打卡完成后发送状态信息
@@ -1596,22 +1979,97 @@ class AttendanceSystem:
                         self.task_manager.remove_task_by_id(tid)
                         logging.info(f"已删除已执行的下班打卡任务 #{tid}")
 
-                        # 返回 CancelJob 以从 schedule 中移除该任务
-                        return schedule.CancelJob
+                        # [M46 修复] cancel_self() 真正从 schedule 移除该任务（替代失效的 return CancelJob）
+                        cancel_self()
 
                     except Exception as e:
                         logging.error(f"执行定时下班打卡任务时发生错误: {str(e)}")
 
-                schedule.every().day.at(task['scheduled_time']).do(lambda: asyncio.create_task(punch_out_job())).tag('punch_out_scheduled')
+                # [M46+M86 修复] 经 _register_self_canceling_job 注册：协程内 cancel_self() 才能真正出队；
+                # 用默认参数 _f=punch_out_job 显式绑定本轮循环的协程函数，根除原 `lambda: ...punch_out_job()`
+                # 按名字晚绑定导致"所有 job 都执行最后一个 punch_out_job"的缺陷。
+                self._register_self_canceling_job(
+                    task['scheduled_time'],
+                    lambda cancel_self, _f=punch_out_job: _f(cancel_self),
+                    'punch_out_scheduled'
+                )
             elif task['type'] == 'punch_in':
-                async def punch_in_job():
+                task_id = task['id']
+                task_time = task['scheduled_time']
+
+                # [M6 修复] 原 punch_in_job 完全裸奔：不校验时间偏差/工作日/创建日，
+                # 睡过 08:30 后唤醒首 tick 会立即补打上班卡（考勤记录成下午上班），
+                # 且 schedule.every().day 会含周末每天重复执行。这里补齐与 punch_out_job 对称的三重守卫。
+                async def punch_in_job(cancel_self, tid=task_id, ttime=task_time):
                     try:
+                        # 获取任务信息，检查是否应该执行
+                        task_info = self.task_manager.get_task_by_id(tid)
+                        if not task_info:
+                            logging.warning(f"任务 #{tid} 不存在，跳过执行")
+                            # [M46 修复] 任务记录已不在：cancel_self() 真正出队（原 return CancelJob 在协程里失效）
+                            cancel_self()
+                            return
+
+                        # [M6 修复 a] 时间偏差守卫：当前时间与今日预定时刻偏差过大（睡过头/唤醒补跑）则跳过，
+                        # 避免在午后唤醒瞬间真实打出错时上班卡。容差 15 分钟。
+                        now = datetime.now()
+                        try:
+                            sched_h, sched_m = (int(x) for x in ttime.split(':'))
+                            scheduled_today = now.replace(hour=sched_h, minute=sched_m, second=0, microsecond=0)
+                            drift = (now - scheduled_today).total_seconds()
+                            if drift > 15 * 60:
+                                logging.warning(
+                                    f"错过定时上班打卡（预定今日 {ttime}，现在 {now.strftime('%H:%M')}，"
+                                    f"偏差 {drift/60:.0f} 分钟），跳过上班打卡任务 #{tid}"
+                                )
+                                await self.send_notification(
+                                    "上班打卡", f"⚠️ 错过定时上班打卡（预定 {ttime}），请手动处理"
+                                )
+                                return
+                        except Exception as drift_err:
+                            logging.error(f"上班打卡时间偏差校验异常（任务 #{tid}）: {drift_err}")
+
+                        # [M6 修复 b] 工作日守卫：非工作日（周末/节假日）跳过，避免每天固定打上班卡
+                        current_date = now.date()
+                        created_date = datetime.strptime(task_info['created_at'], '%Y-%m-%d %H:%M:%S').date()
+                        if current_date != created_date:
+                            if not is_workday(current_date):
+                                logging.info(f"非创建日期且非工作日（创建于{created_date}），跳过上班打卡任务 #{tid}")
+                                return
+                            else:
+                                logging.info(f"非创建日期但是工作日（创建于{created_date}），继续执行上班打卡任务 #{tid}")
+                        else:
+                            logging.info(f"任务创建当天，执行定时上班打卡任务 ({ttime})")
+
+                        # [M39 修复] 互斥占用检查：唤醒突发时若已有打卡操作进行中（如先到的下班补跑占了锁），
+                        # 上班打卡会被静默拒绝 → 当天上班卡彻底丢失。改为告警 + 5 分钟后一次性重试。
+                        if self.current_operation is not None:
+                            await self._handle_timed_punch_rejected('上班', ttime)
+                            return
+                        # 执行打卡
                         await self.punch_in()
                         # 打卡完成后发送状态信息
                         await self.send_daily_status()
+                        logging.info(f"定时上班打卡任务 ({ttime}) 执行完成")
+
+                        # [M6 修复 c] 执行成功后删除任务记录
+                        self.task_manager.remove_task_by_id(tid)
+                        logging.info(f"已删除已执行的上班打卡任务 #{tid}")
+
+                        # [M46 修复] cancel_self() 真正从 schedule 移除该任务（替代失效的 return CancelJob）
+                        cancel_self()
+
                     except Exception as e:
                         logging.error(f"执行定时上班打卡任务时发生错误: {str(e)}")
-                schedule.every().day.at(task['scheduled_time']).do(lambda: asyncio.create_task(punch_in_job())).tag('punch_in_scheduled')
+
+                # [M46+M86 修复] 经 _register_self_canceling_job 注册：协程内 cancel_self() 才能真正出队；
+                # 用默认参数 _f=punch_in_job 显式绑定本轮循环的协程函数，根除原 `lambda: ...punch_in_job()`
+                # 按名字晚绑定导致"所有 job 都执行最后一个 punch_in_job"的缺陷。
+                self._register_self_canceling_job(
+                    task['scheduled_time'],
+                    lambda cancel_self, _f=punch_in_job: _f(cancel_self),
+                    'punch_in_scheduled'
+                )
 
         # 启动时触发一次汇率首刷（容错、不阻塞启动）：放 daemon 线程，避免阻塞 __init__ 与事件循环。
         def _first_exchange_rate_refresh():
@@ -1685,10 +2143,17 @@ class AttendanceSystem:
             # 添加每个用户的打卡记录
             # 读取运行态打卡桶 today_punch_records（由 _set_user_punch_time 写入），而非
             # config 静态 user['punch_records']（恒为 None、从无写入），否则日报永远显示"未打卡"。
+            # [M47 修复] 与 get_status_snapshot 同款日期校验：归属日期 record['date'] 不是今天
+            # （含周末/假日次日尚未触发跨天重置）一律视为"未打卡"。否则连续运行跨周末时，周六/日
+            # 的日报会把周五的上下班时间当"今日打卡"展示，标题日期却是当天，误导用户以为今天打过卡。
             status_text += "📍 今日打卡记录\n"
             for uname, record in self.today_punch_records.items():
-                in_t = record.get('punch_in_time')
-                out_t = record.get('punch_out_time')
+                if record.get('date') != current_date:
+                    in_t = None
+                    out_t = None
+                else:
+                    in_t = record.get('punch_in_time')
+                    out_t = record.get('punch_out_time')
                 status_text += f"\n用户: {uname}\n"
                 status_text += f"上班打卡：{'✅ ' + in_t.strftime('%H:%M:%S') if in_t else '❌ 未打卡'}\n"
                 status_text += f"下班打卡：{'✅ ' + out_t.strftime('%H:%M:%S') if out_t else '❌ 未打卡'}\n"
@@ -1741,16 +2206,15 @@ class AttendanceSystem:
             logging.error(f"发送每日状态信息时发生错误: {str(e)}")
 
 
-    async def _do_punch(self, punch_type="上班", username=None, password=None, collect_remaining_time=False):
-        """通用打卡方法"""
+    async def _do_punch(self, punch_type="上班", username=None, password=None, collect_remaining_time=False, cancel_event=None):
+        """通用打卡方法
+
+        Args:
+            cancel_event: [M11 修复] 本次操作专属取消事件，串行 Selenium 路径透传给 _do_selenium_punch，
+                使其取消检查点能感知精确取消（详见 _do_selenium_punch 文档）。
+        """
         screen = None
         remaining_time_info = None  # 用于存储剩余工作时间信息
-
-        # 确保bot已初始化
-        if not self.bot or not hasattr(self.bot, 'app') or not self.bot.app:
-            error_msg = f"Telegram bot未正确初始化，无法执行{punch_type}打卡"
-            logging.error(error_msg)
-            return (False, None)
 
         try:
             # 重置消息
@@ -1759,9 +2223,20 @@ class AttendanceSystem:
 
             # 根据配置选择打卡模式
             if self.use_selenium_login:
+                # [M10 修复] 去掉原先位于此处的"bot.app 未初始化即 return (False, None)"硬门槛：
+                # main.py 支持 Telegram Bot 初始化失败后降级运行（bot_available=False），Selenium 打卡
+                # 本身不依赖 bot（_do_selenium_punch 内所有 bot 调用都有 try/except，通知会经
+                # send_notification 转推 GUI event_bus + 邮件）。原门槛会让降级状态下 GUI/定时打卡全部秒失败
+                # 且不发任何通知，与降级运行设计矛盾，故此处不再拦截，照常进入 Selenium 分支。
                 await self.send_notification("打卡流程", f"使用Selenium模式执行{punch_type}打卡")
-                return await self._do_selenium_punch(punch_type, username, password, collect_remaining_time)
+                return await self._do_selenium_punch(punch_type, username, password, collect_remaining_time, cancel_event=cancel_event)
             else:
+                # [M10 修复] PyAutoGUI 传统模式的通知/截图强依赖 bot（下方多处直接用 self.bot.app.bot），
+                # bot 缺失时无法完成传统流程，这里做软降级：仅传统模式下校验 bot，缺失则记录并返回。
+                if not self.bot or not hasattr(self.bot, 'app') or not self.bot.app:
+                    error_msg = f"Telegram bot未正确初始化，PyAutoGUI模式无法执行{punch_type}打卡"
+                    logging.error(error_msg)
+                    return (False, None)
                 await self.send_notification("打卡流程", f"使用PyAutoGUI模式执行{punch_type}打卡")
 
             # 使用统一的登录流程方法（PyAutoGUI模式）
@@ -1890,7 +2365,23 @@ class AttendanceSystem:
                                 else:
                                     logging.info(f"多账户模式：收集剩余时间信息：{total_minutes}分钟")
                         else:
+                            # [M49 修复] unable_escape 但 OCR 拿不到剩余时间：原先不调度任何重试，
+                            # 失败邮件却承诺"系统会在适当时间自动重试" → 用户漏打下班卡。
+                            # 单账户模式下按保守默认间隔兜底调度一次重试，使文案与行为一致；
+                            # 收集（多账户）模式无可回传的剩余时间字符串，无法纳入统一调度，
+                            # 故明确告知请人工补卡，不再给出虚假的自动重试承诺。
                             error_msg = "未满足下班条件，无法获取剩余时间"
+                            if not collect_remaining_time:
+                                logging.warning(
+                                    f"OCR 未取到剩余时间，按保守默认 {self._PUNCH_OUT_FALLBACK_RETRY_MINUTES} 分钟兜底调度下班重试"
+                                )
+                                retry_time = await self.schedule_retry_punch_out(
+                                    self._PUNCH_OUT_FALLBACK_RETRY_MINUTES, clear_existing=False
+                                )
+                                if retry_time:
+                                    error_msg += f"\n已按保守默认设置在 {retry_time} 自动重试下班打卡"
+                            else:
+                                error_msg += "\n⚠️ 无法自动重试，请手动补卡"
                         await self.send_notification("打卡流程", error_msg)
 
                         # 保存并发送当前的浏览器窗口截图
@@ -1913,7 +2404,10 @@ class AttendanceSystem:
                             # 获取用户姓氏称谓
                             surname = self.get_surname_honorific(username)
                             email_subject = f"{punch_type}打卡失败通知 - {surname} - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
-                            email_body = f"{surname}您好，\n\n您的{punch_type}打卡尝试失败。\n\n原因：{error_msg}\n\n系统会在适当时间自动重试。\n\n此邮件由自动打卡系统发送，请勿回复。"
+                            # [M49 修复] 去掉无条件的"系统会在适当时间自动重试"承诺——OCR 拿不到剩余时间且
+                            # 处于收集（多账户）模式时根本不会调度重试，原文案会误导用户漏打下班卡。
+                            # error_msg 已携带真实结果（"已设置在 X 自动重试" 或 "请手动补卡"），直接以其为准。
+                            email_body = f"{surname}您好，\n\n您的{punch_type}打卡尝试失败。\n\n原因：{error_msg}\n\n此邮件由自动打卡系统发送，请勿回复。"
 
                             # 复制截图用于邮件发送
                             email_screenshot_path = f'logs/punch_out_fail_email.png'
@@ -2070,7 +2564,11 @@ class AttendanceSystem:
                                 body = f"{surname}您好，\n\n您的{punch_type}打卡已于 {current_time} 成功完成。\n\n详情请查看附件截图。\n\n此邮件由自动打卡系统发送，请勿回复。"
 
                                 # 复制一份截图用于邮件发送
-                                email_screenshot_path = f'logs/punch_{"in" if punch_type == "上班" else "out"}_email.png'
+                                # [M48 修复] 邮件截图交后台线程读取后 cleanup 删除，共享固定名在并发下会被
+                                # 另一用户覆盖/提前删除。加用户名 + 微秒时间戳生成唯一路径（与 Selenium 路径一致）。
+                                safe_username = self._safe_filename_token(username)
+                                ts = datetime.now().strftime('%Y%m%d_%H%M%S_%f')
+                                email_screenshot_path = f'logs/punch_{"in" if punch_type == "上班" else "out"}_email_{safe_username}_{ts}.png'
                                 with open(screenshot_path, 'rb') as f_in:
                                     img_data = f_in.read()
                                     with open(email_screenshot_path, 'wb') as f_out:
@@ -2250,8 +2748,14 @@ class AttendanceSystem:
 
             return (False, None)
 
-    async def _do_selenium_punch(self, punch_type="上班", username=None, password=None, collect_remaining_time=False):
+    async def _do_selenium_punch(self, punch_type="上班", username=None, password=None, collect_remaining_time=False, cancel_event=None):
         """使用Selenium模式的打卡方法（移植传统模式全部功能）
+
+        Args:
+            cancel_event: [M11 修复] 本次操作专属的 asyncio.Event（由 start_punch_operation 建立、
+                经 punch_*_internal / _do_selenium_punch_for_user 透传）。取消判断带上它后，
+                即使 web 强停后 self.operation_cancel_event 被新操作替换，本（旧）任务仍能凭
+                自己捕获的 cancel_event 感知取消并退出，不会"复活"误打卡。
 
         Returns:
             Tuple[bool, str|None]: (是否成功, 剩余时间字符串"X小时Y分钟"或None)
@@ -2344,9 +2848,11 @@ class AttendanceSystem:
         last_step_edit_ts = 0.0
         _STEP_EDIT_MIN_INTERVAL = 2.0
 
-        # 取消事件读取助手：统一判断（含 Flask 线程强停的 _cancel_flag）
+        # 取消事件读取助手：统一判断（含 Flask 线程强停的 _cancel_flag + 本次操作专属 cancel_event）
+        # [M11 修复] 带上本次捕获的 cancel_event：web 强停替换 self.operation_cancel_event 后，
+        # 旧任务的 4 个检查点仍能凭自己的 cancel_event 感知取消，避免旧任务复活并真实打卡。
         def _cancel_triggered():
-            return self._is_cancelled()
+            return self._is_cancelled(cancel_event)
 
         try:
             # 取消检查点 1/4：进入 try 块即检查，driver 未启动可零成本短路
@@ -2540,7 +3046,12 @@ class AttendanceSystem:
                             )
 
                             os.makedirs('logs', exist_ok=True)
-                            email_screenshot_path = f'logs/punch_{"in" if punch_type == "上班" else "out"}_email.png'
+                            # [M48 修复] 并行多账户成功路径同样不能共用 logs/punch_{in,out}_email.png：
+                            # 后台邮件线程读取后 cleanup 删除共享路径，会让另一用户的邮件读不到附件。
+                            # 加用户名 + 微秒时间戳生成唯一路径。
+                            safe_username = self._safe_filename_token(effective_username)
+                            ts = real_punch_time.strftime('%Y%m%d_%H%M%S_%f')
+                            email_screenshot_path = f'logs/punch_{"in" if punch_type == "上班" else "out"}_email_{safe_username}_{ts}.png'
                             with open(email_screenshot_path, 'wb') as f:
                                 f.write(screenshot_bytes)
 
@@ -2609,6 +3120,41 @@ class AttendanceSystem:
                     logging.warning("截图解码失败，跳过 _send_punch_failure_screenshot")
 
                 return (False, remaining_time_str)
+
+            # [M49 修复] 下班 confirmation_needed=True 但拿不到 remaining_minutes（计算/解析失败）：
+            # 原先直接落到下方"其他失败"分支 → 不调度任何重试，但 _send_punch_failure_screenshot 的邮件
+            # 仍写"系统会在适当时间自动重试" → 用户漏打下班卡。这里与传统模式对齐：单账户按保守默认间隔
+            # 兜底调度一次重试；收集（多账户）模式无可回传的剩余时间字符串，明确告知请人工补卡。
+            if flow_type == "punch_out" and confirmation_needed and remaining_minutes is None:
+                error_msg = "未满足下班条件，无法获取剩余时间"
+                if not collect_remaining_time:
+                    try:
+                        logging.warning(
+                            f"Selenium 下班未取到剩余时间，按保守默认 {self._PUNCH_OUT_FALLBACK_RETRY_MINUTES} 分钟兜底调度重试"
+                        )
+                        retry_time = await self.schedule_retry_punch_out(
+                            self._PUNCH_OUT_FALLBACK_RETRY_MINUTES, clear_existing=False
+                        )
+                        if retry_time:
+                            error_msg += f"\n已按保守默认设置在 {retry_time} 自动重试下班打卡"
+                    except Exception as schedule_err:
+                        logging.error(f"调度下班兜底重试失败: {schedule_err}")
+                        error_msg += f"\n⚠️ 设置定时重试失败: {str(schedule_err)}"
+                else:
+                    error_msg += "\n⚠️ 无法自动重试，请手动补卡"
+
+                await self.send_notification("打卡流程", error_msg)
+
+                screen_numpy = _decode_screenshot_bytes(screenshot_bytes)
+                if screen_numpy is not None:
+                    await self._send_punch_failure_screenshot(
+                        screen_numpy, effective_username, punch_type, error_msg
+                    )
+                else:
+                    logging.warning("截图解码失败，跳过 _send_punch_failure_screenshot")
+
+                # remaining_time_str 此时为 None，返回 None 不参与多账户统一调度
+                return (False, None)
 
             # 其他失败（登录失败、按钮异常、等）
             error_msg = message_result or f"{flow_name}流程失败"
@@ -2727,8 +3273,9 @@ class AttendanceSystem:
                         "并行打卡",
                         f"[{username}] 开始 {punch_type} 流程"
                     )
+                    # [M11 修复] 透传本次操作的 cancel_event，使单用户并行子流程也能感知精确取消
                     success, remaining_time_info = await self._do_selenium_punch(
-                        punch_type, username, password, collect_remaining_time
+                        punch_type, username, password, collect_remaining_time, cancel_event=cancel_event
                     )
                     result['success'] = bool(success)
                     result['remaining_time'] = remaining_time_info
@@ -2772,6 +3319,15 @@ class AttendanceSystem:
             if self.current_operation is not None:
                 return False, f"当前已有{self.current_operation}操作正在进行中，请等待完成或使用/stop命令取消"
 
+            # [M11 修复] current_operation 为 None 不代表上一轮 task 真的退出了：web 强停的
+            # _cleanup_operation_state(None) 会立即把 operation_task 置 None 而不等待旧任务收尾。
+            # 若此刻旧任务仍卡在 await（TG 发送慢/信号量排队/sleep），直接清 _cancel_flag + 换 cancel_event
+            # 会让它的取消信号全部失效而"复活"。故启动新操作前确认上一轮 task 已结束；未结束则拒绝启动，
+            # 让上层稍后重试，避免新旧两个打卡流程并行。
+            prev_task = getattr(self, '_last_operation_task', None)
+            if prev_task is not None and not prev_task.done():
+                return False, "上一次打卡操作正在收尾，请稍后重试"
+
             # 设置操作状态
             self.current_operation = operation_type
             self.operation_start_time = datetime.now()
@@ -2788,6 +3344,9 @@ class AttendanceSystem:
                 self.operation_start_time = None
                 self.operation_cancel_event = None
                 return False, "无效的操作类型"
+
+            # [M11 修复] 记录最近一次派出的 task；该引用不会被 _cleanup_operation_state 清空
+            self._last_operation_task = self.operation_task
 
             # 添加任务完成回调
             self.operation_task.add_done_callback(self._operation_completed_callback)
@@ -3004,8 +3563,8 @@ class AttendanceSystem:
                 # 为每个用户发送单独的开始消息
                 await self.send_notification("多用户打卡", f"开始为用户 {username} 执行上班打卡 ({i+1}/{len(users_to_process)})")
 
-                # 执行打卡
-                result, _ = await self._do_punch("上班", username, password)
+                # 执行打卡（[M11 修复] 透传本次操作的 cancel_event）
+                result, _ = await self._do_punch("上班", username, password, cancel_event=cancel_event)
 
                 # 检查取消
                 if self._is_cancelled(cancel_event):
@@ -3150,8 +3709,8 @@ class AttendanceSystem:
                 # 为每个用户发送单独的开始消息
                 await self.send_notification("多用户打卡", f"开始为用户 {username} 执行下班打卡 ({i+1}/{len(users_to_process)})")
 
-                # 执行打卡，并捕获剩余工作时间
-                result, remaining_time_info = await self._do_punch("下班", username, password, collect_remaining_time=True)
+                # 执行打卡，并捕获剩余工作时间（[M11 修复] 透传本次操作的 cancel_event）
+                result, remaining_time_info = await self._do_punch("下班", username, password, collect_remaining_time=True, cancel_event=cancel_event)
 
                 # 检查取消
                 if self._is_cancelled(cancel_event):
@@ -3228,29 +3787,59 @@ class AttendanceSystem:
 
 
     def cleanup(self):
-        """清理资源"""
-        # 保存当前的定时任务到文件
-        scheduled_jobs = schedule.get_jobs()
-        self.task_manager.clear_tasks()
-        for job in scheduled_jobs:
-            if "punch_out" in str(job.job_func):
-                next_run = job.next_run
-                if next_run:
-                    time_str = next_run.strftime("%H:%M")
-                    self.task_manager.add_task('punch_out', time_str)
+        """清理资源
+
+        [M14 修复] 原实现先 task_manager.clear_tasks() 全清任务文件，再仅按
+        `"punch_out" in str(job.job_func)` 启发式回存 punch_out 类 job——但：
+        (1) init_schedule_tasks 恢复的 job qualname 不含 'punch_out'、punch_in 类根本无回存分支，
+            回存匹配不到 → 重启后定时上班任务和恢复的下班任务静默蒸发，次日漏卡；
+        (2) 任务本就持久化在 scheduled_tasks.json，重启后 init_schedule_tasks 会原样恢复，
+            cleanup 这套 clear+回存反而是净损害。
+        故整段删除"动任务文件"的逻辑，cleanup 只负责关闭活跃 selenium driver（避免 driver 泄漏成孤儿）。
+        """
+        try:
+            self._sync_cleanup_on_exit()
+        except Exception as e:
+            logging.error(f"cleanup 关闭活跃 driver 失败: {e}")
+
+    def _is_supervised(self):
+        """[M37 修复] 是否运行在外层监管者（watchdog / Electron）之下。
+
+        受管模式下进程退出会被监管者重新拉起，进程内再 os.execl 自重启会与监管者的拉起逻辑
+        撞车产生双实例（双 Telegram getUpdates 409 / 重复打卡 / 端口冲突）。
+        识别信号：
+        - Electron 始终以 `main.py --gui` 启动，故 sys.argv 含 '--gui'；
+        - watchdog.py 启动子进程前设置 AAS_SUPERVISED=1（见 watchdog.py）。
+        """
+        try:
+            if '--gui' in sys.argv:
+                return True
+        except Exception:
+            pass
+        return os.environ.get('AAS_SUPERVISED') == '1'
 
     async def restart_program(self):
         """重启程序"""
         try:
             await self.send_notification("系统状态", "开始执行程序重启...")
 
-            # 清理资源
+            # 清理资源（关闭活跃 driver；os.execl 不触发 atexit，故必须在重启前主动关闭，避免孤儿 driver）
             self.cleanup()
 
-            # 使用 Python 执行新的程序实例
-            python_executable = sys.executable
-            os.execl(python_executable, python_executable, *sys.argv)
+            if self._is_supervised():
+                # [M37 修复] 受管模式（watchdog/Electron）：用非零退出码让外层监管者拉起新实例，
+                # 不在进程内 os.execl 自重启，杜绝双实例。退出前已 cleanup 关闭 driver。
+                logging.critical("受管模式下请求重启：以退出码 1 退出，交由监管者（watchdog/Electron）拉起新实例")
+                await self.send_notification("系统状态", "受管模式：进程将退出并由监管者自动重启")
+                sys.exit(1)
+            else:
+                # 独立运行（直接 python main.py）：无外层监管者，仍用 os.execl 替换进程映像自重启。
+                python_executable = sys.executable
+                os.execl(python_executable, python_executable, *sys.argv)
 
+        except SystemExit:
+            # sys.exit 抛出的 SystemExit 不应被下方通用 except 吞掉，原样向上传播以真正退出
+            raise
         except Exception as e:
             await self.send_notification("系统状态", f"程序重启失败: {str(e)}")
 
@@ -3302,10 +3891,9 @@ class AttendanceSystem:
             current_time = datetime.now()
             current_date = current_time.date()
 
-            # 如果不是工作日，不进行检查
-            if not is_workday(current_date):
-                return
-
+            # [M47 修复] 跨日重置必须在 is_workday 早退之前执行，否则非工作日（周末/假日）直接 return
+            # 永不重置 today_punch_records → 连续运行跨周末时，周六/日的日报/快照仍带着周五的旧打卡时间。
+            # 重置本身与"今天是否工作日"无关（只看归属日期是否过期），故提到工作日守卫之前。
             # 跨日重置：按用户分桶，每个用户独立判断是否需要重置
             for uname in list(self.notification_sent_today.keys()):
                 state = self.notification_sent_today[uname]
@@ -3327,6 +3915,10 @@ class AttendanceSystem:
             if needs_reset:
                 self._reset_today_punch_records()
                 logging.info(f"重置昨天的打卡记录（所有用户）")
+
+            # 如果不是工作日，重置已完成、但后续打卡提醒只在工作日发送，故此处早退
+            if not is_workday(current_date):
+                return
 
             # 按用户独立判断上下班提醒（用户分桶 → 各自独立状态机）
             work_start_t = datetime.strptime(self.work_start_time, "%H:%M").time()

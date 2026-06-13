@@ -688,25 +688,26 @@ export function SettingsScreen() {
 
       {tab === 'advanced' && (
         <div className="grid grid-2">
-          <Section title="看门狗 Watchdog" sub="主程序崩溃后自动重启" icon="Power">
+          {/* 看门狗参数为 watchdog.py 内代码常量，dynamic_config schema 暂未扩展 → 禁用控件并标注，免得用户误以为可在此调参 */}
+          <Section title="看门狗 Watchdog" sub="暂未生效（展示用）· 参数由 watchdog.py 代码常量控制" icon="Power">
             <div className="field-row">
               <div className="field">
                 <div className="field-label">最大重启次数 / 小时</div>
-                <input className="input mono" defaultValue="5" />
+                <input className="input mono" defaultValue="5" disabled />
               </div>
               <div className="field">
                 <div className="field-label">重启计数窗口 (秒)</div>
-                <input className="input mono" defaultValue="3600" />
+                <input className="input mono" defaultValue="3600" disabled />
               </div>
             </div>
             <div className="field-row">
               <div className="field">
                 <div className="field-label">心跳间隔 (秒)</div>
-                <input className="input mono" defaultValue="300" />
+                <input className="input mono" defaultValue="300" disabled />
               </div>
               <div className="field">
                 <div className="field-label">最大错误数</div>
-                <input className="input mono" defaultValue="5" />
+                <input className="input mono" defaultValue="5" disabled />
               </div>
             </div>
             <div className="toggle-row">
@@ -714,7 +715,8 @@ export function SettingsScreen() {
                 <div className="toggle-row-title">退出时清理孤儿 driver</div>
                 <div className="toggle-row-desc">SIGINT/SIGTERM/atexit 钩子兜底 msedgedriver</div>
               </div>
-              <Toggle on={true} onChange={() => { /* readonly demo */ }} />
+              {/* 展示用，未接后端，禁用以保持与通用 tab 一致 */}
+              <Toggle on={true} onChange={() => { /* 展示用，未接后端 */ }} disabled />
             </div>
           </Section>
 

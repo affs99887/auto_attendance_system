@@ -152,8 +152,21 @@ export function convertUC8159(blackWhiteData: Uint8Array, redWhiteData: Uint8Arr
 
 // ==================== 假期数据 ====================
 
+// 按月份计算合法天数上限（含闰年判断）。未提供 year 时，2 月按 29 天放宽，
+// 避免误杀真实存在的 2-29；提供 year 时（来自 buildHolidayPayload 的同一年份）按实际闰年判定。
+function daysInMonth(month: number, year?: number): number {
+  const monthDays = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+  if (month === 2) {
+    if (year === undefined) return 29; // 年份未知时放宽到 29，防止误判 2-29
+    const isLeap = (year % 4 === 0 && year % 100 !== 0) || year % 400 === 0;
+    return isLeap ? 29 : 28;
+  }
+  return monthDays[month - 1];
+}
+
 // 解析「月-日-类型」逐行文本（# 与 // 行为注释）→ 设备编码：Bit15-12=工作标志, Bit11-8=月份, Bit7-0=日期
-export function parseHolidayData(text: string, onInvalidLine?: (line: string) => void): number[] {
+// 可选 year 用于按月份/闰年校验当天合法天数上限，杜绝 2-30 / 4-31 等不存在的日期被编码下发。
+export function parseHolidayData(text: string, onInvalidLine?: (line: string) => void, year?: number): number[] {
   const lines = text.trim().split('\n');
   const holidays: number[] = [];
 
@@ -167,7 +180,12 @@ export function parseHolidayData(text: string, onInvalidLine?: (line: string) =>
       const day = parseInt(parts[1]);
       const isWork = parseInt(parts[2]);
 
-      if (month >= 1 && month <= 12 && day >= 1 && day <= 31 && (isWork === 0 || isWork === 1)) {
+      // 先校验月份与工作标志，再按月份（含闰年）的实际天数上限校验日期，过滤非法日期
+      if (
+        month >= 1 && month <= 12 &&
+        (isWork === 0 || isWork === 1) &&
+        day >= 1 && day <= daysInMonth(month, year)
+      ) {
         const encoded = (isWork << 12) | (month << 8) | day;
         holidays.push(encoded);
       } else {

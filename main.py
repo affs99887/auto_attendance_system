@@ -71,17 +71,38 @@ _instance_lock_handle = None
 
 
 def acquire_single_instance_lock():
-    """获取项目根下的单实例独占锁，防止重复启动 main.py。
+    """获取单实例独占锁，防止重复启动 main.py。
 
     重复启动会导致两个进程用同一 bot token 同时 getUpdates（Telegram 409 互踢），
     且定时打卡任务在两份进程里各跑一遍、对同一账号重复打卡。这里用锁文件 + PID 校验：
     - 取到独占锁：写入当前 PID，返回 True；
     - 取不到（已有实例持锁）：读出占用 PID 提示后返回 False，由调用方退出；
     - 若锁文件残留但持有者已不在（旧进程崩溃未释放），OS 层独占锁本就不会拦截，可正常抢占。
+
+    [M70] 锁必须锚定到“真正被争用的资源”——Telegram bot token 本身，而非脚本目录、也不是 CWD。
+    实测 config.py 的 load_dotenv()（无参）走 python-dotenv 的 find_dotenv：以真实脚本运行时
+    （python main.py，非 REPL/frozen）它从“调用者文件(config.py)所在目录”向上回溯找 .env，
+    而不是从 CWD 找。于是打包态 GUI 的 main.py 副本(resources/backend/)与仓库手动启动/watchdog 的
+    main.py 即便 CWD 相同(DATA_DIR)，也各自解析到不同目录的 .env——既不能按 __file__、也不能按
+    CWD 放锁来兜住“同一 token 双实例”。故直接用最终加载到的 token 派生系统级命名互斥：把锁文件放在
+    系统临时目录（对同一用户、与 CWD/脚本位置无关地稳定一致），文件名带 token 哈希。这样任何最终
+    用到同一 token 的实例——无论从哪个目录、哪份副本启动——都竞争同一把锁，409 与重复打卡被根除。
+    未配置 token 时退回固定通用名，保持“同机仅一份 main.py”的原有单实例语义。
     """
     global _instance_lock_handle
-    # 锁文件固定放在 main.py 所在目录（项目根），不随 CWD 漂移
-    lock_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), '.main.lock')
+    import hashlib
+    import tempfile
+    # 用最终加载到的 bot token 派生锁名（token 才是被争用的真实资源）；
+    # 锁文件落在系统临时目录——它对同一用户稳定、且与 CWD/脚本目录无关，
+    # 任何加载同一 token 的实例都会指向同一把锁。
+    _token = getattr(config, 'TELEGRAM_BOT_TOKEN', None)
+    if _token:
+        _token_sig = hashlib.sha1(_token.encode('utf-8', 'ignore')).hexdigest()[:16]
+        lock_name = f'aas-main-{_token_sig}.lock'
+    else:
+        # 未配置 token：无 409 风险，但仍保持单实例语义，退回固定通用名
+        lock_name = 'aas-main-no-token.lock'
+    lock_path = os.path.join(tempfile.gettempdir(), lock_name)
     try:
         # 以读写方式打开（不截断），便于失败时读取占用方 PID
         handle = open(lock_path, 'a+')
@@ -456,6 +477,28 @@ async def main(args=None):
             except Exception as e:
                 logging.error(f"GUI 后端启动失败，bot 主流程不受影响: {e}", exc_info=True)
 
+        # [M41] 启动 mihomo 健康巡检后台任务：进程死亡时限频自动重启，
+        # 否则 config.get_telegram_proxy() 始终返回死端口、Telegram 全链路永久不可用。
+        proxy_watchdog_task = None
+        _pm_for_watch = getattr(attendance_system, 'proxy_manager', None)
+        if _pm_for_watch is not None:
+            try:
+                proxy_watchdog_task = asyncio.create_task(_pm_for_watch.watchdog())
+            except Exception:
+                logging.exception("启动内置网络加速健康巡检失败")
+
+        # [M68] bot 初始化降级（bot_available=False）时挂起后台自动恢复任务。
+        # 控制台/watchdog 模式没有 GUI 重连端点，否则进程会"活着但 Telegram 全失效"，
+        # 而 watchdog 只看进程存在性永不修复。_bot_recovery_loop 指数退避调用
+        # bot.reconnect()（内部已串接 start_polling），成功后回写 bot_available 并补启动连接监控。
+        bot_recovery_task = None
+        if not getattr(attendance_system, 'bot_available', True):
+            try:
+                bot_recovery_task = asyncio.create_task(_bot_recovery_loop(attendance_system))
+                logging.warning("Telegram Bot 处于降级状态，已启动后台自动恢复任务（指数退避重连）")
+            except Exception:
+                logging.exception("启动 Telegram Bot 后台恢复任务失败")
+
         # 等待5秒后验证8:15提醒任务设置（bot 降级时跳过，避免对未初始化的 app 操作）
         await asyncio.sleep(5)
         if getattr(attendance_system, 'bot_available', True):
@@ -480,6 +523,9 @@ async def main(args=None):
             # 清理资源
             print("\n[>>] 正在关闭系统...")
             schedule_task.cancel()
+            # [M68] 关停时取消 bot 后台恢复任务，避免它在退出过程中又拉起轮询
+            if bot_recovery_task is not None:
+                bot_recovery_task.cancel()
             if gui_handle is not None:
                 try:
                     gui_handle['stop']()
@@ -492,6 +538,10 @@ async def main(args=None):
             # 停止内置网络加速子进程
             _pm = getattr(attendance_system, 'proxy_manager', None)
             if _pm is not None:
+                # [M41] 先让巡检协程优雅退出，避免它在关停过程中又把刚停的 mihomo 拉起来
+                _pm._watchdog_stop = True
+                if proxy_watchdog_task is not None:
+                    proxy_watchdog_task.cancel()
                 try:
                     _pm.stop()
                 except Exception:

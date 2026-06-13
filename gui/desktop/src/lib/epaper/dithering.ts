@@ -738,3 +738,95 @@ export function processImageData(imageData: ImageData, mode: DitherMode): Uint8A
 
   return processedData;
 }
+
+// ===== 异步抖动流水线（Web Worker 离主线程）=====
+// 审计 E2 的核心冻结根因：上面这些函数全是同步循环，整条流水线（对比度→ditherImage→
+// processImageData→decodeProcessedData）一旦在大画布上跑一次 Stucki/Jarvis，就会把渲染进程
+// 主线程阻塞数百毫秒到数秒，窗口卡死。这里提供一个把整条流水线搬进 Web Worker 的异步入口，
+// 算法逻辑与同步版完全一致（worker 内部复用上面的纯函数）。仅在无 Worker 支持或构造失败时
+// 退回同步执行，保证行为不回归。
+
+// 同步执行整条流水线（worker 不可用时的回退；与原 convertDithering 内联逻辑一致）。
+function ditherPipelineSync(
+  imageData: ImageData,
+  contrast: number,
+  alg: DitherAlgorithm,
+  strength: number,
+  mode: DitherMode,
+): ImageData {
+  adjustContrast(imageData, contrast);
+  const processedData = processImageData(ditherImage(imageData, alg, strength, mode), mode);
+  return decodeProcessedData(processedData, imageData.width, imageData.height, mode);
+}
+
+// 单例 worker + 自增请求 id：复用同一个 worker，避免每次转换都新建/销毁线程；
+// 用 id 关联请求与回包，防止并发调用（理论上）串扰。
+let ditherWorker: Worker | null = null;
+let ditherWorkerBroken = false; // 构造或运行出错后置位，后续直接走同步回退
+let ditherReqId = 0;
+const ditherPending = new Map<number, { resolve: (img: ImageData) => void; reject: (err: unknown) => void }>();
+
+function getDitherWorker(): Worker | null {
+  if (ditherWorkerBroken) return null;
+  if (ditherWorker) return ditherWorker;
+  // 仅在浏览器/渲染进程环境且支持 Worker 时构造
+  if (typeof Worker === 'undefined' || typeof window === 'undefined') {
+    ditherWorkerBroken = true;
+    return null;
+  }
+  try {
+    // Vite 原生支持的 worker 引入写法（new URL + import.meta.url），生产构建会自动打包
+    ditherWorker = new Worker(new URL('./dithering.worker.ts', import.meta.url), { type: 'module' });
+    ditherWorker.onmessage = (e: MessageEvent<{ id: number; buffer: ArrayBuffer; width: number; height: number }>) => {
+      const { id, buffer, width, height } = e.data;
+      const pending = ditherPending.get(id);
+      if (!pending) return;
+      ditherPending.delete(id);
+      pending.resolve(new ImageData(new Uint8ClampedArray(buffer), width, height));
+    };
+    ditherWorker.onerror = () => {
+      // worker 整体异常：拒绝所有挂起请求并标记不可用，后续调用回退到同步
+      ditherWorkerBroken = true;
+      for (const [, pending] of ditherPending) pending.reject(new Error('dither worker error'));
+      ditherPending.clear();
+      ditherWorker = null;
+    };
+    return ditherWorker;
+  } catch {
+    ditherWorkerBroken = true;
+    return null;
+  }
+}
+
+// 异步执行整条抖动流水线，返回最终预览用的 ImageData。
+// 优先在 Web Worker 中运行（不阻塞 UI）；worker 不可用或出错时自动回退到同步执行。
+// 注意：会转移传入 imageData.data 的底层 buffer，调用方在 resolve 前不应再使用该 imageData。
+export async function ditherImageDataAsync(
+  imageData: ImageData,
+  contrast: number,
+  alg: DitherAlgorithm,
+  strength: number,
+  mode: DitherMode,
+): Promise<ImageData> {
+  const worker = getDitherWorker();
+  if (!worker) {
+    // 同步回退：保持与原同步流水线完全一致的行为
+    return ditherPipelineSync(imageData, contrast, alg, strength, mode);
+  }
+
+  const id = ++ditherReqId;
+  const buffer = imageData.data.buffer;
+  return new Promise<ImageData>((resolve, reject) => {
+    ditherPending.set(id, { resolve, reject });
+    try {
+      // 转移像素缓冲到 worker（零拷贝）
+      worker.postMessage(
+        { id, buffer, width: imageData.width, height: imageData.height, contrast, alg, strength, mode },
+        [buffer],
+      );
+    } catch (err) {
+      ditherPending.delete(id);
+      reject(err);
+    }
+  });
+}

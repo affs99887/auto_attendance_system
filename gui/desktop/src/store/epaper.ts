@@ -99,17 +99,65 @@ export function sortMemos(items: StationMemoItem[]): StationMemoItem[] {
   return [...items.filter(m => !m.done), ...items.filter(m => m.done)];
 }
 
+// 逐条校验+规范化持久化的备忘录：localStorage / gui-settings.json 可能被外部改坏或写入
+// 非法元素（缺 text 的对象、字符串、null 等），不过滤会让 sortMemos / drawMemo(wrapText)
+// / Epaper.tsx 渲染因 undefined 崩溃。这里丢弃非对象/text 为空的项，并把字段强制成
+// 合法类型（id→number、text→非空 string、done→boolean、doneAt 仅保留有限数）。
+function normalizeMemoBase(m: unknown): { id: number; text: string; done: boolean; doneAt?: number } | null {
+  if (!m || typeof m !== 'object') return null;
+  const o = m as Record<string, unknown>;
+  if (typeof o.text !== 'string' || !o.text.trim()) return null; // text 必须为非空字符串
+  const item: { id: number; text: string; done: boolean; doneAt?: number } = {
+    id: typeof o.id === 'number' && Number.isFinite(o.id) ? o.id : 0, // id 先占位，下方统一重排去重
+    text: o.text,
+    done: o.done === true,
+  };
+  if (typeof o.doneAt === 'number' && Number.isFinite(o.doneAt)) item.doneAt = o.doneAt;
+  return item;
+}
+
+/** 规范化备忘录主列表：过滤非法项并重算 id（递增去重，防止外部改动产生重复 id 影响
+ *  React key 命中与 toggleMemo），返回规范化后的 items 与下一个可用 nextId。 */
+function normalizeMemos(rawItems: unknown, rawNextId: unknown): { items: StationMemoItem[]; nextId: number } {
+  const arr = Array.isArray(rawItems) ? rawItems : [];
+  const items: StationMemoItem[] = [];
+  let nextId = typeof rawNextId === 'number' && Number.isFinite(rawNextId) ? Math.floor(rawNextId) : 1;
+  for (const raw of arr) {
+    const base = normalizeMemoBase(raw);
+    if (!base) continue;
+    // 重新分配自增 id，确保唯一：以历史 nextId 与已有 id 取最大递增
+    const id = nextId++;
+    items.push({ id, text: base.text, done: base.done, ...(base.doneAt != null ? { doneAt: base.doneAt } : {}) });
+  }
+  return { items, nextId };
+}
+
+/** 规范化归档列表：复用 normalizeMemoBase，并保留/补齐 archivedAt（缺失或非法时补当前时刻）。
+ *  归档项 id 同样重排去重，避免与主列表 / 彼此冲突。 */
+function normalizeArchive(rawArchive: unknown, startId: number): { archive: ArchivedMemo[]; nextId: number } {
+  const arr = Array.isArray(rawArchive) ? rawArchive : [];
+  const archive: ArchivedMemo[] = [];
+  let nextId = startId;
+  for (const raw of arr) {
+    const base = normalizeMemoBase(raw);
+    if (!base) continue;
+    const o = raw as Record<string, unknown>;
+    const archivedAt = typeof o.archivedAt === 'number' && Number.isFinite(o.archivedAt) ? o.archivedAt : Date.now();
+    const id = nextId++;
+    archive.push({ id, text: base.text, done: base.done, archivedAt, ...(base.doneAt != null ? { doneAt: base.doneAt } : {}) });
+  }
+  return { archive, nextId };
+}
+
 function loadMemos(): { items: StationMemoItem[]; nextId: number; archive: ArchivedMemo[] } {
   try {
     const raw = typeof localStorage !== 'undefined' ? localStorage.getItem(MEMO_KEY) : null;
     if (raw) {
       const o = JSON.parse(raw);
-      if (Array.isArray(o.items)) {
-        return {
-          items: o.items,
-          nextId: typeof o.nextId === 'number' ? o.nextId : o.items.length + 1,
-          archive: Array.isArray(o.archive) ? o.archive : [],
-        };
+      if (o && typeof o === 'object' && Array.isArray(o.items)) {
+        const m = normalizeMemos(o.items, o.nextId);
+        const a = normalizeArchive(o.archive, m.nextId);
+        return { items: m.items, nextId: a.nextId, archive: a.archive };
       }
     }
   } catch { /* 忽略损坏的本地数据 */ }
@@ -218,6 +266,27 @@ let memoNextId = initMemos.nextId;
 let pendingSelectId: string | null = null;
 // 定时推送发起的自动重连：连接成功后补推一次（蓝牙会自动断开，到点先重连再推送）
 let autoPushAfterConnect = false;
+// 等待设备首条配置回传后再补推：连上后置 true，onConfigReceived（INIT 后首条通知，
+// 携带正确 driver→画布尺寸/颜色模式）到达时再触发 pushStation('auto')，避免固定盲等导致
+// driver/MTU 未更新就用错误画布渲染。兜底定时器仅在配置迟迟不来时收尾（见下）。
+let pendingAutoPushAfterConfig = false;
+let autoPushFallbackTimer: number | null = null;
+function clearAutoPushFallback() {
+  if (autoPushFallbackTimer != null) {
+    window.clearTimeout(autoPushFallbackTimer);
+    autoPushFallbackTimer = null;
+  }
+}
+// 配置就绪即补推：复核自动推送仍开启、设备在线、无并发发送后再推（重连窗口内用户可能已关闭）
+function triggerAutoPushAfterConfig() {
+  if (!pendingAutoPushAfterConfig) return;
+  pendingAutoPushAfterConfig = false;
+  clearAutoPushFallback();
+  const s = useEpaperStore.getState();
+  if (s.stationAutoMin > 0 && s.connected && !s.stationPushing && !epdSendBusy()) {
+    void s.pushStation('auto');
+  }
+}
 // 一键重连超时定时器（目标设备一直未被扫到时收尾）
 let quickTimer: number | null = null;
 function clearQuickTimer() {
@@ -490,16 +559,18 @@ export const epdClient = new EpdBleClient({
         scanning: false, connectingId: null, scanDevices: [], quickConnecting: false,
         lastConnectedName: last, pairedNames: paired, lastDevice,
       });
-      // 定时推送发起的重连：连上后等设备回传配置/MTU（INIT 后首条通知）再补推。
-      // 补推前复核自动推送仍开启（重连窗口期内用户可能已关闭）且设备仍在线。
+      // 定时推送发起的重连：连上后等设备回传配置（INIT 后首条通知，含正确 driver）再补推 ——
+      // 事件驱动（见 onConfigReceived → triggerAutoPushAfterConfig），而非固定盲等，
+      // 避免慢设备/弱信号下 driver/MTU 尚未更新就用错误画布尺寸/颜色模式渲染发送。
       if (autoPushAfterConnect) {
         autoPushAfterConnect = false;
-        window.setTimeout(() => {
-          const s = useEpaperStore.getState();
-          if (s.stationAutoMin > 0 && s.connected && !s.stationPushing && !epdSendBusy()) {
-            void s.pushStation('auto');
-          }
-        }, 3500);
+        pendingAutoPushAfterConfig = true;
+        // 兜底：极个别固件可能迟迟不回配置；8s 后仍未触发则用当前 store 值（已校验的 driver/MTU）补推一次
+        clearAutoPushFallback();
+        autoPushFallbackTimer = window.setTimeout(() => {
+          autoPushFallbackTimer = null;
+          triggerAutoPushAfterConfig();
+        }, 8000);
       }
     } else {
       // 断开 / 连接失败：复位连接态并关闭扫描 modal / 一键重连态（此时 requestDevice 已结束，
@@ -507,6 +578,8 @@ export const epdClient = new EpdBleClient({
       clearQuickTimer();
       pendingSelectId = null;
       autoPushAfterConnect = false; // 重连失败则放弃本次补推，等下一轮定时
+      pendingAutoPushAfterConfig = false; // 断开则取消「待配置补推」与兜底定时器
+      clearAutoPushFallback();
 
       useEpaperStore.setState({
         connected, canReconnect, deviceName, firmware,
@@ -516,6 +589,8 @@ export const epdClient = new EpdBleClient({
   },
   onConfigReceived(pins, driver) {
     useEpaperStore.setState({ pins, driver });
+    // 配置（driver）已就绪：若有定时推送在等待，事件驱动触发补推（替代旧的固定 3500ms 盲等）
+    triggerAutoPushAfterConfig();
   },
   onMtuUpdate(mtu) {
     useEpaperStore.setState({ mtu });
@@ -566,6 +641,20 @@ if (typeof window !== 'undefined' && window.AAS_EPD) {
       window.AAS_EPD?.pairingResponse(ok);
     })();
   });
+
+  // 窗口隐藏（缩托盘）时主动复位扫描 / 一键重连态（修复 E18 渲染层一致性）：
+  // 主进程已在窗口 close/closed/导航时兜底解析挂起的 native 蓝牙请求（见 main.cjs
+  // resolvePendingBleRequests），但那条路径直接在主进程调 callback('')，不会回传 epd:ble-select，
+  // 渲染层 store 的 scanning/quickConnecting/scanDevices 会被原样保留（下次 openScan 被
+  // `if (scanning) return` 吞掉而打不开扫描）。这里在 document 转入隐藏时复位渲染态，
+  // 与主进程释放保持两端一致；closeScan/cancelQuickReconnect 再发一次 select('') 对主进程幂等
+  // （epd:ble-select 见 !bluetoothRequest 即 return）。
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState !== 'hidden') return;
+    const st = useEpaperStore.getState();
+    if (st.scanning) st.closeScan();
+    if (st.quickConnecting) st.cancelQuickReconnect();
+  });
 }
 
 // ===== 启动回灌：主进程 gui-settings.json → store =====
@@ -588,11 +677,14 @@ async function hydrateFromFile() {
     patch.lastDevice = dev.lastDevice;
   }
 
-  const memosO = all[MEMO_KEY] as { items?: StationMemoItem[]; nextId?: number; archive?: ArchivedMemo[] } | undefined;
+  const memosO = all[MEMO_KEY] as { items?: unknown; nextId?: unknown; archive?: unknown } | undefined;
   if (memosO && typeof memosO === 'object' && Array.isArray(memosO.items)) {
-    patch.memos = memosO.items;
-    patch.memoArchive = Array.isArray(memosO.archive) ? memosO.archive : [];
-    memoNextId = typeof memosO.nextId === 'number' ? memosO.nextId : memosO.items.length + 1;
+    // 与 loadMemos 同口径：逐条校验/规范化并重算 nextId，防止文件被外部改坏后渲染崩溃或 id 冲突
+    const m = normalizeMemos(memosO.items, memosO.nextId);
+    const a = normalizeArchive(memosO.archive, m.nextId);
+    patch.memos = m.items;
+    patch.memoArchive = a.archive;
+    memoNextId = a.nextId;
   }
 
   const stationO = all[STATION_KEY] as { autoMin?: number; lastPush?: number; leave?: StationLeaveCfg } | undefined;

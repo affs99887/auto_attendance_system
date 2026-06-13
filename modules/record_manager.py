@@ -7,6 +7,7 @@
 import json
 import os
 import threading
+import time
 from datetime import datetime
 from modules.config import config
 
@@ -53,9 +54,12 @@ class PunchRecordManager:
             except Exception as e:
                 print(f"加载打卡记录失败: {str(e)}")
                 # 解析失败多半是上次写入被强杀/断电截断，把损坏文件改名备份而非静默丢弃，
-                # 避免随后第一次 save_records 用只含当天的记录覆盖整月历史
+                # 避免随后第一次 save_records 用只含当天的记录覆盖整月历史。
+                # 备份名加时间戳（对齐 config.py 的 .corrupt-{时间戳}）：若同月文件在人工恢复前
+                # 二次崩溃截断，os.replace 在 Windows 会静默覆盖固定名目标，导致首份完整整月历史
+                # 备份被第二份损坏文件覆盖而永久丢失；带时间戳可保证每次备份各自留档、不互相覆盖。
                 try:
-                    backup_file = self.current_month_file + '.corrupt'
+                    backup_file = f"{self.current_month_file}.corrupt-{int(time.time())}"
                     os.replace(self.current_month_file, backup_file)
                     print(f"已将损坏的打卡记录备份为: {backup_file}")
                 except Exception as backup_err:
