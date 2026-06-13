@@ -81,3 +81,11 @@ proxy_runtime/
 
 # 审计报告（含真实姓名/内网地址等敏感描述，仅本地参考，勿入库）
 AUDIT_REPORT.md
+
+# Edge 驱动大二进制不入库（由 webdriver-manager 自动下载 / 本地放置）
+/msedgedriver.exe
+/msedgedriver.exe.bak-*
+
+# 静态原型示例数据含真实考勤记录/员工姓名，禁止入库（已从历史 filter-repo 清除）
+gui/static-prototype/data.jsx
+gui/static-prototype/data/records_*.json
