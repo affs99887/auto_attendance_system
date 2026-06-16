@@ -65,15 +65,12 @@ def _normalize_range(range_):
 
 
 def _proxies():
-    """若内置网络加速启用，返回走本地端口的 proxies dict；否则 None（直连）。"""
-    try:
-        if config.get_proxy_enabled():
-            port = config.get_proxy_local_port()
-            url = f'http://127.0.0.1:{port}'
-            return {'http': url, 'https': url}
-    except Exception:
-        logger.warning('[汇率] 判断代理状态异常，转为直连', exc_info=True)
-    return None
+    """内置加速启用且本地端口在监听时走本地代理，否则直连。
+
+    端口不通（mihomo 未就绪/已崩/确定性失败）时返回 None 直连，不再硬打死端口报 ProxyError。
+    判定集中在 config.get_local_proxy()，与 AI资讯/Claude额度/Telegram 口径一致。
+    """
+    return config.get_local_proxy()
 
 
 def _cache_path():

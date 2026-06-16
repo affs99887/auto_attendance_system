@@ -51,11 +51,72 @@ function NewsItem({ item }: { item: AiNewsItem }) {
   );
 }
 
+// 列表底部：游标懒加载触点 + 加载更多 / 没有更多了 / 重试 状态
+function NewsListFooter({
+  hasNext,
+  loadingMore,
+  moreError,
+  onLoadMore,
+}: {
+  hasNext: boolean;
+  loadingMore: boolean;
+  moreError: string | null;
+  onLoadMore: () => void;
+}) {
+  const sentinelRef = React.useRef<HTMLDivElement | null>(null);
+  // 已加载条数：变化后重建 observer，使首屏/分类内容不足一屏时也能连续加载至撑满或到底
+  const itemCount = useAiNewsStore(s => s.items.length);
+  React.useEffect(() => {
+    const el = sentinelRef.current;
+    // 出错时停止自动加载，等用户手动点"重试"；无更多时也不观察
+    if (!el || !hasNext || moreError) return;
+    const io = new IntersectionObserver(
+      entries => {
+        // loadMore 内部自带防重入（loadingMore / !hasNext / !nextCursor 守卫）
+        if (entries.some(e => e.isIntersecting)) void useAiNewsStore.getState().loadMore();
+      },
+      { rootMargin: '200px' },
+    );
+    io.observe(el);
+    return () => io.disconnect();
+  }, [hasNext, moreError, itemCount]);
+
+  if (loadingMore) {
+    return (
+      <div className="empty-state" style={{ padding: '16px 20px' }}>
+        <span className="spinner" style={{ display: 'inline-block', marginRight: 8 }} /> 加载中…
+      </div>
+    );
+  }
+  if (moreError) {
+    return (
+      <div className="empty-state" style={{ padding: '16px 20px' }}>
+        <div style={{ marginBottom: 8 }}>加载更多失败</div>
+        <button className="btn btn-sm" onClick={onLoadMore}>
+          <Icon.Refresh size={12} /> 重试
+        </button>
+      </div>
+    );
+  }
+  if (hasNext) {
+    return (
+      <div ref={sentinelRef} style={{ display: 'flex', justifyContent: 'center', padding: '14px 0' }}>
+        <button className="btn btn-sm" onClick={onLoadMore}>加载更多</button>
+      </div>
+    );
+  }
+  return <div className="empty-state" style={{ padding: '16px 20px' }}>没有更多了</div>;
+}
+
 export function NewsScreen() {
-  const resp = useAiNewsStore(s => s.resp);
+  const items = useAiNewsStore(s => s.items);
   const loading = useAiNewsStore(s => s.loading);
+  const loadingMore = useAiNewsStore(s => s.loadingMore);
+  const hasNext = useAiNewsStore(s => s.hasNext);
+  const moreError = useAiNewsStore(s => s.moreError);
+  const error = useAiNewsStore(s => s.error);
   const refresh = useAiNewsStore(s => s.refresh);
-  const items = resp?.items ?? [];
+  const loadMore = useAiNewsStore(s => s.loadMore);
   const [cat, setCat] = React.useState<string>('all');
 
   // 各版块计数（all + 各 slug）
@@ -117,10 +178,25 @@ export function NewsScreen() {
         <div className="empty-state">
           <span className="spinner" style={{ display: 'inline-block', marginRight: 8 }} /> 正在拉取 AI HOT 精选…
         </div>
-      ) : shown.length ? (
-        <div className="news-list">
-          {shown.map(it => <NewsItem key={it.id} item={it} />)}
+      ) : error && !items.length ? (
+        <div className="empty-state">
+          <div style={{ marginBottom: 10 }}>加载失败：{error}</div>
+          <button className="btn btn-sm" onClick={() => void refresh(true)}>
+            <Icon.Refresh size={12} /> 重试
+          </button>
         </div>
+      ) : shown.length ? (
+        <>
+          <div className="news-list">
+            {shown.map(it => <NewsItem key={it.id} item={it} />)}
+          </div>
+          <NewsListFooter
+            hasNext={hasNext}
+            loadingMore={loadingMore}
+            moreError={moreError}
+            onLoadMore={() => void loadMore()}
+          />
+        </>
       ) : (
         <div className="empty-state">该版块暂无精选条目</div>
       )}

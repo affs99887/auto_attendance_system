@@ -98,6 +98,8 @@ export interface AiNewsResponse {
   updated_at: number | null; // 缓存最后刷新时刻（unix 秒）
   count: number;
   items: AiNewsItem[];
+  next_cursor?: string | null; // 游标分页：下一页游标（null/缺省表示无更多）
+  has_next?: boolean;          // 是否还有更多可加载
 }
 
 // ===== Claude Code 额度（墨水屏信息站，后端读本机凭据拉官方 usage 接口）=====
@@ -344,10 +346,12 @@ export const api = {
     return request<ExchangeRateResponse>(`/api/v1/exchange-rate?${qs.toString()}`);
   },
 
-  // AI 资讯（AI HOT 聚合）；force=true 跳过后端缓存强制刷新
-  getAiNews: (force?: boolean) => {
+  // AI 资讯（AI HOT 聚合）；force 跳过后端缓存强制刷新（首屏），cursor 游标续拉"加载更多"
+  getAiNews: (opts?: { force?: boolean; cursor?: string; take?: number }) => {
     const qs = new URLSearchParams();
-    if (force) qs.set('force', '1');
+    if (opts?.force) qs.set('force', '1');
+    if (opts?.cursor) qs.set('cursor', opts.cursor);
+    if (opts?.take) qs.set('take', String(opts.take));
     const q = qs.toString();
     return request<AiNewsResponse>(`/api/v1/ai-news${q ? `?${q}` : ''}`);
   },

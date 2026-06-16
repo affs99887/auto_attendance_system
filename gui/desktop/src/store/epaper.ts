@@ -503,8 +503,8 @@ export const useEpaperStore = create<EpaperState>((set, get) => ({
       autoPushAfterConnect = false; // 超时未扫到设备，放弃本次补推
       window.AAS_EPD?.select('');
       useEpaperStore.setState({ quickConnecting: false });
-      useEpaperStore.getState().addLog('一键重连超时：未发现上次连接的设备，请确认设备已开机，或用「连接设备」重新搜索');
-    }, 30_000);
+      useEpaperStore.getState().addLog('一键重连超时（60 秒未发现设备）：墨水屏可能已休眠停止蓝牙广播，请在设备上按键或重新上电唤醒后再试，或用「连接设备」重新搜索');
+    }, 60_000);
     void epdClient.preConnect();
   },
 
@@ -774,6 +774,56 @@ export async function buildStationData(): Promise<StationData> {
 // 模块级定时器：切页不中断。墨水屏全刷耗时长（约 15-25s）且影响寿命，
 // 间隔下限 30 分钟（UI 选项控制）；仅设备已连接、无发送任务时执行。
 // 推送失败时也按 lastAttempt 节流，避免每分钟反复重试打满日志。
+//
+// 方案2：无用户手势场景(定时推送 / 启动后主动重连)的"注入手势→手势内自动重连"。Web Bluetooth 的
+// requestDevice 必须在 user activation 上下文中调用，而定时器/启动钩子都没有手势。主进程经 IPC 用
+// sendInputEvent 注入一次可信 F24 键(isTrusted=true)，下面的 keydown 监听便在该手势上下文里发起一键
+// 重连，无需用户手动点击。仅在 armed 的短窗口内响应、且任意键即可(不赌 Electron keyCode→key 映射，
+// 误触仅多一次无害重连)；注入/手势在窗口缩托盘等情况下可能无效，由调用方 2s 兜底降级为"提示手动"。
+let gestureReconnectArmed = false;
+if (typeof window !== 'undefined') {
+  window.addEventListener('keydown', () => {
+    if (!gestureReconnectArmed) return;
+    gestureReconnectArmed = false;
+    const st = useEpaperStore.getState();
+    if (!st.connected && !st.quickConnecting && !st.scanning && st.lastDevice) {
+      st.addLog('已注入手势，发起自动重连…');
+      st.quickReconnect();
+    }
+  });
+}
+
+// 尝试"注入手势→自动重连上次设备"。reason 仅作日志前缀。已连接/正在连接/无 lastDevice → 跳过；
+// 无注入能力(非 Electron/旧包) → 直接提示手动；注入后 2s 未被 keydown 消费(手势无效/窗口隐藏) → 提示手动。
+function attemptGestureReconnect(reason: string): void {
+  if (typeof window === 'undefined') return;
+  const st = useEpaperStore.getState();
+  if (st.connected || st.quickConnecting || st.scanning || !st.lastDevice) return;
+  const ld = st.lastDevice;
+  const inject = window.AAS_EPD?.tryGestureReconnect;
+  if (!inject) {
+    st.addLog(`${reason}：设备未连接，请点「一键重连」连上「${ld.name || ld.id}」`);
+    return;
+  }
+  gestureReconnectArmed = true;
+  st.addLog(`${reason}：尝试自动重连「${ld.name || ld.id}」…`);
+  void inject().then(ok => { if (!ok) gestureReconnectArmed = false; });
+  window.setTimeout(() => {
+    if (!gestureReconnectArmed) return; // 已被 keydown 消费(已发起重连)
+    gestureReconnectArmed = false;
+    const s = useEpaperStore.getState();
+    if (!s.connected && !s.quickConnecting && !s.scanning) {
+      s.addLog(`${reason}未生效（窗口可能在后台），请点「一键重连」连上「${ld.name || ld.id}」`);
+    }
+  }, 2000);
+}
+
+// 启动即主动重连一次：进入系统后(窗口通常在前台，最利于 sendInputEvent 注入手势生效)，若有上次设备
+// 且未连接，主动触发一次"注入手势→一键重连"——实现"每次重启后主动连上次设备一次"，也便于验证方案2
+// 的模拟手势在重启场景是否有效。延迟 5s 等窗口稳定 / 后端就绪 / preload IPC 可用。
+if (typeof window !== 'undefined') {
+  window.setTimeout(() => attemptGestureReconnect('启动自动重连'), 5000);
+}
 let stationLastAttempt = 0;
 if (typeof window !== 'undefined') {
   window.setInterval(() => {
@@ -799,10 +849,12 @@ if (typeof window !== 'undefined') {
       st.addLog('定时推送：设备已断开，正在重连…');
       void st.reconnect();
     } else if (st.lastDevice) {
+      // 重启应用后内存已无设备对象，requestDevice 需用户手势而定时器没有 → 方案2：注入手势后在手势
+      // 上下文里发起一键重连（详见 attemptGestureReconnect）；失败则降级提示手动。
+      // 保留 autoPushAfterConnect：连上后(见 onConnectionChange)自动补推本次。
       stationLastAttempt = Date.now();
       autoPushAfterConnect = true;
-      st.addLog('定时推送：设备未连接，先尝试一键重连…');
-      st.quickReconnect();
+      attemptGestureReconnect('定时推送');
     }
     // 无任何可重连目标：跳过本轮，等下一次到点
   }, 60_000);

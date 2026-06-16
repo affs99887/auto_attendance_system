@@ -702,6 +702,24 @@ ipcMain.on('epd:ble-select', (_event, deviceId) => {
   try { cb(deviceId || ''); } catch { /* 请求可能已失效，忽略 */ }
 });
 
+// 方案2：定时推送(无用户手势)时，主进程向渲染层注入一次可信键盘输入(F24，isTrusted=true)，
+// 使渲染层得以在 user activation 上下文中调用 navigator.bluetooth.requestDevice 自动重连。
+// 选 F24(几乎无默认绑定/无人使用)避免误触；渲染层仅在"已武装"的短窗口内响应。
+// 注：窗口缩托盘/隐藏时 sendInputEvent 可能无效，故渲染层有 2s 兜底降级为"提示手动"，
+// 本调用只负责尽力注入、绝不抛错(失败 resolve false 即可)。
+ipcMain.handle('epd:gesture-reconnect', () => {
+  try {
+    if (!mainWindow || mainWindow.isDestroyed()) return false;
+    const wc = mainWindow.webContents;
+    wc.sendInputEvent({ type: 'keyDown', keyCode: 'F24' });
+    wc.sendInputEvent({ type: 'keyUp', keyCode: 'F24' });
+    return true;
+  } catch (e) {
+    console.warn('[aas-electron] epd:gesture-reconnect 注入失败:', e && e.message);
+    return false;
+  }
+});
+
 // ============================================================================
 // 窗口控制 IPC（自绘标题栏的三个按钮）
 // ============================================================================

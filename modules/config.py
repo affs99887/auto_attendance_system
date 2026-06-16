@@ -358,7 +358,9 @@ class Config:
         [M60] 判定口径与 ProxyManager._get_active_profile / _read_local_content 严格一致：
         - active profile = 按 active_profile_id 查找，失效则兜底取 profiles[0]；
         - local 正文优先读 proxy_runtime/profiles/<id>.yaml，缺失则回退内联 content（兼容未迁移旧数据）。
-        runtime 路径与 ProxyManager(__file__ → modules/.. + proxy_runtime/profiles) 同根。
+        proxy_runtime 属可写用户数据，路径以 cwd（运行时工作目录/数据根）为基准，与
+        ProxyManager.runtime_dir(os.getcwd()+/proxy_runtime) 及 dynamic_config.json 同根——
+        打包后 cwd=DATA_DIR，不能用 __file__（会落到只读的 resources/backend，profiles/ 为空导致误判）。
         仅做纯文件读取，不导入/实例化 ProxyManager，避免迁移副作用与循环导入。
         """
         profiles = cfg.get('profiles')
@@ -372,8 +374,7 @@ class Config:
             return None
         pid = prof.get('id')
         if pid:
-            project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-            cache = os.path.join(project_root, 'proxy_runtime', 'profiles', f'{pid}.yaml')
+            cache = os.path.join(os.getcwd(), 'proxy_runtime', 'profiles', f'{pid}.yaml')
             if os.path.isfile(cache):
                 try:
                     with open(cache, 'r', encoding='utf-8') as f:
@@ -478,6 +479,32 @@ class Config:
             f"Telegram代理探测失败（已尝试端口 {cls.TELEGRAM_PROXY_PORTS}），将走直连"
         )
         return None
+
+    @classmethod
+    def get_local_proxy(cls):
+        """供 requests 类后台服务（汇率/AI资讯/Claude额度）使用的本地代理 dict，或 None（直连）。
+
+        仅当内置加速已启用且本地端口"确实在监听"时才返回 {'http':url,'https':url}；端口无人监听
+        （未启用 / mihomo 未就绪 / 已崩溃 / 确定性失败永远起不来）一律返回 None 走直连，避免把请求
+        打到无人监听的回环端口而抛 ProxyError（[WinError 10061] 目标计算机积极拒绝）——这正是 mihomo
+        不可用时这些周期拉取"全军覆没"的直接根因。与 get_telegram_proxy 的回退理念一致；区别是这里用
+        即时端口探测而非死等：它们是一次性周期拉取，端口不通时直连/回退旧缓存即可，下个周期 mihomo
+        复活后自然恢复，无需像 Telegram 长连接那样等待。
+        """
+        try:
+            if not cls.get_proxy_enabled():
+                return None
+            port = cls.get_proxy_local_port()
+            try:
+                with socket.create_connection(('127.0.0.1', port), timeout=1.0):
+                    pass
+            except (OSError, socket.timeout):
+                return None
+            url = f"http://127.0.0.1:{port}"
+            return {'http': url, 'https': url}
+        except Exception:
+            logging.warning('判断本地代理状态异常，转为直连', exc_info=True)
+            return None
 
     @classmethod
     def get_user_configs(cls):

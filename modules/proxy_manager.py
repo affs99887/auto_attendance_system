@@ -158,8 +158,15 @@ class ProxyManager:
     """mihomo 子进程 + external-controller API 客户端。"""
 
     def __init__(self, project_root=None):
-        # 项目根：modules/.. → dev 与打包（resources/backend）一致
-        self.project_root = project_root or os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        # 代码根（modules/..）：dev=项目根；打包=resources/backend。随安装包附带的 bin/（mihomo
+        # 二进制 + geo 源库）在此，跟代码走，故用 __file__ 推导。
+        self.code_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        # 数据根：proxy_runtime（config.yaml / profiles 用户粘贴的配置 / mihomo.log / pid / 缓存）
+        # 属"可写用户数据"，必须与 config.py 读 dynamic_config.json、punch_records/logs 等同根 → 用 cwd。
+        # 打包后 main.cjs 以 cwd=DATA_DIR(真实数据树) 拉起后端；若这里仍用 __file__ 落到只读的
+        # resources/backend/proxy_runtime（其 profiles/ 为空），打包版会读不到用户的本地代理配置而抛
+        # "尚未提供 Clash 配置文本"，导致 mihomo 永远起不来、本地代理端口无人监听 → 全程"断网"。
+        self.project_root = project_root or os.getcwd()
         self.runtime_dir = os.path.join(self.project_root, 'proxy_runtime')
         self.proc = None
         self._job = None  # Windows Job Object 句柄（KILL_ON_JOB_CLOSE）；非 Windows/降级时为 None
@@ -174,7 +181,8 @@ class ProxyManager:
 
     # ------------------------------------------------------------------ 路径
     def _bin_dir(self):
-        return os.path.join(self.project_root, 'bin')
+        # bin/ 随代码打包（resources/backend/bin），与可写数据根 proxy_runtime 解耦。
+        return os.path.join(self.code_root, 'bin')
 
     def mihomo_path(self):
         name = 'mihomo.exe' if os.name == 'nt' else 'mihomo'

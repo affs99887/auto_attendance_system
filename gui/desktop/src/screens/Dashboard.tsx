@@ -305,10 +305,9 @@ function useMatchHeight(): [React.RefObject<HTMLDivElement>, number | null] {
 
 // 仪表盘 AI 资讯模块 —— 竖向精选列表（与今日打卡同一行，高度对齐）
 function DashNewsCard({ matchH }: { matchH: number | null }) {
-  const resp = useAiNewsStore(s => s.resp);
+  const items = useAiNewsStore(s => s.items);
   const loading = useAiNewsStore(s => s.loading);
   const refresh = useAiNewsStore(s => s.refresh);
-  const items = resp?.items ?? [];
   const top = React.useMemo(
     () =>
       [...items]

@@ -646,19 +646,33 @@ def _build_flask_app(attendance_system, bridge: AsyncioBridge,
     @app.get('/api/v1/ai-news')
     @require_token
     def get_ai_news():
-        """返回 AI HOT 精选资讯契约（updated_at + count + items）。
+        """返回 AI HOT 精选资讯契约（updated_at + count + items + next_cursor + has_next）。
 
-        query: force=0|1（1 跳过 TTL 立即拉）。
-        失败也返回 200 + 旧缓存；彻底无数据时 updated_at:null、count:0、items:[]。
+        query:
+          - force=0|1（1 跳过 TTL 立即拉，仅首屏有效）；
+          - cursor=<base64>（"加载更多"游标续拉，实时拉不走缓存）；
+          - take=N（每页条数，1..100）。
+        首屏失败返回 200 + 旧缓存；加载更多(带 cursor)失败返回 502，便于前端重试而非误判到底。
         """
         force = request.args.get('force', '0') in ('1', 'true', 'True')
+        cursor = request.args.get('cursor') or None
+        take = None
+        take_raw = request.args.get('take')
+        if take_raw:
+            try:
+                take = max(1, min(100, int(take_raw)))
+            except (TypeError, ValueError):
+                take = None
         try:
             from modules.ai_news_service import get_ai_news as _gan
-            return jsonify(_gan(force=force))
+            return jsonify(_gan(force=force, cursor=cursor, take=take))
         except Exception:
             logging.exception("get_ai_news failed")
-            # 即便彻底异常也返回 200 + 空结构，避免前端报错
-            return jsonify({'updated_at': None, 'count': 0, 'items': []})
+            if cursor:
+                # 加载更多失败：返回 502，前端走错误分支可重试（不伪装成"到底"）
+                return jsonify({'error': 'load_more_failed'}), 502
+            # 首屏即便彻底异常也返回 200 + 空结构，避免前端报错
+            return jsonify({'updated_at': None, 'count': 0, 'items': [], 'next_cursor': None, 'has_next': False})
 
     # ----- Claude Code 额度（墨水屏信息站）-----
     @app.get('/api/v1/claude-usage')

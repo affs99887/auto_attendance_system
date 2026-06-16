@@ -648,6 +648,10 @@ html, body {
   display: grid;
   grid-template-columns: repeat(7, 1fr);
   gap: 4px;
+  /* JetBrains Mono 默认"点零"(0 中央带点)在日历小字号(11px)下易被误读成 8，
+     全日历改用斜杠零区分。slashed-zero 映射 JetBrains Mono 的 zero 特性；
+     font-variant-numeric 可继承，一处覆盖内部日期(.cal-day-num)与时间(.cal-time)数字。 */
+  font-variant-numeric: slashed-zero;
 }
 .cal-head {
   font-size: 10px;

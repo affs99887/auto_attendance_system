@@ -9,8 +9,9 @@ AI 资讯服务模块（AI HOT）
 - 不内置任何假数据/快照——只用真实拉取或缓存或空。
 
 对外暴露：
-- get_ai_news(force=False) -> 契约 dict（带 TTL≈600 秒惰性刷新）
-- refresh() -> 供定时任务调用，强制拉取并写缓存
+- get_ai_news(force=False, cursor=None, take=None) -> 契约 dict（含 next_cursor/has_next）；
+  cursor 非空时为"加载更多"游标续拉（实时、不缓存）。
+- refresh() -> 供定时任务调用，强制拉取首屏并写缓存
 """
 
 import os
@@ -25,9 +26,10 @@ from modules.config import config
 
 logger = logging.getLogger(__name__)
 
-# AI HOT 公开精选接口（mode=selected 仅取主编精选，take 控制条数）
+# AI HOT 公开精选接口（mode=selected 仅取主编精选，take 控制每页条数，cursor 游标翻页）
 _API_URL = 'https://aihot.virxact.com/api/public/items'
-_TAKE = 50
+# 每页/首屏条数（上游 selected 精选共约 186 条，游标分页逐页加载）
+_PAGE_TAKE = 30
 
 # 伪装浏览器 UA：默认 requests UA 会被该站点 403，必须带浏览器 UA
 _USER_AGENT = (
@@ -49,15 +51,12 @@ _lock = threading.Lock()
 
 
 def _proxies():
-    """若内置网络加速启用，返回走本地端口的 proxies dict；否则 None（直连）。"""
-    try:
-        if config.get_proxy_enabled():
-            port = config.get_proxy_local_port()
-            url = f'http://127.0.0.1:{port}'
-            return {'http': url, 'https': url}
-    except Exception:
-        logger.warning('[AI资讯] 判断代理状态异常，转为直连', exc_info=True)
-    return None
+    """内置加速启用且本地端口在监听时走本地代理，否则直连。
+
+    端口不通（mihomo 未就绪/已崩/确定性失败）时返回 None 直连，不再硬打死端口报 ProxyError。
+    判定集中在 config.get_local_proxy()，与 汇率/Claude额度/Telegram 口径一致。
+    """
+    return config.get_local_proxy()
 
 
 def _cache_path():
@@ -112,15 +111,18 @@ def _normalize_item(raw):
     }
 
 
-def _fetch_from_aihot():
-    """调用 AI HOT 接口，返回 items 列表（已归一化）。
+def _fetch_from_aihot(cursor=None, take=None):
+    """调用 AI HOT 接口，返回 (items, next_cursor, has_next)。
 
-    任何网络/解析异常都捕获并向上返回 None，由调用方回退旧缓存。
+    - mode 固定 selected（主编精选）；take 控制每页条数；cursor 非空时翻下一页。
+    - 任何网络/解析异常都捕获并向上返回 (None, None, None)，由调用方回退旧缓存或上抛。
     """
     params = {
         'mode': 'selected',
-        'take': _TAKE,
+        'take': take or _PAGE_TAKE,
     }
+    if cursor:
+        params['cursor'] = cursor
     try:
         resp = requests.get(
             _API_URL,
@@ -136,7 +138,7 @@ def _fetch_from_aihot():
         data = resp.json()
     except Exception:
         logger.warning('[AI资讯] 拉取 AI HOT 数据失败', exc_info=True)
-        return None
+        return None, None, None
 
     try:
         raw_items = data.get('items') or []
@@ -145,10 +147,12 @@ def _fetch_from_aihot():
             if not isinstance(raw, dict):
                 continue
             items.append(_normalize_item(raw))
-        return items
+        next_cursor = data.get('nextCursor')
+        has_next = bool(data.get('hasNext'))
+        return items, next_cursor, has_next
     except Exception:
         logger.warning('[AI资讯] 解析 AI HOT 数据失败', exc_info=True)
-        return None
+        return None, None, None
 
 
 def _build_contract(cache):
@@ -158,19 +162,21 @@ def _build_contract(cache):
         'updated_at': cache.get('updated_at'),
         'count': len(items),
         'items': items,
+        'next_cursor': cache.get('next_cursor'),
+        'has_next': bool(cache.get('has_next')),
     }
 
 
 def refresh():
-    """强制拉取并写缓存，供定时任务调用。
+    """强制拉取首屏并写缓存，供定时任务调用。
 
-    返回最新契约 dict；拉取彻底失败时回退旧缓存的 items（count 同步）；
-    彻底无数据时 updated_at:null、count:0、items:[]。
+    返回最新契约 dict（含 next_cursor/has_next）；拉取彻底失败时回退旧缓存；
+    彻底无数据时 updated_at:null、count:0、items:[]、has_next:false。
     """
     # 网络请求挪到锁外执行：_fetch_from_aihot 只做网络拉取+解析，不触碰共享缓存，
     # 因此最长 ~20s 的慢网络不会持锁阻塞 get_ai_news 的 TTL 快速读路径，
     # 避免 waitress 工作线程被一并卡死（M66，与 exchange_rate_service 同款改造）。
-    items = _fetch_from_aihot()
+    items, next_cursor, has_next = _fetch_from_aihot()
 
     with _lock:
         cache = _load_cache()
@@ -180,23 +186,41 @@ def refresh():
             logger.warning('[AI资讯] 刷新失败，回退旧缓存')
             return _build_contract(cache)
 
-        # 写入/更新缓存结构
+        # 写入/更新缓存结构（含首屏游标，作为"加载更多"续拉起点）
         cache['updated_at'] = int(time.time())
         cache['items'] = items
         cache['fetched'] = int(time.time())
+        cache['next_cursor'] = next_cursor
+        cache['has_next'] = bool(has_next)
 
         _save_cache(cache)
-        logger.info('[AI资讯] 刷新成功 条数=%d', len(items))
+        logger.info('[AI资讯] 刷新成功 条数=%d has_next=%s', len(items), has_next)
         return _build_contract(cache)
 
 
-def get_ai_news(force=False):
-    """返回 AI 资讯契约 dict。
+def get_ai_news(force=False, cursor=None, take=None):
+    """返回 AI 资讯契约 dict（含 next_cursor/has_next）。
 
-    - force=True：跳过 TTL 立即拉取。
-    - force=False：若缓存在 TTL(≈600s) 内则直接复用，否则惰性刷新。
-    - 任何失败均回退旧缓存；彻底无数据时 updated_at:null、count:0、items:[]。
+    - cursor 非空（"加载更多"续拉）：实时拉取该页，不读写缓存；本次拉取失败时
+      抛 RuntimeError，由 HTTP 层转成错误响应（前端可重试，不伪装成到底）。
+    - cursor 为空（首屏）：
+        - force=True：跳过 TTL 立即拉取。
+        - force=False：缓存在 TTL(≈600s) 内则直接复用，否则惰性刷新。
+        - 任何失败均回退旧缓存；彻底无数据时 updated_at:null、count:0、items:[]。
     """
+    if cursor:
+        # 加载更多：游标续拉，实时返回，不进缓存（避免污染首屏缓存）
+        items, next_cursor, has_next = _fetch_from_aihot(cursor=cursor, take=take)
+        if items is None:
+            raise RuntimeError('ai-news load_more failed')
+        return {
+            'updated_at': int(time.time()),
+            'count': len(items),
+            'items': items,
+            'next_cursor': next_cursor,
+            'has_next': bool(has_next),
+        }
+
     if not force:
         # 惰性判断：在锁外读一次缓存，命中 TTL 直接返回，避免无谓网络请求
         with _lock:

@@ -57,6 +57,12 @@ const RED = '#ff0000';
 const SANS = "'IBM Plex Sans SC', 'IBM Plex Sans', 'Microsoft YaHei', sans-serif";
 const MONO = "'JetBrains Mono', 'IBM Plex Mono', Consolas, 'Microsoft YaHei', monospace";
 const SERIF = "'Noto Serif SC', 'Source Han Serif SC', SimSun, serif";
+// 日历日期数字专用字体。JetBrains Mono 的"点零"(0 内嵌圆点)经墨水屏抖动二值化后，圆点与外圈
+// 糊成上下两个半环，在小字号日期上极易被误读成 8。Canvas 无法可靠开启 OpenType 斜杠零
+// (font-feature-settings:"zero" / font-variant-numeric 在 ctx.font 里不生效)，故改用本身就是
+// 斜杠零的等宽字体：Consolas 为 Windows 系统自带(墨水屏在本机 Chromium Canvas 渲染，必可用)，
+// 斜杠零、等宽、与原 mono 风格接近，0/8 一眼可分；DejaVu Sans Mono 作非 Windows 兜底。
+const CAL_DAY_MONO = "Consolas, 'DejaVu Sans Mono', 'JetBrains Mono', monospace";
 
 const WEEKDAYS_CN = ['日', '一', '二', '三', '四', '五', '六'];
 const WEEKDAYS_EN = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
@@ -420,11 +426,11 @@ function drawWeekStrip(
       ctx.arc(cx, st.dayCenter, st.circleR, 0, Math.PI * 2);
       ctx.fill();
       ctx.fillStyle = PAPER;
-      ctx.font = `700 ${st.dayFont - 1}px ${MONO}`;
+      ctx.font = `700 ${st.dayFont - 1}px ${CAL_DAY_MONO}`;
       ctx.fillText(String(d.d), cx, st.dayCenter + (st.dayFont - 1) * 0.36);
     } else {
       ctx.fillStyle = d.off ? RED : INK;
-      ctx.font = `${d.off ? 700 : 600} ${st.dayFont}px ${MONO}`;
+      ctx.font = `${d.off ? 700 : 600} ${st.dayFont}px ${CAL_DAY_MONO}`;
       ctx.fillText(String(d.d), cx, st.dayCenter + st.dayFont * 0.36);
     }
   });

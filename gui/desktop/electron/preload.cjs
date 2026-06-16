@@ -97,4 +97,7 @@ contextBridge.exposeInMainWorld('AAS_EPD', {
   },
   // 配对确认结果回传
   pairingResponse: (confirmed) => ipcRenderer.send('epd:ble-pairing-response', !!confirmed),
+  // 方案2：请求主进程注入一次可信键盘输入(F24)产生 user activation，供渲染层在手势上下文里
+  // 调 requestDevice 自动重连(定时推送无手势)。resolve true=已注入 / false=不可用。
+  tryGestureReconnect: () => ipcRenderer.invoke('epd:gesture-reconnect'),
 });

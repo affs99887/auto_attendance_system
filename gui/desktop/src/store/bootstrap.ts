@@ -168,20 +168,21 @@ export function useBackendBootstrap() {
       void useExchangeRateStore.getState().refresh();
     }, FX_REFRESH_INTERVAL_MS);
 
-    // AI 资讯 15 分钟轮询（与上述轮询同期生命周期，cleanup 一并清理）
+    // AI 资讯 15 分钟轮询（与上述轮询同期生命周期，cleanup 一并清理）；
+    // 用户已"加载更多"时跳过，避免把列表缩回首屏 / 丢失滚动位置
     const aiNewsTimer = window.setInterval(() => {
-      void useAiNewsStore.getState().refresh();
+      useAiNewsStore.getState().refreshIfPristine();
     }, AI_NEWS_REFRESH_INTERVAL_MS);
 
     const onVisible = () => {
       if (document.visibilityState === 'visible') {
         void useExchangeRateStore.getState().refresh();
-        void useAiNewsStore.getState().refresh();
+        useAiNewsStore.getState().refreshIfPristine();
       }
     };
     const onFocus = () => {
       void useExchangeRateStore.getState().refresh();
-      void useAiNewsStore.getState().refresh();
+      useAiNewsStore.getState().refreshIfPristine();
     };
     document.addEventListener('visibilitychange', onVisible);
     window.addEventListener('focus', onFocus);
@@ -242,9 +243,10 @@ export function useBackendBootstrap() {
       }
     }));
 
-    // AI 资讯更新推送：触发重拉（force 默认 false，命中后端 TTL 直接拿新缓存，不重复打外网）
+    // AI 资讯更新推送：触发重拉（force 默认 false，命中后端 TTL 直接拿新缓存，不重复打外网）；
+    // 用户已"加载更多"时跳过，避免打断深度浏览
     unsubs.push(wsClient.subscribe('ai_news:update', () => {
-      void useAiNewsStore.getState().refresh();
+      useAiNewsStore.getState().refreshIfPristine();
     }));
 
     return () => {
