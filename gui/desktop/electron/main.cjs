@@ -442,6 +442,47 @@ ipcMain.on('settings:set', (_event, key, value) => {
   guiSettingsTimer = setTimeout(flushGuiSettings, 300);
 });
 
+// ============================================================================
+// 墨水屏日志持久化（logs/epaper.log）
+//  渲染进程每条墨水屏日志经 epd:log-append 追加；发送图片时 ⇑/⇓ hex 可达上千条，
+//  故主进程缓冲后防抖 250ms 合并写盘（而非每条同步写）。单文件超上限按「保留尾部一半」
+//  滚动截断，无需外部依赖。退出前 before-quit 强制 flush。
+// ============================================================================
+const EPAPER_LOG_PATH = path.join(DATA_DIR, 'logs', 'epaper.log');
+const EPAPER_LOG_MAX_BYTES = 1024 * 1024; // 1 MB；超出截掉前半，避免无限增长
+let epaperLogDirReady = false;
+let epaperLogQueue = [];     // 待写行缓冲
+let epaperLogTimer = null;   // 防抖落盘定时器
+
+function flushEpaperLog() {
+  if (epaperLogTimer) { clearTimeout(epaperLogTimer); epaperLogTimer = null; }
+  if (!epaperLogQueue.length) return;
+  const chunk = epaperLogQueue.join('\n') + '\n';
+  epaperLogQueue = [];
+  try {
+    if (!epaperLogDirReady) {
+      fs.mkdirSync(path.dirname(EPAPER_LOG_PATH), { recursive: true });
+      epaperLogDirReady = true;
+    }
+    fs.appendFileSync(EPAPER_LOG_PATH, chunk, 'utf-8');
+    // 超过上限：仅保留尾部约一半，并从首个换行后切起避免留下半行
+    const { size } = fs.statSync(EPAPER_LOG_PATH);
+    if (size > EPAPER_LOG_MAX_BYTES) {
+      const buf = fs.readFileSync(EPAPER_LOG_PATH);
+      const tail = buf.subarray(buf.length - Math.floor(EPAPER_LOG_MAX_BYTES / 2));
+      const nl = tail.indexOf(0x0a);
+      fs.writeFileSync(EPAPER_LOG_PATH, nl >= 0 ? tail.subarray(nl + 1) : tail);
+    }
+  } catch { /* 日志写盘失败不影响主流程 */ }
+}
+
+ipcMain.on('epd:log-append', (_event, line) => {
+  if (typeof line !== 'string' || !line) return;
+  epaperLogQueue.push(line);
+  if (epaperLogTimer) clearTimeout(epaperLogTimer);
+  epaperLogTimer = setTimeout(flushEpaperLog, 250);
+});
+
 function isVisibleOnSomeDisplay(bounds) {
   if (
     !bounds ||
@@ -925,5 +966,6 @@ app.on('before-quit', () => {
   appQuitting = true;
   clearPendingRestart(); // 退出前取消挂起的重启定时器，防止其到点后又把后端拉起
   flushGuiSettings();
+  flushEpaperLog();
   killPython();
 });

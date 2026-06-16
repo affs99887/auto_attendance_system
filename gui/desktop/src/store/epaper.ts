@@ -333,6 +333,14 @@ export const useEpaperStore = create<EpaperState>((set, get) => ({
     const next = [...get().logs, { id: ++logId, time, action, text }];
     if (next.length > MAX_LOG_LINES) next.splice(0, next.length - MAX_LOG_LINES);
     set({ logs: next });
+    // 持久化：内存仅留最近 MAX_LOG_LINES 行供 UI 展示，完整历史经 IPC 落到主进程 logs/epaper.log
+    // （带日期前缀以便跨天翻查；主进程防抖合并写盘，发送图片时的高频 hex 不会拖慢刷屏）
+    if (typeof window !== 'undefined') {
+      const date = now.getFullYear() + '-' +
+        String(now.getMonth() + 1).padStart(2, '0') + '-' +
+        String(now.getDate()).padStart(2, '0');
+      window.AAS_EPD?.appendLog?.(`${date} ${time}${action ? ' ' + action : ''} ${text}`);
+    }
   },
 
   clearLog() {
