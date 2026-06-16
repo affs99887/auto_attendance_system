@@ -68,6 +68,12 @@ export interface EpdBleEvents {
 
 export const OLD_DASHBOARD_URL = 'https://tsl0922.github.io/EPD-nRF5/v1.5';
 
+// 连接失败重试：GATT 连接（含 service/characteristic 获取）失败时，最多尝试 3 次（首次 + 2 次重试），
+// 每次间隔 800ms。仅覆盖「设备已选定后的 GATT 建立」阶段——此时 bleDevice 已在内存，重连无需用户手势；
+// requestDevice（选设备）失败多为用户取消或需手势，不在此自动重试。
+const CONNECT_MAX_ATTEMPTS = 3;
+const CONNECT_RETRY_DELAY_MS = 800;
+
 export class EpdBleClient {
   private events: EpdBleEvents;
   private bleDevice: BTDevice | null = null;
@@ -75,6 +81,9 @@ export class EpdBleClient {
   private epdCharacteristic: BTCharacteristic | null = null;
   private msgIndex = 0;
   private textDecoder: TextDecoder | null = null;
+  // 连接尝试令牌：每次发起连接自增，并被进行中的重试循环持有；断开/被新连接流程取代时令牌变化，
+  // 旧的重试循环在下一轮检查时主动退出，避免「已断开或已被取代却仍在后台重试连上」。
+  private connectToken = 0;
   private readonly onDisconnected = () => this.handleDisconnected();
 
   appVersion = 0x15;
@@ -111,6 +120,7 @@ export class EpdBleClient {
   }
 
   private handleDisconnected() {
+    this.connectToken++;        // 令进行中的连接重试循环失效（设备已断开，不应再尝试）
     this.resetVariables();
     this.log('已断开连接.');
     this.emitConnectionChange();
@@ -265,29 +275,61 @@ export class EpdBleClient {
 
   // 主动断开（不再触发设备选择器）
   disconnect(): void {
+    // 终止进行中的连接重试：失败重试期间 GATT 尚未连上，下面的 gatt.disconnect() 不会触发
+    // gattserverdisconnected 来兜底中断，故这里显式让重试循环失效。
+    this.connectToken++;
     if (this.bleDevice != null && this.bleDevice.gatt.connected) {
       this.bleDevice.gatt.disconnect();
     }
   }
 
+  // GATT 连接（含 service/characteristic 获取），失败按 CONNECT_RETRY_DELAY_MS 间隔重试至多
+  // CONNECT_MAX_ATTEMPTS 次。成功返回 { service, characteristic }；返回 null 表示重试用尽，或本次
+  // 尝试已被新的连接/断开流程取代（token 失效）——后者交由接管方处理状态，调用方不应再 emit。
+  private async connectGatt(token: number): Promise<{ service: BTService; characteristic: BTCharacteristic } | null> {
+    for (let attempt = 1; attempt <= CONNECT_MAX_ATTEMPTS; attempt++) {
+      // 设备丢失，或本次尝试已被新连接/断开取代 → 放弃，交由接管方处理
+      if (this.bleDevice == null || token !== this.connectToken) return null;
+      try {
+        this.log(attempt === 1
+          ? '正在连接: ' + this.bleDevice.name
+          : `正在连接: ${this.bleDevice.name}（重试 ${attempt}/${CONNECT_MAX_ATTEMPTS}）`);
+        this.gattServer = await this.bleDevice.gatt.connect();
+        this.log('  找到 GATT Server');
+        const service = await this.gattServer.getPrimaryService(EPD_SERVICE_UUID);
+        this.log('  找到 EPD Service');
+        const characteristic = await service.getCharacteristic(EPD_CHARACTERISTIC_UUID);
+        this.epdCharacteristic = characteristic;
+        this.log('  找到 Characteristic');
+        return { service, characteristic };
+      } catch (e) {
+        console.error(e);
+        if ((e as Error).message) this.log('connect: ' + (e as Error).message);
+        // 清理本次半连接状态（下一轮 gatt.connect 幂等重建）；不主动 disconnect，以免触发
+        // gattserverdisconnected 误把「重试中」当成「已断开」复位状态机。
+        this.gattServer = null;
+        this.epdCharacteristic = null;
+        if (attempt < CONNECT_MAX_ATTEMPTS && token === this.connectToken) {
+          this.log(`连接失败，${(CONNECT_RETRY_DELAY_MS / 1000).toFixed(1)}s 后重试…`);
+          await new Promise(resolve => setTimeout(resolve, CONNECT_RETRY_DELAY_MS));
+        }
+      }
+    }
+    if (token === this.connectToken) this.log(`连接失败：已重试 ${CONNECT_MAX_ATTEMPTS} 次仍未成功`);
+    return null;
+  }
+
   private async connect(): Promise<void> {
     if (this.bleDevice == null || this.epdCharacteristic != null) return;
+    const token = ++this.connectToken;
 
-    let epdService: BTService;
-    try {
-      this.log('正在连接: ' + this.bleDevice.name);
-      this.gattServer = await this.bleDevice.gatt.connect();
-      this.log('  找到 GATT Server');
-      epdService = await this.gattServer.getPrimaryService(EPD_SERVICE_UUID);
-      this.log('  找到 EPD Service');
-      this.epdCharacteristic = await epdService.getCharacteristic(EPD_CHARACTERISTIC_UUID);
-      this.log('  找到 Characteristic');
-    } catch (e) {
-      console.error(e);
-      if ((e as Error).message) this.log('connect: ' + (e as Error).message);
-      this.handleDisconnected();
+    const gatt = await this.connectGatt(token);
+    if (gatt == null) {
+      // token 仍是本次 → 确属失败（非被取代）：复位并通知断开；被新流程取代则交给接管方，不再 emit
+      if (token === this.connectToken) this.handleDisconnected();
       return;
     }
+    const { service: epdService, characteristic: epdCharacteristic } = gatt;
 
     try {
       const versionCharacteristic = await epdService.getCharacteristic(EPD_VERSION_CHARACTERISTIC_UUID);
@@ -307,8 +349,8 @@ export class EpdBleClient {
     }
 
     try {
-      await this.epdCharacteristic.startNotifications();
-      this.epdCharacteristic.addEventListener('characteristicvaluechanged', (event) => {
+      await epdCharacteristic.startNotifications();
+      epdCharacteristic.addEventListener('characteristicvaluechanged', (event) => {
         const target = event.target as unknown as { value: DataView };
         this.handleNotify(target.value, this.msgIndex++);
       });

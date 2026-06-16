@@ -328,16 +328,23 @@ async def initialize_system(fast_boot=False):
                 await _tick(0.5)
             elif current_step == 5:  # 初始化Telegram机器人
                 await _tick(0.3)  # 显示进度
-                # bot 初始化失败不应再让整个程序启动崩溃（否则 web_server 没机会启动、GUI 进不去）。
-                # 仅在本分支内吞掉异常并降级：记录原因到 attendance_system，后续可经 GUI 重连端点恢复。
-                try:
-                    await attendance_system.bot._ensure_app_initialized()
-                    if not attendance_system.bot.app:
-                        raise Exception("Telegram Bot 初始化失败")
-                except Exception as e:
-                    logging.warning(f"Telegram Bot 初始化失败，转为降级运行（GUI 仍可启动）: {e!r}")
-                    attendance_system.bot_available = False
-                    attendance_system.bot_error = str(e)[:500]
+                # GUI 模式（fast_boot）：bot 初始化必须走代理，而 _ensure_app_initialized 内部对代理
+                # 启动窗口期最多做 4 次退避重试（可阻塞数十秒）。若在此同步等待，会把随后启动的 GUI
+                # HTTP server（token 下发）一起拖住，表现为「GUI 卡在正在启动后端」。故 GUI 模式将 bot
+                # 的初始化推迟到 GUI 后端就绪之后，由 _start_bot_deferred 后台并发执行（step9/step10 因
+                # bot.app 仍为 None 会被其 `if app is not None` 守卫自动跳过）。控制台/watchdog 模式
+                # （fast_boot=False）保持原同步初始化 + 失败降级语义不变。
+                if not fast_boot:
+                    # bot 初始化失败不应再让整个程序启动崩溃（否则 web_server 没机会启动、GUI 进不去）。
+                    # 仅在本分支内吞掉异常并降级：记录原因到 attendance_system，后续可经 GUI 重连端点恢复。
+                    try:
+                        await attendance_system.bot._ensure_app_initialized()
+                        if not attendance_system.bot.app:
+                            raise Exception("Telegram Bot 初始化失败")
+                    except Exception as e:
+                        logging.warning(f"Telegram Bot 初始化失败，转为降级运行（GUI 仍可启动）: {e!r}")
+                        attendance_system.bot_available = False
+                        attendance_system.bot_error = str(e)[:500]
                 await _tick(0.4)
             elif current_step == 6:  # 连接Telegram API服务
                 await _tick(0.7)
@@ -420,6 +427,50 @@ async def _bot_recovery_loop(attendance_system):
             logging.warning(f"bot 后台恢复第 {attempt} 次重连失败，{backoff_seq[min(attempt, len(backoff_seq) - 1)]} 秒后重试: {msg}")
 
 
+async def _start_bot_deferred(attendance_system):
+    """GUI 模式：GUI 后端就绪后，后台并发完成 Telegram Bot 的初始化 / 启动 / 轮询 / 监控。
+
+    背景：bot 初始化必须走代理，而代理（mihomo）启动初期常有「端口在听但隧道未通」的窗口期，
+    _ensure_app_initialized 内部最多 4 次退避重试会阻塞数十秒。若放在启动主链路同步等待，会把
+    GUI HTTP server 的启动（token 下发）一起拖住，表现为「GUI 卡在正在启动后端」。这里把 bot 的
+    初始化（原 initialize_system step5）与启动 / 轮询 / 连接监控（原 step9 / step10），连同 main()
+    里的 8:15 提醒验证，整体搬到 GUI 后端 await 启动之后由本协程后台执行——GUI 秒级就绪，bot 在后台
+    按原有重试 / 降级 / 恢复语义连接，互不阻塞。仅 GUI 模式调用；控制台 / watchdog 模式仍走原同步链路。
+    """
+    try:
+        await attendance_system.bot._ensure_app_initialized()
+        if not attendance_system.bot.app:
+            raise Exception("Telegram Bot 初始化失败")
+    except Exception as e:
+        # 与原 step5 一致的降级处理：标记降级并交给 _bot_recovery_loop 后台退避重连
+        # （其成功后会自行补启动连接监控）。
+        logging.warning(f"Telegram Bot 初始化失败，转为降级运行（GUI 仍可用）: {e!r}")
+        attendance_system.bot_available = False
+        attendance_system.bot_error = str(e)[:500]
+        await _bot_recovery_loop(attendance_system)
+        return
+
+    # 初始化成功：对应原 step9 / step10（启动应用 + 轮询）
+    try:
+        await attendance_system.bot.app.start()
+        await attendance_system.bot.start_polling()
+    except Exception:
+        logging.exception("Telegram Bot 启动 / 轮询失败")
+        return
+
+    # 对应原 main() 中的 8:15 提醒任务验证（bot 就绪后才有意义）
+    try:
+        if attendance_system.bot.verify_daily_reminder_setup():
+            logging.info("✅ 8:15提醒任务验证成功")
+        else:
+            logging.warning("⚠️ 8:15提醒任务验证失败，可能需要手动检查")
+    except Exception:
+        logging.exception("验证 8:15 提醒任务失败")
+
+    # 保持连接监控长期运行（对应原 monitor_task）；本协程作为后台任务被持有，监控随之常驻
+    await attendance_system.bot.monitor_connection()
+
+
 def _parse_args():
     """解析主程序命令行参数。
 
@@ -442,6 +493,7 @@ async def main(args=None):
         args = argparse.Namespace(gui=False, gui_http_port=8765, gui_ws_port=8766)
 
     gui_handle = None  # web_server.start 返回值，用于关停
+    bot_deferred_task = None  # GUI 模式：web_server 就绪后后台初始化 bot 的任务句柄（持有防 GC + 退出时取消）
 
     try:
         if args.gui:
@@ -476,6 +528,10 @@ async def main(args=None):
                 )
             except Exception as e:
                 logging.error(f"GUI 后端启动失败，bot 主流程不受影响: {e}", exc_info=True)
+            # GUI 后端已（尝试）就绪：现在才后台并发初始化 Telegram Bot，避免 bot 初始化的代理重试
+            # 拖住 GUI token 下发。bot 的初始化 / 启动 / 轮询 / 监控 / 降级恢复全部由 _start_bot_deferred
+            # 接管，故下面的 bot 降级恢复块与 8:15 验证块在 GUI 模式跳过（改由该协程内处理）。
+            bot_deferred_task = asyncio.create_task(_start_bot_deferred(attendance_system))
 
         # [M41] 启动 mihomo 健康巡检后台任务：进程死亡时限频自动重启，
         # 否则 config.get_telegram_proxy() 始终返回死端口、Telegram 全链路永久不可用。
@@ -491,25 +547,29 @@ async def main(args=None):
         # 控制台/watchdog 模式没有 GUI 重连端点，否则进程会"活着但 Telegram 全失效"，
         # 而 watchdog 只看进程存在性永不修复。_bot_recovery_loop 指数退避调用
         # bot.reconnect()（内部已串接 start_polling），成功后回写 bot_available 并补启动连接监控。
+        # GUI 模式的 bot 降级恢复由 _start_bot_deferred 内部接管，这里只管控制台 / watchdog 模式。
         bot_recovery_task = None
-        if not getattr(attendance_system, 'bot_available', True):
+        if not args.gui and not getattr(attendance_system, 'bot_available', True):
             try:
                 bot_recovery_task = asyncio.create_task(_bot_recovery_loop(attendance_system))
                 logging.warning("Telegram Bot 处于降级状态，已启动后台自动恢复任务（指数退避重连）")
             except Exception:
                 logging.exception("启动 Telegram Bot 后台恢复任务失败")
 
-        # 等待5秒后验证8:15提醒任务设置（bot 降级时跳过，避免对未初始化的 app 操作）
-        await asyncio.sleep(5)
-        if getattr(attendance_system, 'bot_available', True):
-            logging.info("验证8:15提醒任务设置...")
-            reminder_status = attendance_system.bot.verify_daily_reminder_setup()
-            if reminder_status:
-                logging.info("✅ 8:15提醒任务验证成功")
+        # 等待5秒后验证8:15提醒任务设置（bot 降级时跳过，避免对未初始化的 app 操作）。
+        # GUI 模式：bot 在后台初始化（见 _start_bot_deferred），验证已移入该协程在 bot 就绪后执行，
+        # 此处跳过，避免对尚未初始化的 app 误操作、并让 GUI 主流程立即进入运行态。
+        if not args.gui:
+            await asyncio.sleep(5)
+            if getattr(attendance_system, 'bot_available', True):
+                logging.info("验证8:15提醒任务设置...")
+                reminder_status = attendance_system.bot.verify_daily_reminder_setup()
+                if reminder_status:
+                    logging.info("✅ 8:15提醒任务验证成功")
+                else:
+                    logging.warning("⚠️ 8:15提醒任务验证失败，可能需要手动检查")
             else:
-                logging.warning("⚠️ 8:15提醒任务验证失败，可能需要手动检查")
-        else:
-            logging.info("Telegram Bot 处于降级状态，跳过 8:15 提醒任务验证")
+                logging.info("Telegram Bot 处于降级状态，跳过 8:15 提醒任务验证")
 
         logging.info("所有服务已启动，系统运行中...")
 
@@ -526,6 +586,9 @@ async def main(args=None):
             # [M68] 关停时取消 bot 后台恢复任务，避免它在退出过程中又拉起轮询
             if bot_recovery_task is not None:
                 bot_recovery_task.cancel()
+            # GUI 模式：取消后台 bot 初始化 / 监控任务，避免它在退出过程中又拉起轮询
+            if bot_deferred_task is not None:
+                bot_deferred_task.cancel()
             if gui_handle is not None:
                 try:
                     gui_handle['stop']()
