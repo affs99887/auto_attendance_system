@@ -12,7 +12,7 @@
 
 appId: com.aas.desktop
 productName: AutoAttendance
-copyright: Copyright © 2026 自动打卡系统
+copyright: Copyright © 2026 AAS
 
 directories:
   output: ../../release
@@ -77,7 +77,7 @@ nsis:
   perMachine: false
   createDesktopShortcut: always
   createStartMenuShortcut: true
-  shortcutName: 自动打卡系统
+  shortcutName: AAS
   installerLanguages:
     - zh_CN
   language: '2052'

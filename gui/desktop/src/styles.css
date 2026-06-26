@@ -1560,6 +1560,8 @@ input[type='date']::-webkit-calendar-picker-indicator { cursor: pointer; opacity
 }
 .ep-memo-archived { opacity: 0.8; background: var(--bg-inset); }
 .ep-memo-archived .ep-hint-inline { flex-shrink: 0; }
+/* 归档箱：独立于备忘录列表的收纳区；标题左对齐以区别于其它居中折叠区 */
+.ep-archive-box .ep-hidden-toggle { justify-content: flex-start; gap: 6px; }
 
 /* 假期说明 */
 .ep-help { font-size: 12.5px; line-height: 1.7; color: var(--text-primary); gap: 16px; }

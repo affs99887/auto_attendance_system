@@ -13,7 +13,7 @@ function AboutScreen() {
             <div className="row gap-4" style={{ alignItems: "flex-start" }}>
               <div className="app-mark" style={{ width: 44, height: 44, borderRadius: 10, fontSize: 22 }}>A</div>
               <div>
-                <div className="h1">自动打卡系统</div>
+                <div className="h1">AAS</div>
                 <div className="muted" style={{ fontSize: 13, marginTop: 4 }}>Auto Attendance System · v2.0</div>
                 <div className="row gap-2" style={{ marginTop: 12 }}>
                   <span className="pill pill-info"><span className="dot" />Python 3.12</span>

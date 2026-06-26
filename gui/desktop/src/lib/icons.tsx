@@ -204,6 +204,13 @@ export const Icon = {
     </>,
   ),
   TextTool: makeIcon(<path d="M3.5 4V3h9v1M8 3v10M6.5 13h3" />),
+  Archive: makeIcon(
+    <>
+      <rect x="1.5" y="2.5" width="13" height="3.5" rx="1" />
+      <path d="M2.5 6v6.5a1 1 0 0 0 1 1h9a1 1 0 0 0 1-1V6" />
+      <path d="M6.5 9h3" />
+    </>,
+  ),
   Undo: makeIcon(
     <>
       <path d="M5 6H9.8a3.2 3.2 0 1 1 0 6.4H6" />

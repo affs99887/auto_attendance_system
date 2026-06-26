@@ -104,7 +104,7 @@ function TitleBar() {
     <div className="titlebar">
       <div className="titlebar-app">
         <div className="app-mark">A</div>
-        <span>自动打卡系统</span>
+        <span>AAS</span>
         <span style={{color:"var(--text-muted)", fontWeight:400, marginLeft:4}}>v2.0</span>
       </div>
       <div className="titlebar-title">Auto Attendance · 邓蕴哲@localhost</div>

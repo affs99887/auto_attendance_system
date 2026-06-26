@@ -514,7 +514,7 @@ async function createWindow() {
     height: 920,
     minWidth: 1100,
     minHeight: 700,
-    title: '自动打卡系统',
+    title: 'AAS',
     backgroundColor: '#2a2926',
     // 自绘标题栏（设计稿本身是 Win 11 风格的 chrome）
     frame: false,
@@ -657,7 +657,7 @@ function createTray() {
     image = nativeImage.createEmpty();
   }
   tray = new Tray(image);
-  tray.setToolTip('自动打卡系统');
+  tray.setToolTip('AAS');
   const menu = Menu.buildFromTemplate([
     { label: '显示主窗口', click: () => { if (mainWindow) { mainWindow.show(); mainWindow.focus(); } } },
     { type: 'separator' },

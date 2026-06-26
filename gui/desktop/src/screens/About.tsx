@@ -49,7 +49,7 @@ export function AboutScreen() {
                 A
               </div>
               <div>
-                <div className="h1">自动打卡系统</div>
+                <div className="h1">AAS</div>
                 <div className="muted" style={{ fontSize: 13, marginTop: 4 }}>
                   Auto Attendance System · v2.0
                 </div>

@@ -4,7 +4,7 @@
   "version": "0.1.0",
   "type": "module",
   "main": "electron/main.cjs",
-  "description": "自动打卡系统 GUI（Electron + React + TS）",
+  "description": "AAS GUI（Electron + React + TS）",
   "scripts": {
     "dev": "vite",
     "build": "tsc -b && vite build",
@@ -12,9 +12,9 @@
     "electron": "electron .",
     "electron:dev": "cross-env AAS_DEV=1 electron .",
     "start": "npm run build && electron .",
-    "predist:exe": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/kill-orphan-mihomo.ps1",
+    "predist:exe": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/kill-running-client.ps1",
     "dist:exe": "npm run build && electron-builder --win --x64",
-    "predist:dir": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/kill-orphan-mihomo.ps1",
+    "predist:dir": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/kill-running-client.ps1",
     "dist:dir": "npm run build && electron-builder --dir"
   },
   "dependencies": {

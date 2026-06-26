@@ -239,6 +239,7 @@ interface EpaperState {
   toggleMemo: (id: number) => void;
   updateMemo: (id: number, text: string) => void;
   removeMemo: (id: number) => void;
+  archiveMemo: (id: number) => void;        // 手动归档：把主列表项移入归档箱
   restoreMemo: (id: number) => void;        // 归档项恢复为未完成，回到主列表
   removeArchivedMemo: (id: number) => void; // 彻底删除单条归档
   clearMemoArchive: () => void;             // 清空归档
@@ -390,6 +391,17 @@ export const useEpaperStore = create<EpaperState>((set, get) => ({
     const memos = get().memos.filter(m => m.id !== id);
     set({ memos });
     saveMemos(memos, memoNextId, get().memoArchive);
+  },
+
+  archiveMemo(id) {
+    // 手动归档：把主列表里的某条事项立即移入归档箱（与「完成超 3 天自动归档」殊途同归）。
+    // 未完成项也允许手动归档；归档箱保留其 done 状态用于展示，恢复时统一回到未完成。
+    const item = get().memos.find(m => m.id === id);
+    if (!item) return;
+    const memos = get().memos.filter(m => m.id !== id);
+    const memoArchive = [...get().memoArchive, { ...item, archivedAt: Date.now() }];
+    set({ memos, memoArchive });
+    saveMemos(memos, memoNextId, memoArchive);
   },
 
   restoreMemo(id) {
@@ -625,7 +637,9 @@ if (typeof window !== 'undefined' && window.AAS_EPD) {
         ? devices.find(d => d.deviceId === ld.id)
           ?? (ld.name ? devices.find(d => d.deviceName === ld.name) : undefined)
         : undefined;
-      if (hit) {
+      if (hit && pendingSelectId == null) {
+        // 发现目标即「立即回选连接」：该设备无开关键、持续广播，扫到就连最稳；
+        // 再等只会让连接窗口/适配器状态白白错过（原 20s「搜索宽限」已废弃）。
         clearQuickTimer();
         pendingSelectId = hit.deviceId;
         st.addLog(`已发现「${hit.deviceName || hit.deviceId}」，正在连接…`);

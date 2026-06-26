@@ -964,49 +964,16 @@ export function EpaperScreen() {
                           <Icon.Pencil size={13} />
                         </button>
                       )}
+                      {memoEditId !== m.id && (
+                        <button className="ep-memo-edit-btn" title="归档到归档箱" onClick={() => store().archiveMemo(m.id)}>
+                          <Icon.Archive size={13} />
+                        </button>
+                      )}
                       <button className="ep-memo-del" title="删除" onClick={() => store().removeMemo(m.id)}>
                         <Icon.Trash size={13} />
                       </button>
                     </div>
                   ))}
-
-                  {/* 已归档（划掉超 3 天自动移入）：可恢复 / 删除 / 清空 */}
-                  {memoArchive.length > 0 && (
-                    <>
-                      <button className="ep-hidden-toggle" onClick={() => setMemoArchiveOpen(v => !v)}>
-                        <Icon.ChevronDown size={13} className={`ep-hidden-chev ${memoArchiveOpen ? 'open' : ''}`} />
-                        {memoArchiveOpen
-                          ? `收起归档（${memoArchive.length}）`
-                          : `已归档 ${memoArchive.length} 条 · 划掉超 3 天自动归档`}
-                      </button>
-                      {memoArchiveOpen && memoArchive.map(m => (
-                        <div key={m.id} className="ep-memo-item done ep-memo-archived">
-                          <span className="ep-memo-text">{m.text}</span>
-                          <span className="ep-hint-inline mono">
-                            {(d => `${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')} 归档`)(new Date(m.archivedAt))}
-                          </span>
-                          <button className="ep-memo-edit-btn" title="恢复为未完成" onClick={() => store().restoreMemo(m.id)}>
-                            <Icon.Undo size={13} />
-                          </button>
-                          <button className="ep-memo-del" title="彻底删除" onClick={() => store().removeArchivedMemo(m.id)}>
-                            <Icon.Trash size={13} />
-                          </button>
-                        </div>
-                      ))}
-                      {memoArchiveOpen && (
-                        <button
-                          className="ep-hidden-toggle"
-                          onClick={() => void (async () => {
-                            if (await appConfirm(`清空全部 ${memoArchive.length} 条归档？`, { title: '清空归档', danger: true, confirmText: '清空' })) {
-                              store().clearMemoArchive();
-                            }
-                          })()}
-                        >
-                          <Icon.Trash size={12} /> 清空归档
-                        </button>
-                      )}
-                    </>
-                  )}
                 </div>
                 <div className="ep-row">
                   <input
@@ -1020,6 +987,45 @@ export function EpaperScreen() {
                   />
                   <button className="btn" onClick={addMemoFromInput}><Icon.Plus size={14} /> 添加</button>
                 </div>
+
+                {/* 归档箱：独立于备忘录的收纳区（手动归档或完成超 3 天自动移入），可恢复 / 删除 / 清空 */}
+                {memoArchive.length > 0 && (
+                  <div className="ep-archive-box">
+                    <button className="ep-hidden-toggle" onClick={() => setMemoArchiveOpen(v => !v)}>
+                      <Icon.ChevronDown size={13} className={`ep-hidden-chev ${memoArchiveOpen ? 'open' : ''}`} />
+                      <Icon.Archive size={13} />
+                      {memoArchiveOpen ? `收起归档箱（${memoArchive.length}）` : `归档箱 · ${memoArchive.length} 条`}
+                    </button>
+                    {memoArchiveOpen && (
+                      <div className="ep-memo-list">
+                        {memoArchive.map(m => (
+                          <div key={m.id} className={`ep-memo-item ${m.done ? 'done' : ''} ep-memo-archived`}>
+                            <span className="ep-memo-text">{m.text}</span>
+                            <span className="ep-hint-inline mono">
+                              {(d => `${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')} 归档`)(new Date(m.archivedAt))}
+                            </span>
+                            <button className="ep-memo-edit-btn" title="恢复到备忘录" onClick={() => store().restoreMemo(m.id)}>
+                              <Icon.Undo size={13} />
+                            </button>
+                            <button className="ep-memo-del" title="彻底删除" onClick={() => store().removeArchivedMemo(m.id)}>
+                              <Icon.Trash size={13} />
+                            </button>
+                          </div>
+                        ))}
+                        <button
+                          className="ep-hidden-toggle"
+                          onClick={() => void (async () => {
+                            if (await appConfirm(`清空全部 ${memoArchive.length} 条归档？`, { title: '清空归档箱', danger: true, confirmText: '清空' })) {
+                              store().clearMemoArchive();
+                            }
+                          })()}
+                        >
+                          <Icon.Trash size={12} /> 清空归档箱
+                        </button>
+                      </div>
+                    )}
+                  </div>
+                )}
 
                 <div className="ep-divider" />
 
@@ -1341,7 +1347,7 @@ export function EpaperScreen() {
         <span>
           基于开源固件 <a href="https://github.com/tsl0922/EPD-nRF5" target="_blank" rel="noreferrer">EPD-nRF5</a> · © 2025 tsl0922
         </span>
-        <span>墨水屏日历 · 自动打卡系统</span>
+        <span>墨水屏日历 · AAS</span>
       </div>
 
       {/* ===== 蓝牙选择 modal ===== */}

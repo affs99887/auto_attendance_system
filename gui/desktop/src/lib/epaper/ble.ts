@@ -68,11 +68,34 @@ export interface EpdBleEvents {
 
 export const OLD_DASHBOARD_URL = 'https://tsl0922.github.io/EPD-nRF5/v1.5';
 
-// 连接失败重试：GATT 连接（含 service/characteristic 获取）失败时，最多尝试 3 次（首次 + 2 次重试），
-// 每次间隔 800ms。仅覆盖「设备已选定后的 GATT 建立」阶段——此时 bleDevice 已在内存，重连无需用户手势；
+// 连接失败重试：GATT 连接（含 service/characteristic 获取）失败时，最多尝试 4 次（首次 + 3 次重试）。
+// 退避采用「递增间隔」：第 n 次重试前等待 CONNECT_RETRY_DELAY_MS × n（即 1s / 2s / 3s）。原来固定 0.8s
+// 太短——这 0.8s 其实是失败后的等待，不是连接耗时；gatt.connect() 多在系统蓝牙栈尚未回收上一次失败连接、
+// 或瞌睡型墨水屏尚未重新广播时瞬时被拒，递增退避给「系统回收 + 设备重新广播」留出更长窗口。
+// 仅覆盖「设备已选定后的 GATT 建立」阶段——此时 bleDevice 已在内存，重连无需用户手势；
 // requestDevice（选设备）失败多为用户取消或需手势，不在此自动重试。
-const CONNECT_MAX_ATTEMPTS = 3;
-const CONNECT_RETRY_DELAY_MS = 800;
+const CONNECT_MAX_ATTEMPTS = 4;
+const CONNECT_RETRY_DELAY_MS = 1000; // 递增退避基值：第 n 次重试前等待 base × n
+// 设备选定（requestDevice 解析 / 重连复用旧句柄）后，到发起 gatt.connect() 之间的等待。
+// 选中后应当「立即发起连接」，这里只留一个极短缓冲（让回选所在的事件循环跑完），不再人为拖延。
+const CONNECT_SETTLE_DELAY_MS = 300;
+
+// 单次连接的「时间上限」：从发起 gatt.connect() 起算，超过本时长仍未拿到 GATT Server 即判本次失败、
+// 转入重试，避免连接卡死时界面永远停在「正在连接」既不成功也不报错。注意：观测到的「Connection attempt
+// failed」是浏览器瞬时自拒（几毫秒），并非耗时超时——本上限只为兜底「连接挂起永不返回」这种卡死场景。
+const CONNECT_ATTEMPT_TIMEOUT_MS = 20000;
+
+// 给一个 Promise 套超时：到点仍未结算就以 message 抛错；原 Promise 正常结算时清掉定时器透传结果/错误。
+// 注意 JS 无法真正「取消」底层操作，这里只是不再等待它——故仅用于「挂起/卡死」兜底，配合上层重试使用。
+function withTimeout<T>(promise: Promise<T>, ms: number, message: string): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error(message)), ms);
+    promise.then(
+      value => { clearTimeout(timer); resolve(value); },
+      err => { clearTimeout(timer); reject(err); },
+    );
+  });
+}
 
 export class EpdBleClient {
   private events: EpdBleEvents;
@@ -262,7 +285,7 @@ export class EpdBleClient {
     }
 
     this.bleDevice.addEventListener('gattserverdisconnected', this.onDisconnected);
-    setTimeout(() => { void this.connect(); }, 300);
+    setTimeout(() => { void this.connect(); }, CONNECT_SETTLE_DELAY_MS);
   }
 
   async reConnect(): Promise<void> {
@@ -270,7 +293,7 @@ export class EpdBleClient {
       this.bleDevice.gatt.disconnect();
     this.resetVariables();
     this.log('正在重连');
-    setTimeout(() => { void this.connect(); }, 300);
+    setTimeout(() => { void this.connect(); }, CONNECT_SETTLE_DELAY_MS);
   }
 
   // 主动断开（不再触发设备选择器）
@@ -283,7 +306,7 @@ export class EpdBleClient {
     }
   }
 
-  // GATT 连接（含 service/characteristic 获取），失败按 CONNECT_RETRY_DELAY_MS 间隔重试至多
+  // GATT 连接（含 service/characteristic 获取），失败按递增退避（CONNECT_RETRY_DELAY_MS × n）重试至多
   // CONNECT_MAX_ATTEMPTS 次。成功返回 { service, characteristic }；返回 null 表示重试用尽，或本次
   // 尝试已被新的连接/断开流程取代（token 失效）——后者交由接管方处理状态，调用方不应再 emit。
   private async connectGatt(token: number): Promise<{ service: BTService; characteristic: BTCharacteristic } | null> {
@@ -294,7 +317,13 @@ export class EpdBleClient {
         this.log(attempt === 1
           ? '正在连接: ' + this.bleDevice.name
           : `正在连接: ${this.bleDevice.name}（重试 ${attempt}/${CONNECT_MAX_ATTEMPTS}）`);
-        this.gattServer = await this.bleDevice.gatt.connect();
+        // 给 gatt.connect() 套时间上限：正常几毫秒~几秒内返回；若蓝牙栈把这次连接「挂起」永不返回，
+        // 到点抛超时错误，落入下面的 catch 走重试，而不是让 UI 永远卡在「正在连接」。
+        this.gattServer = await withTimeout(
+          this.bleDevice.gatt.connect(),
+          CONNECT_ATTEMPT_TIMEOUT_MS,
+          `连接超时（${(CONNECT_ATTEMPT_TIMEOUT_MS / 1000).toFixed(0)}s 内未建立 GATT 连接）`,
+        );
         this.log('  找到 GATT Server');
         const service = await this.gattServer.getPrimaryService(EPD_SERVICE_UUID);
         this.log('  找到 EPD Service');
@@ -305,17 +334,26 @@ export class EpdBleClient {
       } catch (e) {
         console.error(e);
         if ((e as Error).message) this.log('connect: ' + (e as Error).message);
-        // 清理本次半连接状态（下一轮 gatt.connect 幂等重建）；不主动 disconnect，以免触发
-        // gattserverdisconnected 误把「重试中」当成「已断开」复位状态机。
+        // 清理本次半连接状态（下一轮 gatt.connect 幂等重建）。这里不主动 disconnect：本次 gatt.connect()
+        // 直接 reject 时 gatt.connected 仍为 false，按 Web Bluetooth 规范 disconnect() 会直接返回（no-op），
+        // 既无法关闭底层那条失败连接，反而会在「半连上」时误触发 gattserverdisconnected 复位状态机。
         this.gattServer = null;
         this.epdCharacteristic = null;
         if (attempt < CONNECT_MAX_ATTEMPTS && token === this.connectToken) {
-          this.log(`连接失败，${(CONNECT_RETRY_DELAY_MS / 1000).toFixed(1)}s 后重试…`);
-          await new Promise(resolve => setTimeout(resolve, CONNECT_RETRY_DELAY_MS));
+          // 递增退避：第 n 次重试前等待 base × n（1s / 2s / 3s），给系统回收 + 设备重新广播留更长窗口
+          const delay = CONNECT_RETRY_DELAY_MS * attempt;
+          this.log(`连接失败，${(delay / 1000).toFixed(1)}s 后重试…`);
+          await new Promise(resolve => setTimeout(resolve, delay));
         }
       }
     }
-    if (token === this.connectToken) this.log(`连接失败：已重试 ${CONNECT_MAX_ATTEMPTS} 次仍未成功`);
+    if (token === this.connectToken) {
+      this.log(`连接失败：已重试 ${CONNECT_MAX_ATTEMPTS} 次仍未成功`);
+      // 反复瞬时失败（"Connection attempt failed"）多为环境态，纯软件无法连上，给出对症排障指引：
+      this.log('若反复连不上请依次排查：① 墨水屏可能已休眠并停止蓝牙广播——在屏上按键或重新上电唤醒后重试；'
+        + '② 若曾在 Windows「设置 → 蓝牙和其他设备」里配对过本设备——找到它「删除设备」清掉残留配对，'
+        + '再用「连接设备」重新搜索；③ 关闭可能独占该设备的其他蓝牙工具（如 nRF Connect）后重试。');
+    }
     return null;
   }
 
