@@ -665,18 +665,12 @@ if (typeof window !== 'undefined' && window.AAS_EPD) {
   });
 
   // 窗口隐藏（缩托盘）时主动复位扫描 / 一键重连态（修复 E18 渲染层一致性）：
-  // 主进程已在窗口 close/closed/导航时兜底解析挂起的 native 蓝牙请求（见 main.cjs
-  // resolvePendingBleRequests），但那条路径直接在主进程调 callback('')，不会回传 epd:ble-select，
-  // 渲染层 store 的 scanning/quickConnecting/scanDevices 会被原样保留（下次 openScan 被
-  // `if (scanning) return` 吞掉而打不开扫描）。这里在 document 转入隐藏时复位渲染态，
-  // 与主进程释放保持两端一致；closeScan/cancelQuickReconnect 再发一次 select('') 对主进程幂等
-  // （epd:ble-select 见 !bluetoothRequest 即 return）。
-  document.addEventListener('visibilitychange', () => {
-    if (document.visibilityState !== 'hidden') return;
-    const st = useEpaperStore.getState();
-    if (st.scanning) st.closeScan();
-    if (st.quickConnecting) st.cancelQuickReconnect();
-  });
+  // 注意：曾在此监听 visibilitychange，在窗口转入 hidden（最小化/收托盘/被其它窗口完全遮挡）时
+  // closeScan()/cancelQuickReconnect()。但这会让「一键重连」一最小化/失焦就被打断，违背
+  // 「只有用户点『取消重连』才停」的预期，故移除。配套地，主进程 close 缩托盘时也不再
+  // resolvePendingBleRequests（仅真正退出/窗口销毁/重载才释放，见 main.cjs），因此隐藏期间
+  // native 扫描与渲染层 scanning/quickConnecting 都保持运行、两端依然一致；又因
+  // backgroundThrottling:false，隐藏后定时器不被节流，后台重连可全速进行。
 }
 
 // ===== 启动回灌：主进程 gui-settings.json → store =====

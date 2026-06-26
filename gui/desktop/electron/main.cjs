@@ -525,6 +525,8 @@ async function createWindow() {
       contextIsolation: true,
       nodeIntegration: false,
       sandbox: true,
+      // 缩托盘/最小化/被遮挡后仍要后台定时推送与「一键重连」全速运行，故关闭隐藏窗口的定时器节流
+      backgroundThrottling: false,
       // token 不再随窗口创建注入（窗口先于后端就绪），仅保留 http/ws 默认值；
       // token 由 backend:status('token') 异步推送
       additionalArguments: [
@@ -595,13 +597,15 @@ async function createWindow() {
   });
 
   win.on('close', e => {
-    // 缩托盘前先兜底解析挂起的原生蓝牙请求：扫描 modal 开着却直接关窗口时，
-    // 否则 native 扫描会一直挂起、渲染层 scanning 卡 true（详见 resolvePendingBleRequests）。
-    resolvePendingBleRequests();
     if (!appQuitting) {
+      // 缩托盘：保留挂起的 native 蓝牙请求，让后台「一键重连」/扫描在托盘里继续跑
+      //（只有用户点「取消重连」才停）。真正退出/窗口销毁/重载才释放，见下方 closed /
+      // did-start-navigation 与 before-quit。
       e.preventDefault();
       win.hide();
+      return;
     }
+    resolvePendingBleRequests(); // 真正退出：释放挂起的 native 蓝牙请求，避免扫描状态泄漏
   });
   // 窗口真正销毁时再兜底一次（直接退出/异常销毁路径）
   win.on('closed', resolvePendingBleRequests);
