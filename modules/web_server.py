@@ -651,11 +651,20 @@ def _build_flask_app(attendance_system, bridge: AsyncioBridge,
         query:
           - force=0|1（1 跳过 TTL 立即拉，仅首屏有效）；
           - cursor=<base64>（"加载更多"游标续拉，实时拉不走缓存）；
-          - take=N（每页条数，1..100）。
+          - take=N（每页条数，1..100）；
+          - category=ai-models|ai-products|industry|paper|tip（按版块服务端过滤，缺省或 all 即"全部"）；
+          - mode=all|selected（selected 只取主编精选"只看精选"，缺省全量；可与 category 组合，
+            各视图独立一份列表/游标/缓存）。
         首屏失败返回 200 + 旧缓存；加载更多(带 cursor)失败返回 502，便于前端重试而非误判到底。
         """
         force = request.args.get('force', '0') in ('1', 'true', 'True')
         cursor = request.args.get('cursor') or None
+        category = request.args.get('category') or None
+        if category == 'all':
+            category = None
+        mode = request.args.get('mode') or None
+        if mode not in ('all', 'selected'):
+            mode = None  # 非法/缺省 → 交由服务层用默认口径(all)
         take = None
         take_raw = request.args.get('take')
         if take_raw:
@@ -665,7 +674,7 @@ def _build_flask_app(attendance_system, bridge: AsyncioBridge,
                 take = None
         try:
             from modules.ai_news_service import get_ai_news as _gan
-            return jsonify(_gan(force=force, cursor=cursor, take=take))
+            return jsonify(_gan(force=force, cursor=cursor, take=take, category=category, mode=mode))
         except Exception:
             logging.exception("get_ai_news failed")
             if cursor:

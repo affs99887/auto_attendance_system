@@ -21,6 +21,7 @@ import { DialogHost } from './lib/dialog';
 import { ModeQuickToggle } from './components/ModeQuickToggle';
 import { SystemBanners } from './components/SystemBanners';
 import { ServiceControls } from './components/ServiceControls';
+import { SidebarFxWidget } from './components/SidebarFxWidget';
 import { useSystemStore } from './store/system';
 
 type ScreenComponent = React.ComponentType;
@@ -148,8 +149,10 @@ function Sidebar({ screen, setScreen }: SidebarProps) {
         {renderGroup('config')}
       </div>
 
-      {/* 底部仅保留服务控制（已切单用户，去掉账户行）— 照设计稿最终态 */}
+      {/* 底部：汇率快查小组件 + 分割线 + 服务控制（已切单用户，去掉账户行）*/}
       <div className="side-footer">
+        <SidebarFxWidget />
+        <div className="side-footer-sep" />
         <ServiceControls variant="compact" />
       </div>
     </aside>

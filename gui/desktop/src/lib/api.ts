@@ -92,6 +92,7 @@ export interface AiNewsItem {
   publishedAt?: string | null; // 内容发布时间（ISO 字符串）
   summary?: string | null;
   category?: string | null; // 版块 slug，对应 AI_NEWS_CATEGORIES
+  selected?: boolean; // 是否上游主编精选（true 时前端打「精选」标）
 }
 
 export interface AiNewsResponse {
@@ -346,12 +347,16 @@ export const api = {
     return request<ExchangeRateResponse>(`/api/v1/exchange-rate?${qs.toString()}`);
   },
 
-  // AI 资讯（AI HOT 聚合）；force 跳过后端缓存强制刷新（首屏），cursor 游标续拉"加载更多"
-  getAiNews: (opts?: { force?: boolean; cursor?: string; take?: number }) => {
+  // AI 资讯（AI HOT 聚合）；force 跳过后端缓存强制刷新（首屏），cursor 游标续拉"加载更多"，
+  // category 按版块服务端过滤（缺省即"全部"），mode='selected' 只取主编精选（"只看精选"）；
+  // mode+category 可组合，各视图各自独立一份列表/游标
+  getAiNews: (opts?: { force?: boolean; cursor?: string; take?: number; category?: string; mode?: 'all' | 'selected' }) => {
     const qs = new URLSearchParams();
     if (opts?.force) qs.set('force', '1');
     if (opts?.cursor) qs.set('cursor', opts.cursor);
     if (opts?.take) qs.set('take', String(opts.take));
+    if (opts?.category) qs.set('category', opts.category);
+    if (opts?.mode) qs.set('mode', opts.mode);
     const q = qs.toString();
     return request<AiNewsResponse>(`/api/v1/ai-news${q ? `?${q}` : ''}`);
   },

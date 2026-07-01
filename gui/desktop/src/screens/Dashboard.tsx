@@ -74,9 +74,56 @@ function estimateOut(inT: string | null): string | null {
   return `${String(oh).padStart(2, '0')}:${String(om).padStart(2, '0')}`;
 }
 
+// 午休（午餐 + 午休）时段：11:00 – 13:15，这段不计入工作时长
+const LUNCH_START = 11 * 60;
+const LUNCH_END = 13 * 60 + 15;
+
+// 'HH:MM(:SS)' → 一天中的分钟数（带秒的小数，让进度条随当前时间平滑推进）
+function hmToMin(s: string): number {
+  const p = s.split(':').map(Number);
+  return (p[0] || 0) * 60 + (p[1] || 0) + (p[2] || 0) / 60;
+}
+// 分钟数 → '3h12m' / '45m'
+function fmtDur(min: number): string {
+  const t = Math.max(0, Math.round(min));
+  const h = Math.floor(t / 60);
+  const m = t % 60;
+  return h > 0 ? `${h}h${String(m).padStart(2, '0')}m` : `${m}m`;
+}
+
+interface WorkProgress {
+  posPct: number;        // 当前时间在「上班→下班」上的位置（0~100）
+  lunchLeftPct: number;  // 午休段左边界（0~100）
+  lunchWidthPct: number; // 午休段宽度（0~100）
+  worked: number;        // 已工作分钟（当前 − 上班，午休照常计入）
+  remaining: number;     // 剩余分钟（下班 − 当前，午休照常计入）
+  hasLunch: boolean;     // 上下班区间是否覆盖到午休段
+}
+// 由上班时间 / 预计（或实际）下班时间 / 当前时间，算出工作进度模型
+function buildWorkProgress(inStr: string | null, outStr: string | null, now: Date): WorkProgress | null {
+  if (!inStr || !outStr) return null;
+  const inMin = hmToMin(inStr);
+  const outMin = hmToMin(outStr);
+  if (!(outMin > inMin)) return null;
+  const span = outMin - inMin;
+  const nowMin = now.getHours() * 60 + now.getMinutes() + now.getSeconds() / 60;
+  const cur = Math.min(Math.max(nowMin, inMin), outMin); // 夹在上下班之间
+  const ll = Math.min(Math.max((LUNCH_START - inMin) / span, 0), 1);
+  const lr = Math.min(Math.max((LUNCH_END - inMin) / span, 0), 1);
+  return {
+    posPct: ((cur - inMin) / span) * 100,
+    lunchLeftPct: ll * 100,
+    lunchWidthPct: (lr - ll) * 100,
+    worked: cur - inMin,
+    remaining: outMin - cur,
+    hasLunch: lr > ll,
+  };
+}
+
 function PunchUserCard({ user }: { user: User }) {
   const snapshot = useSystemStore(s => s.snapshot);
   const refreshStatus = useSystemStore(s => s.refresh);
+  const { clock } = useApp(); // 每秒更新，驱动工作进度条
   // 操作 busy 态：驱动按钮 spin-ic 图标动画 + 互斥禁用（in/out/auto/check 四种动作）
   const [busy, setBusy] = React.useState<null | 'in' | 'out' | 'auto' | 'check'>(null);
   // 结果提示：照设计稿 punch-toast（success/info）替代原 hint 文本
@@ -187,9 +234,11 @@ function PunchUserCard({ user }: { user: User }) {
   const punchedIn = Boolean(today.in);
   const punchedOut = Boolean(today.out);
   const estOut = punchedIn ? estimateOut(today.in) : null;
+  // 工作进度：上班 → 实际/预计下班；已下班用实际下班时刻，否则用预计
+  const prog = buildWorkProgress(today.in, today.out || estOut, clock);
 
   return (
-    <div className="card" style={{ display: 'flex', flexDirection: 'column', height: '100%' }}>
+    <div className="card" style={{ display: 'flex', flexDirection: 'column', height: '100%', minHeight: 300 }}>
       <div className="card-header" style={{ flexWrap: 'wrap', rowGap: 10 }}>
         <div className="row gap-2">
           <div
@@ -203,23 +252,8 @@ function PunchUserCard({ user }: { user: User }) {
             <div className="card-sub mono">{user.env}</div>
           </div>
         </div>
-        {/* 上/下班时间：迁移到顶部，横向摆放 + 状态 pill */}
-        <div className="row gap-4" style={{ marginLeft: 'auto', alignItems: 'flex-end' }}>
-          <div className="col" style={{ gap: 0, alignItems: 'flex-end' }}>
-            <div className="kicker">上班</div>
-            <div className="mono" style={{ fontSize: 18, fontWeight: 600 }}>
-              {today.in || <span className="muted">--:--:--</span>}
-            </div>
-          </div>
-          <div className="col" style={{ gap: 0, alignItems: 'flex-end' }}>
-            <div className="kicker">下班</div>
-            <div
-              className="mono"
-              style={{ fontSize: 18, fontWeight: 600, color: today.out ? undefined : 'var(--text-muted)' }}
-            >
-              {today.out || (estOut ? estOut : '--:--:--')}
-            </div>
-          </div>
+        {/* 状态 pill 靠右（上/下班时间已放大移到卡片中部展示）*/}
+        <div className="row" style={{ marginLeft: 'auto' }}>
           {punchedOut ? (
             <span className="pill pill-success"><span className="dot" />已完成</span>
           ) : punchedIn ? (
@@ -240,10 +274,66 @@ function PunchUserCard({ user }: { user: User }) {
             <span>{toast.msg}</span>
           </div>
         )}
+        {/* 上/下班时间 + 工作进度：占据中间留白，垂直居中 */}
+        <div style={{ flex: 1, display: 'flex', flexDirection: 'column', justifyContent: 'center', gap: 18 }}>
+          <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 40 }}>
+            <div className="col" style={{ gap: 4, alignItems: 'center' }}>
+              <div className="kicker">上班</div>
+              <div className="mono" style={{ fontSize: 28, fontWeight: 600, lineHeight: 1 }}>
+                {today.in || <span className="muted">--:--:--</span>}
+              </div>
+            </div>
+            <div style={{ width: 1, height: 40, background: 'var(--border-soft)' }} />
+            <div className="col" style={{ gap: 4, alignItems: 'center' }}>
+              <div className="kicker">下班</div>
+              <div
+                className="mono"
+                style={{ fontSize: 28, fontWeight: 600, lineHeight: 1, color: today.out ? undefined : 'var(--text-muted)' }}
+              >
+                {today.out || (estOut ? estOut : '--:--:--')}
+              </div>
+            </div>
+          </div>
+          {prog && (
+            <div className="col" style={{ gap: 6 }}>
+              <div className="row spread" style={{ fontSize: 11 }}>
+                <span className="muted">
+                  已工作 <span className="mono" style={{ color: 'var(--text-secondary)' }}>{fmtDur(prog.worked)}</span>
+                </span>
+                <span className="muted">
+                  {punchedOut ? '已下班' : <>剩余 <span className="mono" style={{ color: 'var(--text-secondary)' }}>{fmtDur(prog.remaining)}</span></>}
+                </span>
+              </div>
+              {/* 进度轨道：蓝色为已过时间，橙色块标出午休 11:00–13:15（悬浮显示提示） */}
+              <div style={{ position: 'relative', height: 8, borderRadius: 999, background: 'var(--bg-inset)', overflow: 'hidden' }}>
+                <div style={{ position: 'absolute', left: 0, top: 0, bottom: 0, width: `${prog.posPct}%`, background: 'var(--accent)', borderRadius: 999 }} />
+                {prog.hasLunch && (
+                  <div
+                    title="午休 11:00–13:15"
+                    style={{
+                      position: 'absolute', top: 0, bottom: 0,
+                      left: `${prog.lunchLeftPct}%`, width: `${prog.lunchWidthPct}%`,
+                      background: 'var(--warning)',
+                      opacity: 0.9,
+                      cursor: 'help',
+                    }}
+                  />
+                )}
+              </div>
+              <div className="row spread" style={{ fontSize: 10 }}>
+                <span className="muted">进度 {Math.round(prog.posPct)}%</span>
+                <span style={{ display: 'inline-flex', alignItems: 'center', gap: 4 }}>
+                  <span style={{ width: 8, height: 8, borderRadius: 2, background: 'var(--warning)', opacity: 0.9 }} />
+                  <span className="muted">午休 11:00–13:15</span>
+                </span>
+              </div>
+            </div>
+          )}
+        </div>
         {/* 控制器：横向按钮组，靠模块底部 */}
         <div
           className="punch-actions"
-          style={{ marginTop: 'auto', paddingTop: 14, borderTop: '1px solid var(--border-soft)' }}
+          style={{ paddingTop: 14, borderTop: '1px solid var(--border-soft)' }}
         >
           <button
             className="btn btn-primary btn-sm"
@@ -305,8 +395,8 @@ function useMatchHeight(): [React.RefObject<HTMLDivElement>, number | null] {
 
 // 仪表盘 AI 资讯模块 —— 竖向精选列表（与今日打卡同一行，高度对齐）
 function DashNewsCard({ matchH }: { matchH: number | null }) {
-  const items = useAiNewsStore(s => s.items);
-  const loading = useAiNewsStore(s => s.loading);
+  const items = useAiNewsStore(s => s.cats.all.items);
+  const loading = useAiNewsStore(s => s.cats.all.loading);
   const refresh = useAiNewsStore(s => s.refresh);
   const top = React.useMemo(
     () =>
@@ -325,7 +415,7 @@ function DashNewsCard({ matchH }: { matchH: number | null }) {
             <div className="card-sub">AI HOT · 今日精选</div>
           </div>
         </div>
-        <button className="btn btn-ico btn-sm" title="刷新" onClick={() => void refresh(true)} disabled={loading}>
+        <button className="btn btn-ico btn-sm" title="刷新" onClick={() => void refresh('all', true)} disabled={loading}>
           <span className={loading ? 'spin-ic' : ''} style={{ display: 'inline-flex' }}><Icon.Refresh size={13} /></span>
         </button>
       </div>

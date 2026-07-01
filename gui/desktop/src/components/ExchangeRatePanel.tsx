@@ -60,7 +60,7 @@ function useMeasure(): [React.RefObject<HTMLDivElement>, number] {
 function FxChart({ series, direction }: { series: SeriesPoint[]; direction: ExchangeRateDirection }) {
   const [wrapRef, W] = useMeasure();
   const [hover, setHover] = React.useState<number | null>(null);
-  const H = 200;
+  const H = 160;
   const padL = 52, padR = 16, padT = 16, padB = 26;
   const innerW = Math.max(W - padL - padR, 10);
   const innerH = H - padT - padB;
@@ -242,12 +242,15 @@ function FxConverter({ baseRate }: { baseRate: number }) {
   const quicks = cny2jpy ? [100, 500, 1000, 5000] : [1000, 5000, 10000, 50000];
 
   return (
-    <div className="card">
+    <div className="card" style={{ display: 'flex', flexDirection: 'column' }}>
       <div className="card-header">
         <div className="card-title">汇率转换器</div>
         <span className="pill pill-neutral mono">{rate.toFixed(cny2jpy ? 4 : 6)}</span>
       </div>
-      <div className="card-body">
+      <div
+        className="card-body"
+        style={{ flex: 1, display: 'flex', flexDirection: 'column', justifyContent: 'center' }}
+      >
         {/* 输入 + 方向切换 + 输出 + 说明 + 快捷金额（原快捷对照表已删除）*/}
         <div className="col" style={{ gap: 10 }}>
           <div className="fx-conv-field">
@@ -443,7 +446,7 @@ export function FxSection() {
                 <div
                   className="muted"
                   style={{
-                    height: 200,
+                    height: 160,
                     display: 'flex',
                     alignItems: 'center',
                     justifyContent: 'center',
