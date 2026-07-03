@@ -584,8 +584,10 @@ export function decodeProcessedData(processedData: Uint8Array, width: number, he
     ];
     for (let y = 0; y < height; y++) {
       for (let x = 0; x < width; x++) {
-        const newIndex = (y * width + x) / 4 | 0;
-        const shift = 6 - ((x % 4) * 2);
+        // 与 processImageData 的 fourColor 打包互逆：字节下标和位移基于同一个线性像素序号 p
+        const p = y * width + x;
+        const newIndex = p >> 2;
+        const shift = 6 - ((p % 4) * 2);
         const value = (processedData[newIndex] >> shift) & 0x03;
         const color = fourColorValues.find(c => c.value === value) || fourColorValues[1]; // 默认白色
         const index = (y * width + x) * 4;
@@ -670,9 +672,12 @@ export function processImageData(imageData: ImageData, mode: DitherMode): Uint8A
         const g = data[index + 1];
         const b = data[index + 2];
         const closest = findClosestColor(r, g, b, mode); // 使用 fourColorPalette
-        const colorValue = closest.value; // 0x00 (黑), 0x01 (白), 0x02 (红), 0x03 (黄)
-        const newIndex = (y * width + x) / 4 | 0;
-        const shift = 6 - ((x % 4) * 2);
+        const colorValue = closest.value; // 0x00 (黑), 0x01 (白), 0x02 (黄), 0x03 (红)
+        // 字节下标和位移必须基于同一个线性像素序号 p，否则宽度不是 4 的倍数时
+        // 相邻行的像素会错位挤进同一个 2bit 槽（|= 叠加出错色）。decodeProcessedData 用同款映射解码。
+        const p = y * width + x;
+        const newIndex = p >> 2;
+        const shift = 6 - ((p % 4) * 2);
         processedData[newIndex] |= (colorValue << shift);
       }
     }

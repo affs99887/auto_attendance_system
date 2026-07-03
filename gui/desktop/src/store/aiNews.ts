@@ -60,13 +60,18 @@ export interface AiNewsCatState {
   moreError: string | null;   // 加载更多错误（底部重试用）
   lastFetched: number | null; // 该版块是否已首拉过（null=从未拉取，供切版块时懒加载）
   loadedMore: boolean;        // 用户是否点过"加载更多"（自动刷新据此避免打断深度浏览）
+  generation: number;         // 列表代次：refresh 成功整体替换列表时换全局递增值，loadMore 靠它识别并丢弃陈旧响应
 }
+
+// 代次取全局单调递增而不是桶内 +1：reset 重建桶会把代次归零，
+// 若在途 loadMore 发起时的旧代次恰好被"归零后再刷新几次"追平，旧响应会被误收
+let nextGeneration = 1;
 
 function emptyCat(): AiNewsCatState {
   return {
     items: [], updatedAt: null, nextCursor: null, hasNext: false,
     loading: false, loadingMore: false, error: null, moreError: null,
-    lastFetched: null, loadedMore: false,
+    lastFetched: null, loadedMore: false, generation: 0,
   };
 }
 
@@ -124,6 +129,13 @@ export const useAiNewsStore = create<AiNewsState>((set, get) => {
       patchCat(key, { loading: true, error: null });
       try {
         const resp = await api.getAiNews({ force, ...keyToParams(key) });
+        // 后端在"上游拉取失败且无旧缓存"时也回 200，但结构是 updated_at=null + 空 items。
+        // 这种情况按失败处理：不置 lastFetched（保持 null，预拉取/兜底补拉之后还会重试），
+        // 置 error 走错误态。updated_at 非空而 items 为空是"真没有条目"，正常落列表。
+        if (resp.updated_at == null && !(resp.items ?? []).length) {
+          patchCat(key, { error: '后端暂未取到资讯（上游拉取失败或无缓存）', loading: false });
+          return;
+        }
         patchCat(key, {
           items: resp.items ?? [],
           updatedAt: resp.updated_at ?? null,
@@ -133,6 +145,8 @@ export const useAiNewsStore = create<AiNewsState>((set, get) => {
           loadedMore: false,
           lastFetched: Date.now(),
           loading: false,
+          // 列表被整体替换：换新代次，让在途 loadMore 的旧快照失效
+          generation: nextGeneration++,
         });
       } catch (e) {
         const msg = e instanceof ApiError ? `${e.status} ${e.message}` : (e as Error).message;
@@ -146,17 +160,29 @@ export const useAiNewsStore = create<AiNewsState>((set, get) => {
       patchCat(key, { loadingMore: true, moreError: null, loadedMore: true });
       try {
         const resp = await api.getAiNews({ cursor: st.nextCursor, ...keyToParams(key) });
+        // await 期间列表可能已被 refresh 整体替换（代次变化）：丢弃本次响应只收尾 loadingMore，
+        // 避免用发起时的旧快照把刷新到的新列表/新游标覆盖回去
+        const latest = get().cats[key] ?? emptyCat();
+        if (latest.generation !== st.generation) {
+          patchCat(key, { loadingMore: false });
+          return;
+        }
         // 按 id 去重追加（防游标边界重复）
-        const seen = new Set(st.items.map(it => it.id));
+        const seen = new Set(latest.items.map(it => it.id));
         const fresh = (resp.items ?? []).filter(it => it.id && !seen.has(it.id));
         patchCat(key, {
-          items: [...st.items, ...fresh],
+          items: [...latest.items, ...fresh],
           nextCursor: resp.next_cursor ?? null,
           hasNext: !!resp.has_next,
           loadingMore: false,
         });
       } catch (e) {
         const msg = e instanceof ApiError ? `${e.status} ${e.message}` : (e as Error).message;
+        // 期间列表已被 refresh 替换：不给新列表挂旧错，只收尾 loadingMore
+        if ((get().cats[key] ?? emptyCat()).generation !== st.generation) {
+          patchCat(key, { loadingMore: false });
+          return;
+        }
         // 保留 hasNext/nextCursor 以便重试；记 moreError 供底部展示
         patchCat(key, { moreError: msg, loadingMore: false });
       }

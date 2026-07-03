@@ -365,6 +365,11 @@ function pingBackend(timeoutMs = 4000) {
 
 async function handleResume() {
   if (appQuitting) return;
+  // 先向渲染层广播「系统刚唤醒」（power:resume）：休眠中蓝牙链路必掉，墨水屏侧要靠这个
+  // 信号立即校验连接/触发重连，与后端进程是否在跑无关，故放在 pythonProc 判断之前。
+  if (mainWindow && !mainWindow.isDestroyed()) {
+    try { mainWindow.webContents.send('power:resume'); } catch { /* ignore */ }
+  }
   // 唤醒时后端本就不在跟踪（未启动 / 之前已失败）：不擅自拉起，保留用户手动启动入口。
   if (!pythonProc) return;
   // 先重新侦测就绪：token 已存在会立即推送，修复「睡眠跨过启动窗口 → 渲染端停在 failed」。
@@ -414,11 +419,32 @@ let guiSettingsTimer = null;  // 防抖写盘定时器
 
 function getGuiSettings() {
   if (guiSettings == null) {
+    let raw = null;
     try {
-      const o = JSON.parse(fs.readFileSync(GUI_SETTINGS_PATH, 'utf-8'));
-      guiSettings = o && typeof o === 'object' ? o : {};
-    } catch {
+      raw = fs.readFileSync(GUI_SETTINGS_PATH, 'utf-8');
+    } catch (e) {
+      // 文件不存在（ENOENT，首次启动）属正常，静默；其他读失败（如被杀毒软件临时锁住）留条日志便于排查
+      if (!e || e.code !== 'ENOENT') {
+        console.warn('[aas-electron] gui-settings.json 读取失败:', e && e.message);
+      }
+    }
+    if (raw == null) {
       guiSettings = {};
+    } else {
+      try {
+        const o = JSON.parse(raw);
+        guiSettings = o && typeof o === 'object' ? o : {};
+      } catch {
+        // 内容损坏：直接回退空对象会在下次写盘时把损坏文件覆盖掉，备忘录等用户数据将永久丢失。
+        // 先把损坏文件改名留档为 .bak（覆盖旧 .bak），至少可人工恢复，再按空设置起步。
+        try {
+          fs.renameSync(GUI_SETTINGS_PATH, GUI_SETTINGS_PATH + '.bak');
+          console.warn('[aas-electron] gui-settings.json 内容损坏，已留档为 gui-settings.json.bak');
+        } catch (e2) {
+          console.warn('[aas-electron] gui-settings.json 损坏留档失败:', e2 && e2.message);
+        }
+        guiSettings = {};
+      }
     }
   }
   return guiSettings;
@@ -428,7 +454,11 @@ function flushGuiSettings() {
   if (guiSettingsTimer) { clearTimeout(guiSettingsTimer); guiSettingsTimer = null; }
   if (guiSettings == null) return;
   try {
-    fs.writeFileSync(GUI_SETTINGS_PATH, JSON.stringify(guiSettings, null, 2), 'utf-8');
+    // 原子写：先写同目录临时文件再 rename 覆盖（同分区 rename 是原子替换），
+    // 避免写盘瞬间崩溃/断电留下半截 JSON 毁掉备忘录等用户数据
+    const tmp = GUI_SETTINGS_PATH + '.tmp';
+    fs.writeFileSync(tmp, JSON.stringify(guiSettings, null, 2), 'utf-8');
+    fs.renameSync(tmp, GUI_SETTINGS_PATH);
   } catch { /* ignore */ }
 }
 
@@ -445,26 +475,30 @@ ipcMain.on('settings:set', (_event, key, value) => {
 // ============================================================================
 // 墨水屏日志持久化（logs/epaper.log）
 //  渲染进程每条墨水屏日志经 epd:log-append 追加；发送图片时 ⇑/⇓ hex 可达上千条，
-//  故主进程缓冲后防抖 250ms 合并写盘（而非每条同步写）。单文件超上限按「保留尾部一半」
-//  滚动截断，无需外部依赖。退出前 before-quit 强制 flush。
+//  故主进程缓冲后防抖 250ms 合并写盘（而非每条同步写）；持续日志会一直重置防抖，
+//  所以另设 max-wait：距队首入队超 2 秒直接落盘，保证长传输期间周期性写盘、内存有界。
+//  单文件超上限按「保留尾部一半」滚动截断，无需外部依赖。退出前 before-quit 强制 flush。
 // ============================================================================
 const EPAPER_LOG_PATH = path.join(DATA_DIR, 'logs', 'epaper.log');
 const EPAPER_LOG_MAX_BYTES = 1024 * 1024; // 1 MB；超出截掉前半，避免无限增长
+const EPAPER_LOG_MAX_WAIT_MS = 2000;      // 防抖强制落盘上限：距队首入队超此时长直接 flush
 let epaperLogDirReady = false;
 let epaperLogQueue = [];     // 待写行缓冲
 let epaperLogTimer = null;   // 防抖落盘定时器
+let epaperLogFirstAt = 0;    // 队首那条日志的入队时刻（max-wait 判定基准）
 
 function flushEpaperLog() {
   if (epaperLogTimer) { clearTimeout(epaperLogTimer); epaperLogTimer = null; }
   if (!epaperLogQueue.length) return;
   const chunk = epaperLogQueue.join('\n') + '\n';
-  epaperLogQueue = [];
   try {
     if (!epaperLogDirReady) {
       fs.mkdirSync(path.dirname(EPAPER_LOG_PATH), { recursive: true });
       epaperLogDirReady = true;
     }
     fs.appendFileSync(EPAPER_LOG_PATH, chunk, 'utf-8');
+    // 写成功才清队列；若先清再写，写失败这批日志就被静默丢弃了
+    epaperLogQueue = [];
     // 超过上限：仅保留尾部约一半，并从首个换行后切起避免留下半行
     const { size } = fs.statSync(EPAPER_LOG_PATH);
     if (size > EPAPER_LOG_MAX_BYTES) {
@@ -473,12 +507,25 @@ function flushEpaperLog() {
       const nl = tail.indexOf(0x0a);
       fs.writeFileSync(EPAPER_LOG_PATH, nl >= 0 ? tail.subarray(nl + 1) : tail);
     }
-  } catch { /* 日志写盘失败不影响主流程 */ }
+  } catch {
+    // 写盘失败（如 logs 目录被删/被占用）不影响主流程：日志留在队列等下次落盘重试。
+    // 目录标记复位让下次重建目录；截断队列防持续失败时内存无限涨；
+    // 刷新 firstAt 让连续日志期间的强制落盘至少隔 2 秒再试（稀疏日志仍走 250ms 防抖重试）。
+    epaperLogDirReady = false;
+    if (epaperLogQueue.length > 1000) epaperLogQueue.splice(0, epaperLogQueue.length - 1000);
+    epaperLogFirstAt = Date.now();
+  }
 }
 
 ipcMain.on('epd:log-append', (_event, line) => {
   if (typeof line !== 'string' || !line) return;
+  if (!epaperLogQueue.length) epaperLogFirstAt = Date.now();
   epaperLogQueue.push(line);
+  // 队首等太久（发图时日志间隔常小于 250ms，纯防抖会被一直重置）：不再重置定时器，直接落盘
+  if (Date.now() - epaperLogFirstAt >= EPAPER_LOG_MAX_WAIT_MS) {
+    flushEpaperLog();
+    return;
+  }
   if (epaperLogTimer) clearTimeout(epaperLogTimer);
   epaperLogTimer = setTimeout(flushEpaperLog, 250);
 });

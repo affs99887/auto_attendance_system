@@ -10,6 +10,7 @@ import {
   relTime,
 } from '../store/aiNews';
 import type { AiNewsItem } from '../lib/api';
+import { useToastStore } from '../store/toast';
 
 // 版块标签：按 slug 取配色 hue 与中文名（兜底 industry），size='lg' 用于更大字号场景
 function CatTag({ slug, size = 'sm' }: { slug: string | null | undefined; size?: 'sm' | 'lg' }) {
@@ -96,7 +97,9 @@ function NewsListFooter({
     );
     io.observe(el);
     return () => io.disconnect();
-  }, [bucketKey, hasNext, moreError, itemCount]);
+    // loadingMore 也要进依赖：加载期间哨兵会卸载，若整页去重后 0 条新增（itemCount 不变），
+    // 需在 loadingMore 翻回 false、哨兵重挂载后重建 observer，否则旧 observer 盯着已卸载节点永不触发
+  }, [bucketKey, hasNext, moreError, itemCount, loadingMore]);
 
   if (loadingMore) {
     return (
@@ -157,6 +160,16 @@ export function NewsScreen() {
 
   const { items, loading, loadingMore, hasNext, moreError, error } = st;
 
+  // 手动刷新：失败且列表非空时，空列表错误块不会渲染（只在无数据时出现），
+  // 改推全局错误 toast——否则 spinner 停止而列表纹丝不动，用户会误以为已刷到最新
+  const doRefresh = async () => {
+    await refresh(key, true);
+    const cur = useAiNewsStore.getState().cats[key];
+    if (cur?.error && cur.items.length) {
+      useToastStore.getState().push('err', `AI 资讯刷新失败：${cur.error}`);
+    }
+  };
+
   // 当前视图按发布时间倒序
   const shown = React.useMemo(
     () => [...items].sort((a, b) => new Date(b.publishedAt ?? 0).getTime() - new Date(a.publishedAt ?? 0).getTime()),
@@ -176,7 +189,7 @@ export function NewsScreen() {
             </div>
           </div>
         </div>
-        <button className="btn btn-sm" onClick={() => void refresh(key, true)} disabled={loading}>
+        <button className="btn btn-sm" onClick={() => void doRefresh()} disabled={loading}>
           {loading ? <span className="spinner" /> : <Icon.Refresh size={12} />}
           {loading ? '拉取中…' : '刷新'}
         </button>

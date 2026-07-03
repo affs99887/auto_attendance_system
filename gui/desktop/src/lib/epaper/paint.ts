@@ -24,6 +24,9 @@ interface CanvasState {
   imageData?: ImageData;
   textElements: TextElement[];
   lineSegments: LineSegment[];
+  // 上面两个数组克隆的估算字节（按 JSON 字符串长度），保存时算好缓存在这，
+  // 供 enforceHistoryBudget 计入内存预算，免得每次淘汰检查都重新 stringify 全栈
+  elementsBytes: number;
 }
 
 export interface PaintHost {
@@ -135,12 +138,16 @@ export class PaintManager {
     //   - 连续增量步达到 REBASELINE_INTERVAL → 补一张全量基线（见常量说明），其余情况存增量。
     const storeFull = !reconstructable || !hasBaseline || incrementalRun >= this.REBASELINE_INTERVAL;
 
+    // 克隆拆成"先 stringify 再 parse"两步，顺手拿字符串长度估算这两个数组占的内存，计入历史预算
+    const textJson = JSON.stringify(this.textElements);
+    const lineJson = JSON.stringify(this.lineSegments);
     const canvasState: CanvasState = {
       imageData: storeFull
         ? (snapshot ?? this.ctx.getImageData(0, 0, this.canvas.width, this.canvas.height))
         : undefined,
-      textElements: JSON.parse(JSON.stringify(this.textElements)),
-      lineSegments: JSON.parse(JSON.stringify(this.lineSegments)),
+      textElements: JSON.parse(textJson),
+      lineSegments: JSON.parse(lineJson),
+      elementsBytes: textJson.length + lineJson.length,
     };
 
     this.historyStack.push(canvasState);
@@ -151,14 +158,15 @@ export class PaintManager {
   }
 
   // 淘汰最旧历史以同时满足两条约束（对应 E16 的两个危害维度）：
-  //   ① 内存：只有"全量"步持有整张位图，按实际保留的位图总字节数 ≤ MAX_HISTORY_BYTES 收敛，
-  //      避免大画布满栈整张快照常驻撑爆 renderer 内存（增量步几乎不占内存，不计入预算）；
+  //   ① 内存：按实际保留字节数 ≤ MAX_HISTORY_BYTES 收敛——"全量"步的整张位图 + 每步笔迹/文字
+  //      数组克隆的估算字节（笔迹上千时 50 步各持一份克隆也会累积到数十 MB，不能只算位图），
+  //      避免满栈快照常驻撑爆 renderer 内存；
   //   ② 步数：总步数 ≤ MAX_HISTORY，保持撤销深度上限语义与原一致。
-  // 与旧版"按单张字节数推算固定步数上限"相比，这里按真实位图字节计：增量步多时撤销深度不再被
+  // 与旧版"按单张字节数推算固定步数上限"相比，这里按真实保留字节计：增量步多时撤销深度不再被
   // 误压到 ~24 步，仍严守 64MB 内存红线。
   private enforceHistoryBudget() {
     const retainedBytes = () => this.historyStack.reduce(
-      (sum, s) => sum + (s.imageData ? s.imageData.data.byteLength : 0),
+      (sum, s) => sum + (s.imageData ? s.imageData.data.byteLength : 0) + s.elementsBytes,
       0,
     );
 
@@ -228,6 +236,13 @@ export class PaintManager {
         this.replaySegments(state.lineSegments.slice(baseLineCount));
         this.replayTextElements(state.textElements.slice(baseTextCount));
       }
+
+      // 上面整体换掉了 textElements（全是新克隆对象），选中/拖动态里存的还是换掉前的旧引用：
+      // 留着会让 startPaint 的 === 命中判定永远失败（拖动静默失效），旧画面快照也一直占内存。
+      // 这里一并清掉，口径与 cancelTextPlacement 一致。
+      this.selectedTextElement = null;
+      this.draggingCanvasContext = null;
+      this.isDraggingText = false;
 
       this.notifyHistoryChange();
     }

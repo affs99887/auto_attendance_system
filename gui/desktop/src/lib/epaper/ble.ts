@@ -9,6 +9,8 @@ import {
   hex2bytes,
   bytes2hex,
 } from './protocol';
+// sendImage 对 ble 只有 type-only 导入（编译后擦除），这里反向引用不构成运行时循环依赖
+import { epdSendBusy } from './sendImage';
 
 // TypeScript DOM lib 不含 Web Bluetooth，自带最小类型声明（Electron/Chromium 运行时可用）
 interface BTCharacteristic {
@@ -17,6 +19,7 @@ interface BTCharacteristic {
   readValue(): Promise<DataView>;
   startNotifications(): Promise<BTCharacteristic>;
   addEventListener(type: 'characteristicvaluechanged', listener: (event: Event) => void): void;
+  removeEventListener(type: 'characteristicvaluechanged', listener: (event: Event) => void): void;
 }
 
 interface BTService {
@@ -33,8 +36,8 @@ interface BTGattServer {
 interface BTDevice {
   name?: string;
   gatt: BTGattServer;
-  addEventListener(type: 'gattserverdisconnected', listener: () => void): void;
-  removeEventListener(type: 'gattserverdisconnected', listener: () => void): void;
+  addEventListener(type: 'gattserverdisconnected', listener: (event: Event) => void): void;
+  removeEventListener(type: 'gattserverdisconnected', listener: (event: Event) => void): void;
 }
 
 interface BTRequestOptions {
@@ -107,7 +110,12 @@ export class EpdBleClient {
   // 连接尝试令牌：每次发起连接自增，并被进行中的重试循环持有；断开/被新连接流程取代时令牌变化，
   // 旧的重试循环在下一轮检查时主动退出，避免「已断开或已被取代却仍在后台重试连上」。
   private connectToken = 0;
-  private readonly onDisconnected = () => this.handleDisconnected();
+  private readonly onDisconnected = (event: Event) => this.handleDisconnected(event);
+  // 通知回调持具名引用（而非匿名函数），才能在重复初始化时先摘除再挂载，避免同一条通知被处理多次
+  private readonly onNotify = (event: Event) => {
+    const target = event.target as unknown as { value: DataView };
+    this.handleNotify(target.value, this.msgIndex++);
+  };
 
   appVersion = 0x15;
 
@@ -142,14 +150,51 @@ export class EpdBleClient {
     this.msgIndex = 0;
   }
 
-  private handleDisconnected() {
+  private handleDisconnected(event?: Event) {
+    // 只处理当前设备的断连：换设备后旧设备晚到的断连事件（事件源不是 this.bleDevice）直接忽略，
+    // 否则会误清新连接的状态、并让正在进行的重连令牌失效
+    if (event != null && (event.target as unknown as BTDevice) !== this.bleDevice) return;
     this.connectToken++;        // 令进行中的连接重试循环失效（设备已断开，不应再尝试）
     this.resetVariables();
     this.log('已断开连接.');
     this.emitConnectionChange();
   }
 
+  // 写入互斥：BLE 链路同一时刻只允许一个「逻辑写入单元」占用——一次 write() 是一个单元，
+  // writeImage 的整个分块循环也是一个单元（分块之间不许其他命令插队，否则设备端图像接收
+  // 状态机被打断会花屏）。实现为 promise 链排队：acquire 等到轮到自己时解析出释放函数。
+  // 与 sendImage.ts 的 sendingLock 分工：sendingLock 标记「整个发送管线（多层图像+刷新）进行中」，
+  // 供下面 write() 直接拒绝外部命令；本互斥只保证单个写入单元不被并发穿插。
+  private writeMutex: Promise<void> = Promise.resolve();
+
+  private acquireWriteLock(): Promise<() => void> {
+    let release!: () => void;
+    const next = new Promise<void>(resolve => { release = resolve; });
+    const prev = this.writeMutex;
+    this.writeMutex = next;
+    return prev.then(() => release);
+  }
+
   async write(cmd: number, data?: string | Uint8Array | number[] | null, withResponse = true): Promise<boolean> {
+    // 图像发送期间（全刷耗时 15-25s）只放行图像分块、刷新与 INIT：其他命令即便排队等到锁，
+    // 也会落在黑白层/红白层等多层图像之间破坏图传，所以直接拒绝而不是排队。
+    // INIT 放行给"发送中途断连后快速重连"的连接初始化用——那时发送管线的占用标记可能
+    // 还没释放，但旧发送已经死了；用户面板发 INIT 的按钮在发送期间本就被禁用。
+    if (epdSendBusy() && cmd !== EpdCmd.WRITE_IMG && cmd !== EpdCmd.REFRESH && cmd !== EpdCmd.INIT) {
+      this.log('图像发送中，已拒绝本次命令，请等屏幕刷新完成后重试');
+      return false;
+    }
+    const release = await this.acquireWriteLock();
+    try {
+      return await this.writeUnlocked(cmd, data, withResponse);
+    } finally {
+      release();
+    }
+  }
+
+  // 实际写入（不排队）。仅供 write() 与 writeImage() 内部使用：
+  // writeImage 已整体持有写入锁，分块若再经 write() 排队会等自己释放锁（死锁）
+  private async writeUnlocked(cmd: number, data?: string | Uint8Array | number[] | null, withResponse = true): Promise<boolean> {
     if (!this.epdCharacteristic) {
       this.log('服务不可用，请检查蓝牙连接');
       return false;
@@ -157,7 +202,14 @@ export class EpdBleClient {
     const payload: number[] = [cmd];
     if (data) {
       let bytes = data;
-      if (typeof bytes === 'string') bytes = hex2bytes(bytes);
+      if (typeof bytes === 'string') {
+        const parsed = hex2bytes(bytes);
+        if (parsed == null) {
+          this.log(`非法 16 进制数据（含非 hex 字符或长度为奇数），已取消发送: ${bytes}`);
+          return false;
+        }
+        bytes = parsed;
+      }
       if (bytes instanceof Uint8Array) bytes = Array.from(bytes);
       payload.push(...bytes);
     }
@@ -192,25 +244,32 @@ export class EpdBleClient {
     let chunkIdx = 0;
     let noReplyCount = interleavedCount;
 
-    for (let i = 0; i < data.length; i += chunkSize) {
-      const currentTime = (new Date().getTime() - opts.startTime) / 1000.0;
-      opts.onStatus(`${step === 'bw' ? '黑白' : '颜色'}块: ${chunkIdx + 1}/${count + 1}, 总用时: ${currentTime}s`);
-      const payload = [
-        (step === 'bw' ? 0x0f : 0x00) | (i === 0 ? 0x00 : 0xf0),
-        ...data.slice(i, i + chunkSize),
-      ];
-      // 检查每块写入返回值：断连后 epdCharacteristic 被置空或 BLE 写入抛错时 write() 返回 false，
-      // 此处必须抛错中断循环，否则会静默发送残缺图像并误报成功
-      let ok: boolean;
-      if (noReplyCount > 0) {
-        ok = await this.write(EpdCmd.WRITE_IMG, payload, false);
-        noReplyCount--;
-      } else {
-        ok = await this.write(EpdCmd.WRITE_IMG, payload, true);
-        noReplyCount = interleavedCount;
+    // 整个分块循环持有写入锁：期间外部 write() 只能排队或被拒绝，不会插进分块流中间；
+    // 循环内走 writeUnlocked（不再排队），否则会等自己释放锁形成死锁
+    const release = await this.acquireWriteLock();
+    try {
+      for (let i = 0; i < data.length; i += chunkSize) {
+        const currentTime = (new Date().getTime() - opts.startTime) / 1000.0;
+        opts.onStatus(`${step === 'bw' ? '黑白' : '颜色'}块: ${chunkIdx + 1}/${count + 1}, 总用时: ${currentTime}s`);
+        const payload = [
+          (step === 'bw' ? 0x0f : 0x00) | (i === 0 ? 0x00 : 0xf0),
+          ...data.slice(i, i + chunkSize),
+        ];
+        // 检查每块写入返回值：断连后 epdCharacteristic 被置空或 BLE 写入抛错时返回 false，
+        // 此处必须抛错中断循环，否则会静默发送残缺图像并误报成功
+        let ok: boolean;
+        if (noReplyCount > 0) {
+          ok = await this.writeUnlocked(EpdCmd.WRITE_IMG, payload, false);
+          noReplyCount--;
+        } else {
+          ok = await this.writeUnlocked(EpdCmd.WRITE_IMG, payload, true);
+          noReplyCount = interleavedCount;
+        }
+        if (!ok) throw new Error('图像分块写入失败，连接可能已断开');
+        chunkIdx++;
       }
-      if (!ok) throw new Error('图像分块写入失败，连接可能已断开');
-      chunkIdx++;
+    } finally {
+      release();
     }
   }
 
@@ -260,10 +319,16 @@ export class EpdBleClient {
     try {
       const bluetooth = (navigator as unknown as BTNavigator).bluetooth;
       if (!bluetooth) throw new Error('Web Bluetooth API 不可用');
-      this.bleDevice = await bluetooth.requestDevice({
+      const device = await bluetooth.requestDevice({
         optionalServices: [EPD_SERVICE_UUID],
         acceptAllDevices: true,
       });
+      // 换设备时先摘掉旧设备上的断连监听：旧设备晚到的断连事件不该再影响新设备的连接状态。
+      // 必须放在选择成功之后摘——用户取消选择时旧设备仍是当前设备，监听要保留
+      if (this.bleDevice != null && this.bleDevice !== device) {
+        this.bleDevice.removeEventListener('gattserverdisconnected', this.onDisconnected);
+      }
+      this.bleDevice = device;
     } catch (e) {
       console.error(e);
       const msg = (e as Error).message || '';
@@ -306,11 +371,27 @@ export class EpdBleClient {
     }
   }
 
+  // 令牌复核：本次连接流程已被新的连接/断开流程取代时返回 true，调用方应立即收场退出。
+  // 收场动作要分设备：同一设备的 gatt.connect() 每次 resolve 的是同一个 server 对象，
+  // 断开它或清共享状态会连带杀掉接管流程刚建好的连接——所以同设备时什么都不动，
+  // 链路留给接管方复用（对已连接的 server 再调 connect() 会立即成功）；
+  // 只有换了设备（server 不属于当前设备）才断开旧链路并回滚自己写入的共享状态。
+  private abortIfStale(token: number, server: BTGattServer): boolean {
+    if (token === this.connectToken) return false;
+    if (this.bleDevice != null && this.bleDevice.gatt === server) return true;
+    if (this.gattServer === server) {
+      this.gattServer = null;
+      this.epdCharacteristic = null;
+    }
+    if (server.connected) server.disconnect();
+    return true;
+  }
+
   // GATT 连接（含 service/characteristic 获取）。失败不立刻放弃：在 CONNECT_RETRY_WINDOW_MS（≥20s）窗口内
   // 反复发起 gatt.connect()（每次失败后固定等 CONNECT_RETRY_DELAY_MS 再试），直到连上或窗口耗尽。
-  // 成功返回 { service, characteristic }；返回 null 表示窗口内未连上，或本次尝试已被新的连接/断开流程
-  // 取代（token 失效）——后者交由接管方处理状态，调用方不应再 emit。
-  private async connectGatt(token: number): Promise<{ service: BTService; characteristic: BTCharacteristic } | null> {
+  // 成功返回 { server, service, characteristic }；返回 null 表示窗口内未连上，或本次尝试已被新的连接/断开
+  // 流程取代（token 失效）——后者交由接管方处理状态，调用方不应再 emit。
+  private async connectGatt(token: number): Promise<{ server: BTGattServer; service: BTService; characteristic: BTCharacteristic } | null> {
     const deadline = Date.now() + CONNECT_RETRY_WINDOW_MS;
     let attempt = 0;
     for (;;) {
@@ -323,26 +404,35 @@ export class EpdBleClient {
           : `正在连接: ${this.bleDevice.name}（第 ${attempt} 次）`);
         // 给 gatt.connect() 套时间上限：正常几毫秒~几秒内返回；若蓝牙栈把这次连接「挂起」永不返回，
         // 到点抛超时错误，落入下面的 catch 走重试，而不是让 UI 永远卡在「正在连接」。
-        this.gattServer = await withTimeout(
+        const server = await withTimeout(
           this.bleDevice.gatt.connect(),
           CONNECT_ATTEMPT_TIMEOUT_MS,
           `连接超时（${(CONNECT_ATTEMPT_TIMEOUT_MS / 1000).toFixed(0)}s 内未建立 GATT 连接）`,
         );
+        // 每个 await 成功后都复核令牌：await 期间本流程可能已被新连接/断开取代，
+        // 旧流程若继续走完初始化，会重复挂监听、把 characteristic 指向错误设备
+        if (this.abortIfStale(token, server)) return null;
+        this.gattServer = server;
         this.log('  找到 GATT Server');
-        const service = await this.gattServer.getPrimaryService(EPD_SERVICE_UUID);
+        const service = await server.getPrimaryService(EPD_SERVICE_UUID);
+        if (this.abortIfStale(token, server)) return null;
         this.log('  找到 EPD Service');
         const characteristic = await service.getCharacteristic(EPD_CHARACTERISTIC_UUID);
+        if (this.abortIfStale(token, server)) return null;
         this.epdCharacteristic = characteristic;
         this.log('  找到 Characteristic');
-        return { service, characteristic };
+        return { server, service, characteristic };
       } catch (e) {
         console.error(e);
         if ((e as Error).message) this.log('connect: ' + (e as Error).message);
-        // 清理本次半连接状态（下一轮 gatt.connect 幂等重建）。这里不主动 disconnect：本次 gatt.connect()
+        // 清理本次半连接状态（下一轮 gatt.connect 幂等重建）。仅令牌仍有效时才清：被新流程取代后
+        // 这两个字段可能已属于新流程，不能误清。这里不主动 disconnect：本次 gatt.connect()
         // 直接 reject 时 gatt.connected 仍为 false，按 Web Bluetooth 规范 disconnect() 会直接返回（no-op），
         // 既无法关闭底层那条失败连接，反而会在「半连上」时误触发 gattserverdisconnected 复位状态机。
-        this.gattServer = null;
-        this.epdCharacteristic = null;
+        if (token === this.connectToken) {
+          this.gattServer = null;
+          this.epdCharacteristic = null;
+        }
         // 窗口已用尽 / 被新流程取代 → 跳出去判失败
         if (Date.now() >= deadline || token !== this.connectToken) break;
         const remainSec = Math.ceil((deadline - Date.now()) / 1000);
@@ -370,7 +460,7 @@ export class EpdBleClient {
       if (token === this.connectToken) this.handleDisconnected();
       return;
     }
-    const { service: epdService, characteristic: epdCharacteristic } = gatt;
+    const { server, service: epdService, characteristic: epdCharacteristic } = gatt;
 
     try {
       const versionCharacteristic = await epdService.getCharacteristic(EPD_VERSION_CHARACTERISTIC_UUID);
@@ -381,6 +471,7 @@ export class EpdBleClient {
       console.error(e);
       this.appVersion = 0x15;
     }
+    if (this.abortIfStale(token, server)) return;
 
     if (this.appVersion < 0x16) {
       this.events.onLowFirmware(this.appVersion, OLD_DASHBOARD_URL);
@@ -391,16 +482,18 @@ export class EpdBleClient {
 
     try {
       await epdCharacteristic.startNotifications();
-      epdCharacteristic.addEventListener('characteristicvaluechanged', (event) => {
-        const target = event.target as unknown as { value: DataView };
-        this.handleNotify(target.value, this.msgIndex++);
-      });
     } catch (e) {
       console.error(e);
       if ((e as Error).message) this.log('startNotifications: ' + (e as Error).message);
     }
+    if (this.abortIfStale(token, server)) return;
+    // 先摘再挂（onNotify 是具名引用）：同一 characteristic 被重复初始化时不会叠挂监听器，
+    // 否则每条通知会被处理多次、msgIndex 双倍自增导致配置帧被当普通文本解码
+    epdCharacteristic.removeEventListener('characteristicvaluechanged', this.onNotify);
+    epdCharacteristic.addEventListener('characteristicvaluechanged', this.onNotify);
 
     await this.write(EpdCmd.INIT);
+    if (this.abortIfStale(token, server)) return;
     this.emitConnectionChange();
   }
 }

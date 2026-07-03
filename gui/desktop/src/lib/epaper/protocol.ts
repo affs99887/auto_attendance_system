@@ -107,7 +107,10 @@ export const epdDrivers: EpdDriver[] = [
   { value: '0b', label: '7.5寸HD (三色, SSD1677)', color: 'threeColor', size: '7.5_880_528' },
 ];
 
-export function hex2bytes(hex: string): Uint8Array {
+// 严格解析 16 进制字符串：含非 hex 字符或长度为奇数时返回 null，由调用方负责提示。
+// 不校验的话 parseInt 会得到 NaN，塞进 Uint8Array 被静默转成 0x00 下发到设备（可能变成危险指令）。
+export function hex2bytes(hex: string): Uint8Array | null {
+  if (hex.length % 2 !== 0 || !/^[0-9a-fA-F]*$/.test(hex)) return null;
   const bytes: number[] = [];
   for (let c = 0; c < hex.length; c += 2) {
     bytes.push(parseInt(hex.substr(c, 2), 16));
@@ -240,11 +243,10 @@ export const DEFAULT_HOLIDAYS_2026 = `1-1-0
 6-19-0
 6-20-0
 6-21-0
-9-25-1
+9-20-1
+9-25-0
 9-26-0
 9-27-0
-9-28-0
-9-20-1
 10-1-0
 10-2-0
 10-3-0

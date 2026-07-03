@@ -75,6 +75,17 @@ const HEADER_BORDER_Y = 28;   // 刊头底边（2px）
 const STRIP_BORDER_Y = 112;   // 额度条底边（2px，状态 A/B）
 const BODY_TOP = 114;
 
+// 状态 A 列分界与备忘录列几何。drawMemo（真实绘制）和 estimateVisibleMemoCount（UI 估算）
+// 都从这套常量取值，保证"哪些条目能上屏"两处算出来完全一致
+const BODY_SPLIT = 182;             // 备忘录列 | 日历列分界（2px 竖线 x，0.92fr/1.08fr）
+const MEMO_X0 = 9;                  // 备忘录列左边界（勾选框 x）
+const MEMO_X1 = BODY_SPLIT - 9;     // 备忘录列右边界
+const MEMO_TEXT_X = MEMO_X0 + 20;   // 文本起点（勾选框右侧）
+const MEMO_LINE_H = 16;             // 行高
+const MEMO_LIST_TOP = 137;          // 列表区上界
+const MEMO_LIST_BOT = 293;          // 列表区下界
+const MEMO_FONT = `600 12px ${SANS}`;
+
 // ===== Clawd 图（模块级缓存加载）=====
 
 let clawdImage: HTMLImageElement | null = null;
@@ -441,16 +452,15 @@ function drawWeekStrip(
 // ===== 状态 A · 备忘录 | 日历 =====
 
 function drawBodyA(ctx: CanvasRenderingContext2D, data: StationData, todayIso: string) {
-  // 列分界（0.92fr / 1.08fr → 备忘录列 184 含 2px 竖线）
-  const split = 182;
+  // 列分界竖线（备忘录列几何常量见 BODY_SPLIT / MEMO_* 定义处）
   ctx.fillStyle = INK;
-  ctx.fillRect(split, BODY_TOP, 2, DH - BODY_TOP);
+  ctx.fillRect(BODY_SPLIT, BODY_TOP, 2, DH - BODY_TOP);
 
-  drawMemo(ctx, data, 9, split - 9);
+  drawMemo(ctx, data);
 
   // --- 日历列 ---
   const cal = data.calendar;
-  const x0 = split + 12;
+  const x0 = BODY_SPLIT + 12;
   const x1 = 390;
   const headBase = 131;
 
@@ -613,73 +623,107 @@ function drawNearestHoliday(
 
 // ===== 备忘录（状态 A）=====
 
-function drawMemo(ctx: CanvasRenderingContext2D, data: StationData, x0: number, x1: number) {
+// emoji 整段匹配：单个 emoji、肤色修饰、变体选择符（FE0F）、ZWJ 组合（家庭/职业等）、国旗对。
+// 墨水屏只有黑白红三色，浅色 emoji 主体会被量化成白色（屏上近乎不可见），
+// 逐码点断行还会把 ZWJ 组合从中间拆散，所以绘制前统一替换为占位符「◻」
+const EMOJI_RE = /\p{Regional_Indicator}\p{Regional_Indicator}|\p{Extended_Pictographic}(?:\p{Emoji_Modifier}|\uFE0F|\u200D\p{Extended_Pictographic})*/gu;
+
+function sanitizeMemoText(text: string): string {
+  return text.replace(EMOJI_RE, '◻');
+}
+
+/** 备忘录筛选与断行（drawMemo 与 estimateVisibleMemoCount 共用，保证"哪些条目上屏"口径一致）：
+ * 取前 STATION_MEMO_MAX 条 → emoji 换占位符 → 按列宽逐字断行 →
+ * 单条行数超过区域上限时截到最后一行加省略号（防止超长单条画穿列表区下界）→
+ * 总高度仍超出时从尾部丢弃整项（绝不画半截条目） */
+function layoutMemoItems(ctx: CanvasRenderingContext2D, memos: StationMemoItem[]) {
+  ctx.font = MEMO_FONT; // 先设字体再量宽
+  const maxW = MEMO_X1 - MEMO_TEXT_X;
+  const areaH = MEMO_LIST_BOT - MEMO_LIST_TOP;
+  const maxLines = Math.max(1, Math.floor(areaH / MEMO_LINE_H)); // 单条行数上限 = 整个区域能装下的整行数
+  const items = memos.slice(0, STATION_MEMO_MAX).map(m => {
+    const lines = wrapText(ctx, sanitizeMemoText(m.text), maxW);
+    if (lines.length > maxLines) {
+      lines.length = maxLines;
+      lines[maxLines - 1] = fitText(ctx, lines[maxLines - 1] + '…', maxW);
+    }
+    return { m, lines };
+  });
+  // 换行后总高可能超出列表区：从尾部丢弃整项，表头计数仍示全量
+  const contentH = (arr: typeof items) => arr.reduce((h, it) => h + it.lines.length * MEMO_LINE_H, 0);
+  while (items.length > 1 && contentH(items) > areaH) items.pop();
+  return items;
+}
+
+// 估算专用离屏画布上下文（懒建缓存）：估算发生在 UI 里、手上没有推屏画布，
+// measureText 结果只取决于字体不受画布尺寸影响，与 drawMemo 量宽一致
+let memoMeasureCtx: CanvasRenderingContext2D | null = null;
+
+/** 实际可上屏的备忘录条数（与 drawMemo 同一套筛选逻辑，供 UI 判断哪些条目在屏外） */
+export function estimateVisibleMemoCount(memos: StationMemoItem[]): number {
+  if (!memoMeasureCtx) memoMeasureCtx = document.createElement('canvas').getContext('2d');
+  if (!memoMeasureCtx) return Math.min(memos.length, STATION_MEMO_MAX); // 拿不到 2d 上下文时退回固定上限
+  return layoutMemoItems(memoMeasureCtx, memos).length;
+}
+
+function drawMemo(ctx: CanvasRenderingContext2D, data: StationData) {
   const headBase = 131;
-  const listTop = 137;
-  const listBot = 293;
 
   const doneCount = data.memos.filter(m => m.done).length;
 
   ctx.textAlign = 'left';
   ctx.fillStyle = INK;
   ctx.font = `700 13px ${SANS}`;
-  ctx.fillText('备忘录', x0, headBase);
+  ctx.fillText('备忘录', MEMO_X0, headBase);
   ctx.textAlign = 'right';
   ctx.font = `700 12px ${MONO}`;
-  ctx.fillText(`${doneCount}/${data.memos.length}`, x1, headBase);
+  ctx.fillText(`${doneCount}/${data.memos.length}`, MEMO_X1, headBase);
   ctx.textAlign = 'left';
 
-  // 长文本不加省略号，按列宽换行展示
-  const tx = x0 + 20;
-  const lineH = 16;
-  const areaH = listBot - listTop;
-  ctx.font = `600 12px ${SANS}`; // 先设字体再量宽
-  const items = data.memos.slice(0, STATION_MEMO_MAX)
-    .map(m => ({ m, lines: wrapText(ctx, m.text, x1 - tx) }));
-
-  // 换行后可能超出列表区：从尾部丢弃整项（绝不画半截内容），表头计数仍示全量
-  const contentH = (arr: typeof items) => arr.reduce((h, it) => h + it.lines.length * lineH, 0);
-  while (items.length > 1 && contentH(items) > areaH) items.pop();
+  // 长文本按列宽换行展示（筛选/截断逻辑见 layoutMemoItems）
+  const items = layoutMemoItems(ctx, data.memos);
+  const areaH = MEMO_LIST_BOT - MEMO_LIST_TOP;
+  const usedH = items.reduce((h, it) => h + it.lines.length * MEMO_LINE_H, 0);
 
   // 均匀分布（设计稿 space-between）：剩余空间均分为每项上下留白，
   // 全单行时与旧版等分槽位的基线完全一致
-  const pad = Math.max(0, (areaH - contentH(items)) / items.length / 2);
-  let y = listTop;
+  const pad = Math.max(0, (areaH - usedH) / items.length / 2);
+  let y = MEMO_LIST_TOP;
   items.forEach(({ m, lines }) => {
-    const c0 = y + pad + lineH / 2; // 首行中线（勾选框对齐首行）
+    const c0 = y + pad + MEMO_LINE_H / 2; // 首行中线（勾选框对齐首行）
     const boxY = Math.round(c0 - 7);
 
     if (m.done) {
       // 实心方形勾选框 + 白勾
       ctx.fillStyle = INK;
-      ctx.fillRect(x0, boxY, 14, 14);
+      ctx.fillRect(MEMO_X0, boxY, 14, 14);
       ctx.strokeStyle = PAPER;
       ctx.lineWidth = 2.2;
       ctx.lineCap = 'round';
       ctx.lineJoin = 'round';
       ctx.beginPath();
-      ctx.moveTo(x0 + 3.2, boxY + 7.4);
-      ctx.lineTo(x0 + 5.8, boxY + 10);
-      ctx.lineTo(x0 + 10.8, boxY + 3.9);
+      ctx.moveTo(MEMO_X0 + 3.2, boxY + 7.4);
+      ctx.lineTo(MEMO_X0 + 5.8, boxY + 10);
+      ctx.lineTo(MEMO_X0 + 10.8, boxY + 3.9);
       ctx.stroke();
     } else {
       ctx.strokeStyle = INK;
       ctx.lineWidth = 2;
-      ctx.strokeRect(x0 + 1, boxY + 1, 12, 12);
+      ctx.strokeRect(MEMO_X0 + 1, boxY + 1, 12, 12);
     }
 
     // 文本逐行绘制（完成项每行划删除线）
     ctx.fillStyle = INK;
-    ctx.font = `600 12px ${SANS}`;
+    ctx.font = MEMO_FONT;
     lines.forEach((line, k) => {
-      const cy = c0 + lineH * k;
-      ctx.fillText(line, tx, cy + 4);
+      const cy = c0 + MEMO_LINE_H * k;
+      ctx.fillText(line, MEMO_TEXT_X, cy + 4);
       if (m.done) {
-        ctx.fillRect(tx - 1, cy - 1, ctx.measureText(line).width + 2, 2);
+        ctx.fillRect(MEMO_TEXT_X - 1, cy - 1, ctx.measureText(line).width + 2, 2);
       }
     });
 
-    y = c0 - lineH / 2 + lines.length * lineH + pad;
+    y = c0 - MEMO_LINE_H / 2 + lines.length * MEMO_LINE_H + pad;
   });
 }
 

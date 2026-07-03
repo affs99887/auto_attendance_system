@@ -12,6 +12,8 @@
 - 可选 after 参数：返回该日期之后的第一个工作日（「请假中」状态的销假日计算）
 
 所有计算 try/except 包裹：chinese_calendar 不含目标年份数据时回退「仅按双休」，绝不外抛。
+契约里的 coverage_end 是数据覆盖的最后一天（降级信号）：超出这天的日期都是按双休
+估算的，法定假日/调休不可见，前端可据此提示。
 
 对外暴露：
 - get_calendar_info() -> 契约 dict（以服务器当天为基准，返回当月数据）
@@ -35,6 +37,22 @@ _HOLIDAY_NAMES_CN = {
 
 # 向后扫描的最大天数（覆盖跨年节假日与调休）
 _SCAN_DAYS = 400
+
+# 已提示过的覆盖边界（同一边界只 warning 一次，避免每次请求都刷日志）
+_warned_coverage = set()
+
+
+def _coverage_end():
+    """chinese_calendar 数据覆盖的最后一天。
+
+    该库按整年收录节假日数据，所以覆盖到「最大年份的 12-31」；
+    取不到（未安装/包结构变化）时返回 None。
+    """
+    try:
+        import chinese_calendar as cc
+        return datetime.date(max(cc.holidays.keys()).year, 12, 31)
+    except Exception:
+        return None
 
 
 def _is_off(day):
@@ -116,11 +134,23 @@ def get_calendar_info(after=None):
             'next_holidays': [],
             'next_makeup': [],
             'workday_after': None,
+            'coverage_end': None,
         }
 
 
 def _build(today, after=None):
     year, month = today.year, today.month
+
+    # ---- 数据覆盖边界（降级信号）：扫描区间超出这天后 _is_off 只按双休估算 ----
+    coverage_end = _coverage_end()
+    if coverage_end is not None and today + datetime.timedelta(days=_SCAN_DAYS) > coverage_end:
+        if coverage_end not in _warned_coverage:
+            _warned_coverage.add(coverage_end)
+            logger.warning(
+                '[日历] chinese_calendar 数据只覆盖到 %s，之后的日期仅按双休估算'
+                '（法定假日/调休不可见），请升级 chinese_calendar',
+                coverage_end.isoformat(),
+            )
 
     # ---- 当月每日标记 ----
     days = []
@@ -180,11 +210,15 @@ def _build(today, after=None):
     while scanned < _SCAN_DAYS and len(next_holidays) < 2:
         name = _holiday_name(d)
         if name:
-            # 向后吃完整个法定假日连续段，收集段内出现过的假期名（保持出现顺序去重）
-            names = []
+            # 今天可能已在假期中段：先向前回溯到该法定段的真实首日，
+            # 否则 start/连休天数会错报成「从今天起」
             first = d
-            last = d
-            cur = d
+            while _holiday_name(first - datetime.timedelta(days=1)):
+                first -= datetime.timedelta(days=1)
+            # 从首日向后吃完整个法定假日连续段，按出现顺序收集段内假期名（去重）
+            names = []
+            last = first
+            cur = first
             while True:
                 n = _holiday_name(cur)
                 if not n:
@@ -200,7 +234,8 @@ def _build(today, after=None):
                 'name': label,
                 'start': first.isoformat(),
                 'end': last.isoformat(),
-                'days_until': (first - today).days,
+                # 进行中的假期（首日在今天之前）钳为 0，不给负数
+                'days_until': max(0, (first - today).days),
             })
             d = last + datetime.timedelta(days=1)
         else:
@@ -236,4 +271,5 @@ def _build(today, after=None):
         'next_holidays': next_holidays,
         'next_makeup': next_makeup,
         'workday_after': workday_after,
+        'coverage_end': coverage_end.isoformat() if coverage_end else None,
     }

@@ -54,6 +54,16 @@ _VALID_CATEGORIES = {'ai-models', 'ai-products', 'industry', 'paper', 'tip'}
 # 缓存读写互斥（参考 record_manager 的 _lock）
 _lock = threading.Lock()
 
+# 失败冷却：按视图 key 记录最近一次首屏拉取的发起时刻（无论成败，_lock 保护）。
+# 上游不可达时拉取必败、fetched 不会更新，TTL 判定永远 miss——若不设冷却，
+# 每个首屏请求都会同步硬扛 10-20 秒网络超时。冷却期内直接回旧缓存不打网络。
+_last_attempt = {}
+_FAIL_COOLDOWN_SECONDS = 90
+
+# single-flight：正在拉取中的视图 key 集合（_lock 保护）。同视图并发 TTL-miss 时
+# 只放一个线程真正打上游，后来者直接返回旧缓存（不等待），避免重复请求上游。
+_inflight = set()
+
 
 def _proxies():
     """内置加速启用且本地端口在监听时走本地代理，否则直连。
@@ -114,11 +124,19 @@ def _set_bucket(cache, mode, category, bucket):
 
 
 def _save_cache(cache):
-    """写入缓存文件（失败仅记日志，不抛）。"""
+    """写入缓存文件（失败仅记日志，不抛）。
+
+    先写同目录 .tmp 再 os.replace 原子替换（与 config._save_dynamic_config 同款写法）：
+    避免写到一半进程被杀留下截断 JSON，导致下次加载失败、全部视图缓存一次性作废。
+    """
     path = _cache_path()
     try:
-        with open(path, 'w', encoding='utf-8') as f:
+        tmp_path = f"{path}.tmp"
+        with open(tmp_path, 'w', encoding='utf-8') as f:
             json.dump(cache, f, ensure_ascii=False, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_path, path)
     except Exception:
         logger.warning('[AI资讯] 写入缓存失败', exc_info=True)
 
@@ -127,13 +145,10 @@ def _normalize_item(raw):
     """把 API 原始 item 归一化为统一结构 dict。
 
     必有字段 id/title/url/source；可选 title_en/summary/publishedAt/category/selected。
-    category 取值应为 ai-models|ai-products|industry|paper|tip 之一，否则原样保留或 None。
+    category 正常取值为 _VALID_CATEGORIES 之一；上游偶发的非法取值原样透传、由前端兜底展示。
+    请求参数侧的 category 白名单校验在 web_server 路由层做（复用 _VALID_CATEGORIES）。
     selected=True 表示该条是上游主编精选（前端据此打「精选」标）。
     """
-    category = raw.get('category')
-    if category is not None and category not in _VALID_CATEGORIES:
-        # 非合法取值原样保留（前端兜底处理）
-        category = category
     return {
         'id': raw.get('id'),
         'title': raw.get('title'),
@@ -142,7 +157,7 @@ def _normalize_item(raw):
         'source': raw.get('source'),
         'publishedAt': raw.get('publishedAt'),
         'summary': raw.get('summary'),
-        'category': category,
+        'category': raw.get('category'),
         'selected': bool(raw.get('selected')),
     }
 
@@ -216,33 +231,50 @@ def refresh(category=None, mode=None):
     彻底无数据时 updated_at:null、count:0、items:[]、has_next:false。
     """
     mode = mode or _MODE
-    # 网络请求挪到锁外执行：_fetch_from_aihot 只做网络拉取+解析，不触碰共享缓存，
-    # 因此最长 ~20s 的慢网络不会持锁阻塞 get_ai_news 的 TTL 快速读路径，
-    # 避免 waitress 工作线程被一并卡死（M66，与 exchange_rate_service 同款改造）。
-    items, next_cursor, has_next = _fetch_from_aihot(category=category, mode=mode)
-
+    key = _bucket_key(mode, category)
     with _lock:
-        cache = _load_cache()
+        if key in _inflight:
+            # single-flight：同视图已有拉取在途，后来者直接回旧缓存（不等待），
+            # 避免对上游重复发起相同拉取、多占一个 waitress 线程陪跑网络超时
+            return _build_contract(_get_bucket(_load_cache(), mode, category))
+        _inflight.add(key)
+        # 无论本次成败都记发起时刻，供 get_ai_news 的失败冷却判定
+        _last_attempt[key] = time.time()
 
-        if items is None:
-            # 本次彻底失败：回退该视图旧缓存
-            logger.warning('[AI资讯] 刷新失败，回退旧缓存 view=%s', _bucket_key(mode, category))
-            return _build_contract(_get_bucket(cache, mode, category))
+    try:
+        # 网络请求挪到锁外执行：_fetch_from_aihot 只做网络拉取+解析，不触碰共享缓存，
+        # 因此最长 ~20s 的慢网络不会持锁阻塞 get_ai_news 的 TTL 快速读路径，
+        # 避免 waitress 工作线程被一并卡死（M66，与 exchange_rate_service 同款改造）。
+        items, next_cursor, has_next = _fetch_from_aihot(category=category, mode=mode)
 
-        # 写入/更新该视图缓存（含首屏游标，作为"加载更多"续拉起点）
-        bucket = {
-            'updated_at': int(time.time()),
-            'items': items,
-            'fetched': int(time.time()),
-            'next_cursor': next_cursor,
-            'has_next': bool(has_next),
-        }
-        _set_bucket(cache, mode, category, bucket)
+        with _lock:
+            cache = _load_cache()
 
-        _save_cache(cache)
-        logger.info('[AI资讯] 刷新成功 view=%s 条数=%d has_next=%s',
-                    _bucket_key(mode, category), len(items), has_next)
-        return _build_contract(bucket)
+            if items is None:
+                # 本次彻底失败：回退该视图旧缓存（冷却期内首屏不会再打网络）
+                logger.warning('[AI资讯] 刷新失败，回退旧缓存 view=%s', key)
+                return _build_contract(_get_bucket(cache, mode, category))
+
+            # 写入/更新该视图缓存（含首屏游标，作为"加载更多"续拉起点）
+            bucket = {
+                'updated_at': int(time.time()),
+                'items': items,
+                'fetched': int(time.time()),
+                'next_cursor': next_cursor,
+                'has_next': bool(has_next),
+            }
+            _set_bucket(cache, mode, category, bucket)
+
+            _save_cache(cache)
+            # 一次成功即证明上游可达：清掉全部视图的失败冷却，
+            # 让 WS 推送触发的其他视图重拉立即回源，而不是被冷却挡回空缓存
+            _last_attempt.clear()
+            logger.info('[AI资讯] 刷新成功 view=%s 条数=%d has_next=%s',
+                        key, len(items), has_next)
+            return _build_contract(bucket)
+    finally:
+        with _lock:
+            _inflight.discard(key)
 
 
 def get_ai_news(force=False, cursor=None, take=None, category=None, mode=None):
@@ -250,11 +282,14 @@ def get_ai_news(force=False, cursor=None, take=None, category=None, mode=None):
 
     - mode 缺省 _MODE(all 全量)，'selected' 时仅主编精选（"只看精选"筛选）。
     - category 非空：按版块服务端过滤（可与 mode 组合，各视图独立一份列表/游标/缓存）。
+    - take 仅对 cursor 续拉生效；首屏固定拉 _PAGE_TAKE(30) 条，传了 take 也会被忽略
+      （首屏结果要进各视图共享缓存，条数必须统一，不能按调用方任意变化）。
     - cursor 非空（"加载更多"续拉）：实时拉取该页（沿用同视图 mode+category），不读写缓存；
       本次拉取失败时抛 RuntimeError，由 HTTP 层转成错误响应（前端可重试，不伪装成到底）。
     - cursor 为空（首屏）：
         - force=True：跳过 TTL 立即拉取。
-        - force=False：该视图缓存在 TTL(≈600s) 内则直接复用，否则惰性刷新。
+        - force=False：该视图缓存在 TTL(≈600s) 内则直接复用，否则惰性刷新；
+          刚拉取失败过（冷却期 _FAIL_COOLDOWN_SECONDS 内）也直接回旧缓存，不再打网络。
         - 任何失败均回退该视图旧缓存；彻底无数据时 updated_at:null、count:0、items:[]。
     """
     mode = mode or _MODE
@@ -273,12 +308,19 @@ def get_ai_news(force=False, cursor=None, take=None, category=None, mode=None):
         }
 
     if not force:
-        # 惰性判断：在锁外读一次缓存，该视图命中 TTL 直接返回，避免无谓网络请求
+        # 惰性判断：短暂持锁只读一次缓存（不发网络请求），该视图命中 TTL 直接返回
         with _lock:
             cache = _load_cache()
+            last_attempt = _last_attempt.get(_bucket_key(mode, category), 0)
         bucket = _get_bucket(cache, mode, category)
         fetched = bucket.get('fetched')
-        if fetched and (time.time() - fetched) < _TTL_SECONDS:
+        now = time.time()
+        if fetched and (now - fetched) < _TTL_SECONDS:
+            return _build_contract(bucket)
+        # 失败冷却：TTL 未命中但刚发起过拉取（成功会更新 fetched 走上面的 TTL 分支，
+        # 走到这里说明那次多半失败了）——冷却期内直接回旧缓存，
+        # 避免上游不可达时每个首屏请求都同步硬扛 10-20 秒网络超时
+        if last_attempt and (now - last_attempt) < _FAIL_COOLDOWN_SECONDS:
             return _build_contract(bucket)
 
     # 未命中 TTL 或强制刷新

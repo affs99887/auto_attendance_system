@@ -168,21 +168,44 @@ export function useBackendBootstrap() {
       void useExchangeRateStore.getState().refresh();
     }, FX_REFRESH_INTERVAL_MS);
 
+    // AI 资讯自动补刷：遍历"尝试过至少一次"的视图——拉成功过（lastFetched 非空）或
+    // 失败留有 error 的都算；失败视图不纳入的话，冷启动首拉失败后 WS 推送/轮询都救不回它。
+    // 从未碰过的视图跳过；用户已"加载更多"的跳过（避免缩回首屏丢滚动位置）。
+    // 串行逐个刷：除缺省视图外多数会过后端 600 秒 TTL 真回源一次，并发发出去会
+    // 同时占满后端工作线程；串行一次只占一个，上游故障时不拖慢打卡等其他接口。
+    let aiNewsSweeping = false;
+    const refreshAiNewsViews = () => {
+      if (aiNewsSweeping) return;
+      aiNewsSweeping = true;
+      void (async () => {
+        try {
+          const keys = Object.entries(useAiNewsStore.getState().cats)
+            .filter(([, st]) => (st.lastFetched !== null || st.error !== null) && !st.loadedMore)
+            .map(([key]) => key);
+          for (const key of keys) {
+            const st = useAiNewsStore.getState().cats[key];
+            if (!st || st.loading || st.loadedMore) continue;
+            await useAiNewsStore.getState().refresh(key);
+          }
+        } finally {
+          aiNewsSweeping = false;
+        }
+      })();
+    };
+
     // AI 资讯 15 分钟轮询（与上述轮询同期生命周期，cleanup 一并清理）；
-    // 用户已"加载更多"时跳过，避免把列表缩回首屏 / 丢失滚动位置
-    const aiNewsTimer = window.setInterval(() => {
-      useAiNewsStore.getState().refreshIfPristine();
-    }, AI_NEWS_REFRESH_INTERVAL_MS);
+    // 用户已"加载更多"的视图跳过，避免把列表缩回首屏 / 丢失滚动位置
+    const aiNewsTimer = window.setInterval(refreshAiNewsViews, AI_NEWS_REFRESH_INTERVAL_MS);
 
     const onVisible = () => {
       if (document.visibilityState === 'visible') {
         void useExchangeRateStore.getState().refresh();
-        useAiNewsStore.getState().refreshIfPristine();
+        refreshAiNewsViews();
       }
     };
     const onFocus = () => {
       void useExchangeRateStore.getState().refresh();
-      useAiNewsStore.getState().refreshIfPristine();
+      refreshAiNewsViews();
     };
     document.addEventListener('visibilitychange', onVisible);
     window.addEventListener('focus', onFocus);
@@ -243,10 +266,10 @@ export function useBackendBootstrap() {
       }
     }));
 
-    // AI 资讯更新推送：触发重拉（force 默认 false，命中后端 TTL 直接拿新缓存，不重复打外网）；
-    // 用户已"加载更多"时跳过，避免打断深度浏览
+    // AI 资讯更新推送：重拉所有尝试过的视图。后端定时任务只刷新缺省桶，
+    // 缺省视图能命中新缓存，其余视图过了 TTL 会各自回源一次（refreshAiNewsViews 已做串行限流）
     unsubs.push(wsClient.subscribe('ai_news:update', () => {
-      useAiNewsStore.getState().refreshIfPristine();
+      refreshAiNewsViews();
     }));
 
     return () => {

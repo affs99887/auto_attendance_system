@@ -651,8 +651,9 @@ def _build_flask_app(attendance_system, bridge: AsyncioBridge,
         query:
           - force=0|1（1 跳过 TTL 立即拉，仅首屏有效）；
           - cursor=<base64>（"加载更多"游标续拉，实时拉不走缓存）；
-          - take=N（每页条数，1..100）；
-          - category=ai-models|ai-products|industry|paper|tip（按版块服务端过滤，缺省或 all 即"全部"）；
+          - take=N（每页条数，1..100；仅对带 cursor 的续拉生效，首屏固定 30 条、传了也会被忽略）；
+          - category=ai-models|ai-products|industry|paper|tip（按版块服务端过滤，
+            缺省 / all / 非法值均按"全部"处理）；
           - mode=all|selected（selected 只取主编精选"只看精选"，缺省全量；可与 category 组合，
             各视图独立一份列表/游标/缓存）。
         首屏失败返回 200 + 旧缓存；加载更多(带 cursor)失败返回 502，便于前端重试而非误判到底。
@@ -662,6 +663,12 @@ def _build_flask_app(attendance_system, bridge: AsyncioBridge,
         category = request.args.get('category') or None
         if category == 'all':
             category = None
+        if category is not None:
+            # 白名单校验（与服务层清单同源）：非法版块当"全部"处理，
+            # 避免任意字符串透传上游、并在缓存文件里为每个非法值堆出一个新 bucket
+            from modules.ai_news_service import _VALID_CATEGORIES
+            if category not in _VALID_CATEGORIES:
+                category = None
         mode = request.args.get('mode') or None
         if mode not in ('all', 'selected'):
             mode = None  # 非法/缺省 → 交由服务层用默认口径(all)
@@ -723,7 +730,7 @@ def _build_flask_app(attendance_system, bridge: AsyncioBridge,
                 'available': False, 'today': _t.isoformat(),
                 'year': _t.year, 'month': _t.month, 'days': [], 'week': [],
                 'nearest_rest': None, 'next_holidays': [], 'next_makeup': [],
-                'workday_after': None,
+                'workday_after': None, 'coverage_end': None,
             })
 
     # ----- Auto byebye -----

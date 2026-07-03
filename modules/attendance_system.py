@@ -141,6 +141,12 @@ class AttendanceSystem:
         # 设置每日状态推送时间
         self.daily_status_time = config.DAILY_STATUS_TIME  # 每日状态推送时间
 
+        # GUI 后端事件总线占位。仅在 main.py --gui 模式下由 web_server.start() 注入；
+        # 默认 None，对纯 bot 部署 send_notification 等代码无任何影响。
+        # 必须赋值在 init_schedule_tasks() 之前：里面起的首刷后台线程会读 self._event_bus，
+        # 快网络下可能赶在 __init__ 走完之前访问。
+        self._event_bus = None
+
         # 初始化定时任务
         self.init_schedule_tasks()
 
@@ -188,10 +194,6 @@ class AttendanceSystem:
 
         # 安装进程退出钩子（atexit + SIGINT/SIGTERM），无论怎样退出都尽力清掉活跃 driver
         self._install_exit_handlers()
-
-        # GUI 后端事件总线占位。仅在 main.py --gui 模式下由 web_server.start() 注入；
-        # 默认 None，对纯 bot 部署 send_notification 等代码无任何影响。
-        self._event_bus = None
 
         # 初始化完成，取消静默模式
         self._silent_init = False
@@ -1902,10 +1904,15 @@ class AttendanceSystem:
             try:
                 from modules.ai_news_service import refresh as _refresh_news
                 loop = asyncio.get_running_loop()
+                started = int(time.time())
                 contract = await loop.run_in_executor(None, _refresh_news)
-                if self._event_bus is not None:
+                # 成功守卫（与 exchange_rate_job 同口径）：refresh 失败时返回的是旧缓存契约
+                # （updated_at 是旧值或 None），只有 updated_at >= 本轮发起时刻才说明真拉到了新数据；
+                # 失败也推送只会诱使前端再发一次必败请求陪跑 loading
+                updated_at = (contract or {}).get('updated_at')
+                if updated_at and updated_at >= started and self._event_bus is not None:
                     self._event_bus.publish_threadsafe('ai_news:update', {
-                        'updated_at': (contract or {}).get('updated_at'),
+                        'updated_at': updated_at,
                         'count': (contract or {}).get('count'),
                     })
             except Exception as e:
@@ -2119,7 +2126,23 @@ class AttendanceSystem:
             try:
                 _wait_proxy_usable()
                 from modules.ai_news_service import refresh as _refresh_news
-                _refresh_news()
+                started = int(time.time())
+                contract = _refresh_news()
+                updated_at = (contract or {}).get('updated_at')
+                # 首刷可能撞上前端在途的必败请求：refresh 的 single-flight 会直接回旧缓存，
+                # updated_at 没前进。首刷是一次性的，这里等几秒再补试一次，别让补发落空。
+                if not (updated_at and updated_at >= started):
+                    time.sleep(5)
+                    contract = _refresh_news()
+                    updated_at = (contract or {}).get('updated_at')
+                # 首刷成功后补一次 WS 推送（payload 与 ai_news_job 一致）：冷启动时前端首拉
+                # 若发生在代理就绪前会拿到空数据、记为失败态，不推送就只能等前端轮询兜底
+                # （最长约 15 分钟）。守卫口径同 ai_news_job：只有 updated_at 为本轮新写入才推。
+                if updated_at and updated_at >= started and self._event_bus is not None:
+                    self._event_bus.publish_threadsafe('ai_news:update', {
+                        'updated_at': updated_at,
+                        'count': (contract or {}).get('count'),
+                    })
             except Exception as e:
                 logging.error(f"启动 AI 资讯首刷失败（忽略）: {str(e)}")
         try:

@@ -35,7 +35,9 @@ export class CropManager {
     this.handleTouchMove = this.handleTouchMove.bind(this);
   }
 
-  private resetStates() {
+  // 重置缩放/平移等裁剪变换。除进裁剪模式时内部调用外，换新图直绘时也需由外部调用：
+  // 上一张图裁剪残留的 zoom/pan 套到新图上会截出错误局部
+  resetStates() {
     this.backgroundZoom = 1;
     this.backgroundPanX = 0;
     this.backgroundPanY = 0;
@@ -118,7 +120,12 @@ export class CropManager {
   // 把当前缩放/平移下的可视区域绘制到画布并退出裁剪模式
   finishCrop(callback?: () => void) {
     const imageFile = this.host.getImageFile();
-    if (!imageFile) return;
+    // 无图片文件（纯手绘或图片已清除）：不重画背景，但 callback（抖动流水线）必须照常执行，
+    // 否则纯手绘画布上调抖动参数会毫无反应
+    if (!imageFile) {
+      if (callback) callback();
+      return;
+    }
 
     const image = new Image();
     image.onload = () => {
@@ -138,9 +145,11 @@ export class CropManager {
       this.exitCropMode();
       if (callback) callback();
     };
-    // 解码失败（损坏/不支持格式）时 onload 不会触发：补 onerror 释放 ObjectURL 防永久泄漏
+    // 解码失败（损坏/不支持格式）时 onload 不会触发：补 onerror 释放 ObjectURL 防永久泄漏，
+    // 并经画布标题给出可见反馈（不主动退出裁剪模式，若在裁剪中用户可重试或换图）
     image.onerror = () => {
       URL.revokeObjectURL(image.src);
+      this.host.setCanvasTitle('图片解码失败：文件可能已损坏或为不支持的格式');
     };
     image.src = URL.createObjectURL(imageFile);
   }

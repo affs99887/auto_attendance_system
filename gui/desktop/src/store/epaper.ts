@@ -91,6 +91,7 @@ export interface ArchivedMemo extends StationMemoItem {
 }
 
 const MEMO_ARCHIVE_MS = 3 * 86400000; // 划掉超过 3 天自动归档
+const MEMO_ARCHIVE_MAX = 200; // 归档箱上限：只进不出会让持久化体积无限膨胀，超限从最旧裁剪
 
 /** 稳定分区排序：未完成在上，已完成沉底（两组各保持原相对顺序）。
  *  仅在展示/上屏时派生使用 —— 底层 memos 数组始终保持添加顺序不重排，
@@ -102,14 +103,19 @@ export function sortMemos(items: StationMemoItem[]): StationMemoItem[] {
 // 逐条校验+规范化持久化的备忘录：localStorage / gui-settings.json 可能被外部改坏或写入
 // 非法元素（缺 text 的对象、字符串、null 等），不过滤会让 sortMemos / drawMemo(wrapText)
 // / Epaper.tsx 渲染因 undefined 崩溃。这里丢弃非对象/text 为空的项，并把字段强制成
-// 合法类型（id→number、text→非空 string、done→boolean、doneAt 仅保留有限数）。
+// 合法类型（id→number、text→非空 string 且限长、done→boolean、doneAt 仅保留有限数）。
 function normalizeMemoBase(m: unknown): { id: number; text: string; done: boolean; doneAt?: number } | null {
   if (!m || typeof m !== 'object') return null;
   const o = m as Record<string, unknown>;
-  if (typeof o.text !== 'string' || !o.text.trim()) return null; // text 必须为非空字符串
+  if (typeof o.text !== 'string') return null;
+  // 换行/控制字符替换为空格并截到 100 字：外部改坏的超长/多行文本会把屏上备忘录区画穿、
+  // 挤掉其他条目（正常 UI 输入本身限 40 字，不受影响）
+  // 用 Array.from 按码点截断：字符串 slice 按 UTF-16 码元截，会把第 100 位的 emoji 劈成半个乱码
+  const text = Array.from(o.text.replace(/[\u0000-\u001f\u007f]/g, ' ').trim()).slice(0, 100).join('');
+  if (!text) return null;
   const item: { id: number; text: string; done: boolean; doneAt?: number } = {
     id: typeof o.id === 'number' && Number.isFinite(o.id) ? o.id : 0, // id 先占位，下方统一重排去重
-    text: o.text,
+    text,
     done: o.done === true,
   };
   if (typeof o.doneAt === 'number' && Number.isFinite(o.doneAt)) item.doneAt = o.doneAt;
@@ -121,7 +127,11 @@ function normalizeMemoBase(m: unknown): { id: number; text: string; done: boolea
 function normalizeMemos(rawItems: unknown, rawNextId: unknown): { items: StationMemoItem[]; nextId: number } {
   const arr = Array.isArray(rawItems) ? rawItems : [];
   const items: StationMemoItem[] = [];
-  let nextId = typeof rawNextId === 'number' && Number.isFinite(rawNextId) ? Math.floor(rawNextId) : 1;
+  // nextId 钳制在安全整数范围：被外部改成超大数（≥2^53）时 nextId++ 因浮点精度不再自增，
+  // 所有条目会拿到同一个 id；id 反正会整体重排，非法时重置为 1 无副作用
+  let nextId = typeof rawNextId === 'number' && Number.isFinite(rawNextId)
+    && rawNextId >= 1 && rawNextId < Number.MAX_SAFE_INTEGER / 2
+    ? Math.floor(rawNextId) : 1;
   for (const raw of arr) {
     const base = normalizeMemoBase(raw);
     if (!base) continue;
@@ -146,6 +156,8 @@ function normalizeArchive(rawArchive: unknown, startId: number): { archive: Arch
     const id = nextId++;
     archive.push({ id, text: base.text, done: base.done, archivedAt, ...(base.doneAt != null ? { doneAt: base.doneAt } : {}) });
   }
+  // 超上限从最旧裁剪（归档按时间追加，数组头部最旧）
+  if (archive.length > MEMO_ARCHIVE_MAX) archive.splice(0, archive.length - MEMO_ARCHIVE_MAX);
   return { archive, nextId };
 }
 
@@ -177,22 +189,30 @@ export interface StationLeaveCfg {
 
 const DEFAULT_LEAVE: StationLeaveCfg = { enabled: false, label: '年假', start: '', end: '' };
 
-function loadStationCfg(): { autoMin: number; lastPush: number | null; leave: StationLeaveCfg } {
+// autoMin 读入规范化：持久化文件可能被外部改坏。非有限数或 <=0 视为 0（关闭）；
+// 0<x<30 钳到 30（与 UI 下限一致）——墨水屏全刷伤屏，间隔过小会近乎连续刷屏损耗设备。
+function normalizeAutoMin(v: unknown): number {
+  if (typeof v !== 'number' || !Number.isFinite(v) || v <= 0) return 0;
+  return v < 30 ? 30 : v;
+}
+
+function loadStationCfg(): { autoMin: number; adaptive: boolean; lastPush: number | null; leave: StationLeaveCfg } {
   try {
     const raw = typeof localStorage !== 'undefined' ? localStorage.getItem(STATION_KEY) : null;
     if (raw) {
       const o = JSON.parse(raw);
       return {
-        autoMin: typeof o.autoMin === 'number' ? o.autoMin : 0,
+        autoMin: normalizeAutoMin(o.autoMin),
+        adaptive: o.adaptive === true,
         lastPush: typeof o.lastPush === 'number' ? o.lastPush : null,
         leave: o.leave && typeof o.leave === 'object' ? { ...DEFAULT_LEAVE, ...o.leave } : { ...DEFAULT_LEAVE },
       };
     }
   } catch { /* 忽略损坏的本地数据 */ }
-  return { autoMin: 0, lastPush: null, leave: { ...DEFAULT_LEAVE } };
+  return { autoMin: 0, adaptive: false, lastPush: null, leave: { ...DEFAULT_LEAVE } };
 }
-function saveStationCfg(autoMin: number, lastPush: number | null, leave: StationLeaveCfg) {
-  persist(STATION_KEY, { autoMin, lastPush, leave });
+function saveStationCfg(autoMin: number, adaptive: boolean, lastPush: number | null, leave: StationLeaveCfg) {
+  persist(STATION_KEY, { autoMin, adaptive, lastPush, leave });
 }
 
 interface EpaperState {
@@ -224,6 +244,7 @@ interface EpaperState {
   memos: StationMemoItem[];
   memoArchive: ArchivedMemo[];   // 已归档（完成超 3 天自动移入）
   stationAutoMin: number;        // 自动推送间隔（分钟，0 = 关闭）
+  stationAdaptive: boolean;      // 自适应：跟随 Claude 5 小时额度窗口（第2/4/5小时刷新，拿不到额度退回按间隔）
   stationPushing: boolean;       // 信息站推送进行中
   stationLastPush: number | null; // 上次成功推送（epoch ms）
   stationLeave: StationLeaveCfg; // 请假设置（区间内渲染「请假中」全屏）
@@ -244,6 +265,7 @@ interface EpaperState {
   removeArchivedMemo: (id: number) => void; // 彻底删除单条归档
   clearMemoArchive: () => void;             // 清空归档
   setStationAutoMin: (min: number) => void;
+  setStationAdaptive: (v: boolean) => void;
   setStationLeave: (patch: Partial<StationLeaveCfg>) => void;
   pushStation: (reason?: 'manual' | 'auto') => Promise<boolean>; // 离屏渲染并发送到屏幕
 
@@ -322,6 +344,7 @@ export const useEpaperStore = create<EpaperState>((set, get) => ({
   memos: initMemos.items,
   memoArchive: initMemos.archive,
   stationAutoMin: initStation.autoMin,
+  stationAdaptive: initStation.adaptive,
   stationPushing: false,
   stationLastPush: initStation.lastPush,
   stationLeave: initStation.leave,
@@ -399,7 +422,8 @@ export const useEpaperStore = create<EpaperState>((set, get) => ({
     const item = get().memos.find(m => m.id === id);
     if (!item) return;
     const memos = get().memos.filter(m => m.id !== id);
-    const memoArchive = [...get().memoArchive, { ...item, archivedAt: Date.now() }];
+    // slice(-MEMO_ARCHIVE_MAX)：超上限时把最旧的挤出去
+    const memoArchive = [...get().memoArchive, { ...item, archivedAt: Date.now() }].slice(-MEMO_ARCHIVE_MAX);
     set({ memos, memoArchive });
     saveMemos(memos, memoNextId, memoArchive);
   },
@@ -428,15 +452,26 @@ export const useEpaperStore = create<EpaperState>((set, get) => ({
 
   setStationAutoMin(min) {
     set({ stationAutoMin: min });
-    saveStationCfg(min, get().stationLastPush, get().stationLeave);
+    saveStationCfg(min, get().stationAdaptive, get().stationLastPush, get().stationLeave);
     if (min > 0) get().addLog(`信息站自动推送已开启：每 ${min} 分钟（断开时自动重连后推送）`);
     else get().addLog('信息站自动推送已关闭');
+  },
+
+  setStationAdaptive(v) {
+    set({ stationAdaptive: v });
+    saveStationCfg(get().stationAutoMin, v, get().stationLastPush, get().stationLeave);
+    if (v) {
+      get().addLog('信息站自适应推送已开启：跟随 Claude 5 小时额度窗口（第 2/4/5 小时各刷新一次，拿不到额度时按间隔兜底）');
+      refreshAdaptiveUsage(true); // 立即预取一次 resets_at，让 ticker 尽快用上自适应节奏
+    } else {
+      get().addLog('信息站自适应推送已关闭：按固定间隔推送');
+    }
   },
 
   setStationLeave(patch) {
     const leave = { ...get().stationLeave, ...patch };
     set({ stationLeave: leave });
-    saveStationCfg(get().stationAutoMin, get().stationLastPush, leave);
+    saveStationCfg(get().stationAutoMin, get().stationAdaptive, get().stationLastPush, leave);
   },
 
   async pushStation(reason = 'manual') {
@@ -478,7 +513,7 @@ export const useEpaperStore = create<EpaperState>((set, get) => ({
 
       const now = Date.now();
       set({ stationLastPush: now });
-      saveStationCfg(get().stationAutoMin, now, get().stationLeave);
+      saveStationCfg(get().stationAutoMin, get().stationAdaptive, now, get().stationLeave);
       get().addLog(`信息站推送完成！耗时: ${seconds}s`);
       get().addLog('屏幕刷新完成前请不要操作。');
       return true;
@@ -703,9 +738,10 @@ async function hydrateFromFile() {
     memoNextId = a.nextId;
   }
 
-  const stationO = all[STATION_KEY] as { autoMin?: number; lastPush?: number; leave?: StationLeaveCfg } | undefined;
+  const stationO = all[STATION_KEY] as { autoMin?: number; adaptive?: boolean; lastPush?: number; leave?: StationLeaveCfg } | undefined;
   if (stationO && typeof stationO === 'object') {
-    patch.stationAutoMin = typeof stationO.autoMin === 'number' ? stationO.autoMin : 0;
+    patch.stationAutoMin = normalizeAutoMin(stationO.autoMin);
+    patch.stationAdaptive = stationO.adaptive === true;
     patch.stationLastPush = typeof stationO.lastPush === 'number' ? stationO.lastPush : null;
     patch.stationLeave = stationO.leave && typeof stationO.leave === 'object'
       ? { ...DEFAULT_LEAVE, ...stationO.leave }
@@ -720,7 +756,7 @@ async function hydrateFromFile() {
   const st = useEpaperStore.getState();
   saveDevHistory(st.lastConnectedName, st.pairedNames, st.lastDevice);
   saveMemos(st.memos, memoNextId, st.memoArchive);
-  saveStationCfg(st.stationAutoMin, st.stationLastPush, st.stationLeave);
+  saveStationCfg(st.stationAutoMin, st.stationAdaptive, st.stationLastPush, st.stationLeave);
   persist(INVERT_KEY, st.invertRender);
 
   archiveExpiredMemos(); // 回灌完成后立刻清一遍过期完成项
@@ -748,6 +784,8 @@ function archiveExpiredMemos() {
     }
   }
   if (changed) {
+    // 归档箱超上限从最旧裁剪（读回处 normalizeArchive 同口径）
+    if (archive.length > MEMO_ARCHIVE_MAX) archive.splice(0, archive.length - MEMO_ARCHIVE_MAX);
     useEpaperStore.setState({ memos: keep, memoArchive: archive });
     saveMemos(keep, memoNextId, archive);
   }
@@ -840,17 +878,147 @@ function attemptGestureReconnect(reason: string): void {
 if (typeof window !== 'undefined') {
   window.setTimeout(() => attemptGestureReconnect('启动自动重连'), 5000);
 }
+
+// 系统休眠唤醒（主进程经 'power:resume' 通知）：睡眠期间 BLE 必然掉线，但断开事件要等唤醒后
+// 才补派发，store.connected 可能还是过期的 true。自动推送开启时不等 60 秒 tick，立即校验实时
+// 连接并发起重连（连上后到点的推送由 ticker 正常触发）。
+// AAS_POWER 用可选链守卫：preload 未提供该桥时静默不生效。
+if (typeof window !== 'undefined') {
+  (window as unknown as { AAS_POWER?: { onResume?: (cb: () => void) => void } }).AAS_POWER?.onResume?.(() => {
+    const st = useEpaperStore.getState();
+    if (epdClient.connected) return; // 实时链路仍在（短暂睡眠没掉线），无需处理
+    // 自动推送总开关是 autoMin>0（自适应也以它为前提，ticker 同此判定）：
+    // 没开就不自动重连，免得白唤醒 BLE 却没有任何后续推送
+    if (!(st.stationAutoMin > 0)) return;
+    if (st.stationPushing || epdSendBusy()) return;
+    if (st.quickConnecting || st.scanning) return; // 已在连接流程中，等结果
+    if (st.connected || st.canReconnect) {
+      // 设备对象还在内存（含 store 尚未感知断开、connected 过期为真的情况）→ 直接 GATT 重连
+      st.addLog('休眠唤醒：连接已失效，正在重连…');
+      void st.reconnect();
+    } else if (st.lastDevice) {
+      attemptGestureReconnect('休眠唤醒');
+    }
+  });
+}
+
+// ===== 自适应推送：跟随 Claude 5 小时额度窗口 =====
+// resets_at 是 5 小时窗口的重置时刻（窗口结束）；窗口起点 = resets_at − 5h。
+// 用户要的刷新点：窗口第 2 / 4 / 5 小时 → 即 resets_at−3h、resets_at−1h、resets_at 本身。
+// 拿不到 resets_at（无 Claude 凭据 / 离线 / 无活跃窗口）时，交由 ticker 退回固定间隔兜底。
+const FIVE_HOUR_MS = 5 * 60 * 60 * 1000;
+const HOUR_MS = 60 * 60 * 1000;
+
+// resets_at 本地缓存：ticker 每 60s 跑，但额度拉取按 TTL 节流，避免每分钟打一次本地 HTTP
+// （后端 get_claude_usage 自身也有 300s TTL）。
+// 三态区分「还不知道」和「确定拿不到」——这对重启后的时序很关键：
+//   'unknown'     首拉未回 / 网络波动 → 先等，绝不按兜底误推（否则会在该等 12 分钟时立刻推一张）
+//   'ok'          拿到有效 resets_at → 跟随 5 小时窗口
+//   'unavailable' HTTP 通了但没有可用窗口（未登录 Claude / 无活跃窗口 / resets_at 缺失）→ 退回固定间隔
+let adaptiveResetsAt: number | null = null;                              // 当前 5 小时窗口重置时刻（epoch ms）
+let adaptiveState: 'unknown' | 'ok' | 'unavailable' = 'unknown';
+let adaptiveFetchedAt = 0;                                               // 上次拉取完成时刻
+let adaptiveFetching = false;
+let adaptiveFailCount = 0;                                               // 连续拉取失败次数（成功清零）
+const ADAPTIVE_USAGE_TTL = 5 * 60_000;
+const ADAPTIVE_UNKNOWN_MAX_FAILS = 5; // 'unknown' 态连续失败这么多次后升级为 'unavailable' 走兜底
+
+// 拉取一次 Claude 额度、更新 resets_at 缓存。force=true 跳过 TTL（如刚勾选自适应时预取）。
+// 状态未确定（unknown）时不节流，每次调用都重试，尽快在重启后补上真实窗口。
+function refreshAdaptiveUsage(force = false): void {
+  if (adaptiveFetching) return;
+  if (!force && adaptiveState !== 'unknown' && adaptiveFetchedAt && Date.now() - adaptiveFetchedAt < ADAPTIVE_USAGE_TTL) return;
+  adaptiveFetching = true;
+  void api.getClaudeUsage()
+    .then(r => {
+      adaptiveFailCount = 0;
+      const iso = r?.available ? r.five_hour?.resets_at ?? null : null;
+      const ms = iso ? Date.parse(iso) : NaN;
+      // resets_at 正常最多在未来 5 小时内；异常超前（后端时钟偏差/脏数据）会让三个目标点
+      // 全落在未来、恒无到点，自适应静默停摆——所以也视同拿不到，走固定间隔兜底
+      if (Number.isFinite(ms) && ms - Date.now() <= FIVE_HOUR_MS + ADAPTIVE_STALE_GRACE_MS) {
+        adaptiveResetsAt = ms;
+        adaptiveState = 'ok';
+      } else {
+        adaptiveResetsAt = null;
+        adaptiveState = 'unavailable'; // HTTP 通了但没有可用（或数值异常）的 5 小时窗口 → 走固定间隔兜底
+      }
+    })
+    .catch(() => {
+      // 网络/后端波动：保留上次状态等下次重试，不误判为「拿不到」。
+      // 但 'unknown' 不能永远等（后端一直不可达时 ticker 会因 unknown 每分钟直接返回，
+      // 自动推送整体停摆）：连续失败次数到上限即视同「拿不到额度」，退回固定间隔兜底。
+      adaptiveFailCount++;
+      if (adaptiveState === 'unknown' && adaptiveFailCount >= ADAPTIVE_UNKNOWN_MAX_FAILS) {
+        adaptiveState = 'unavailable';
+        useEpaperStore.getState().addLog('自适应推送：额度接口连续拉取失败，退回固定间隔兜底（恢复后自动回到自适应）');
+      }
+    })
+    .finally(() => { adaptiveFetchedAt = Date.now(); adaptiveFetching = false; });
+}
+
+// 当前「已到点、且此刻之后尚未推送」的自适应目标时刻（ms）；无到点目标返回 null。
+// 取所有已过目标里最晚的一个：长时间未运行（关机/睡眠跨过多个点）只补推一次，不逐个补。
+function adaptiveDueTarget(resetsAt: number, now: number): number | null {
+  const start = resetsAt - FIVE_HOUR_MS;
+  const targets = [start + 2 * HOUR_MS, start + 4 * HOUR_MS, resetsAt]; // 第 2 / 4 / 5 小时
+  let due: number | null = null;
+  for (const t of targets) if (t <= now && (due === null || t > due)) due = t;
+  return due;
+}
+
 let stationLastAttempt = 0;
+// 自适应失败重试节流：同一目标点尝试过但没成功，10 分钟内不再试（成功或到下一目标点即解除）
+const ADAPTIVE_RETRY_MS = 10 * 60_000;
+// resets_at 新鲜度宽限：已过去超过 15 分钟仍没等到新窗口，说明后端在沿用旧缓存
+// （后端刷新失败时保留旧值且 available 仍为 true）→ 视同拿不到额度，退回固定间隔
+const ADAPTIVE_STALE_GRACE_MS = 15 * 60_000;
+let adaptiveLoggedTarget = 0; // 同一目标点的「到点」日志只打一次，防止无法立即推送时每 60 秒刷屏
 if (typeof window !== 'undefined') {
   window.setInterval(() => {
     archiveExpiredMemos(); // 长开应用也按时归档过期完成项（与自动推送开关无关）
     const st = useEpaperStore.getState();
-    if (st.stationAutoMin <= 0) return;
+    if (st.stationAutoMin <= 0) return;               // 下拉「关闭」= 整个自动推送关闭
     if (st.stationPushing || epdSendBusy()) return;
-    const interval = st.stationAutoMin * 60_000;
-    const base = Math.max(st.stationLastPush ?? 0, stationLastAttempt);
-    if (Date.now() - base < interval) return;
-    if (st.connected) {
+    const now = Date.now();
+
+    // 固定间隔到点判定（非自适应 / 自适应拿不到额度时的兜底规则）
+    const fixedDue = () => {
+      const base = Math.max(st.stationLastPush ?? 0, stationLastAttempt);
+      return now - base >= st.stationAutoMin * 60_000;
+    };
+
+    // 到点判定：开了自适应且拿到 5 小时窗口 → 跟随第 2/4/5 小时；否则退回固定间隔
+    let due: boolean;
+    if (st.stationAdaptive) {
+      refreshAdaptiveUsage();
+      // 额度还没拿到确定结果：先等，别按兜底误推（连续失败会升级为 unavailable，见 refreshAdaptiveUsage）
+      if (adaptiveState === 'unknown') return;
+      // resets_at 已过去超过宽限期 = 旧窗口早结束却拿不到新窗口（多为后端沿用旧缓存），按拿不到处理
+      const stale = adaptiveResetsAt == null || now - adaptiveResetsAt > ADAPTIVE_STALE_GRACE_MS;
+      if (adaptiveState === 'ok' && adaptiveResetsAt != null && !stale) {
+        const target = adaptiveDueTarget(adaptiveResetsAt, now);
+        // 到点且此后尚未成功推送(stationLastPush < target) → due；只有成功推送才消费目标点。
+        // stationLastAttempt 仅做失败重试节流：尝试过但没成功，隔 ADAPTIVE_RETRY_MS 可再试。
+        // 关机跨多个点的场景不受影响：adaptiveDueTarget 只取最晚的已过目标，仍只补推一次。
+        due = target != null && (st.stationLastPush ?? 0) < target
+          && (stationLastAttempt < target || now - stationLastAttempt >= ADAPTIVE_RETRY_MS);
+        if (due && target != null && target !== adaptiveLoggedTarget) {
+          adaptiveLoggedTarget = target;
+          const hour = Math.round((target - (adaptiveResetsAt - FIVE_HOUR_MS)) / HOUR_MS);
+          st.addLog(`自适应推送：Claude 5 小时窗口第 ${hour} 小时到点`);
+        }
+      } else {
+        due = fixedDue(); // 确定拿不到额度（未登录 / 无活跃窗口 / resets_at 过期）：退回固定间隔
+      }
+    } else {
+      due = fixedDue();
+    }
+    if (!due) return;
+
+    // 推送前用 epdClient 实时 getter 复核：休眠唤醒后 gattserverdisconnected 事件可能迟到，
+    // store.connected 还是过期的 true，直接推必失败还烧掉本轮尝试。
+    if (st.connected && epdClient.connected) {
       stationLastAttempt = Date.now();
       void st.pushStation('auto');
       return;
@@ -859,7 +1027,8 @@ if (typeof window !== 'undefined') {
     // 本次会话断联（设备对象还在内存）→ 直接 GATT 重连，最快；
     // 重启后（无内存设备）→ 走一键重连（按记忆的 lastDevice 后台扫描自动回选）。
     if (st.quickConnecting || st.scanning) return; // 已在连接流程中，等结果
-    if (st.canReconnect) {
+    if (st.canReconnect || st.connected) {
+      // st.connected 为真但实时链路已断（上面的复核没过）：设备对象仍在内存，同样直接 GATT 重连
       stationLastAttempt = Date.now();
       autoPushAfterConnect = true;
       st.addLog('定时推送：设备已断开，正在重连…');

@@ -9,6 +9,7 @@ import { usePunchStore } from '../store/punch';
 import { api } from '../lib/api';
 import { FxSection } from '../components/ExchangeRatePanel';
 import { useAiNewsStore, CATEGORY_BY_SLUG, relTime } from '../store/aiNews';
+import { useToastStore } from '../store/toast';
 
 /** 后端 today_records 时间字段：`'08:29:55'` 或 `'1900-01-01T08:29:55'`，统一抽 HH:MM:SS */
 function extractTime(raw: string | null | undefined): string | null {
@@ -397,7 +398,16 @@ function useMatchHeight(): [React.RefObject<HTMLDivElement>, number | null] {
 function DashNewsCard({ matchH }: { matchH: number | null }) {
   const items = useAiNewsStore(s => s.cats.all.items);
   const loading = useAiNewsStore(s => s.cats.all.loading);
+  const error = useAiNewsStore(s => s.cats.all.error);
   const refresh = useAiNewsStore(s => s.refresh);
+  // 有旧数据时卡片体不显示错误占位，刷新失败对用户完全无感，这里补一条 toast（与 News 页同款）
+  const doRefresh = async () => {
+    await refresh('all', true);
+    const cur = useAiNewsStore.getState().cats.all;
+    if (cur?.error && cur.items.length) {
+      useToastStore.getState().push('err', `AI 资讯刷新失败：${cur.error}`);
+    }
+  };
   const top = React.useMemo(
     () =>
       [...items]
@@ -415,24 +425,35 @@ function DashNewsCard({ matchH }: { matchH: number | null }) {
             <div className="card-sub">AI HOT · 今日精选</div>
           </div>
         </div>
-        <button className="btn btn-ico btn-sm" title="刷新" onClick={() => void refresh('all', true)} disabled={loading}>
+        <button className="btn btn-ico btn-sm" title="刷新" onClick={() => void doRefresh()} disabled={loading}>
           <span className={loading ? 'spin-ic' : ''} style={{ display: 'inline-flex' }}><Icon.Refresh size={13} /></span>
         </button>
       </div>
       <div className="card-body scroll-area" style={{ padding: '4px 16px', flex: 1, minHeight: 0, overflowY: 'auto' }}>
-        <div className="dash-news">
-          {top.map(it => (
-            <a key={it.id} className="dash-news-row" href={it.url} target="_blank" rel="noreferrer">
-              <div className="dash-news-title">{it.title}</div>
-              <div className="dash-news-meta">
-                {dashCatTag(it.category)}
-                <span className="muted" style={{ fontSize: 10.5, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
-                  {it.source} · {relTime(it.publishedAt)}
-                </span>
-              </div>
-            </a>
-          ))}
-        </div>
+        {/* 无数据时按 加载中 / 拉取失败 / 真没有 三种情况给占位，避免卡片体一片空白无解释 */}
+        {top.length ? (
+          <div className="dash-news">
+            {top.map(it => (
+              <a key={it.id} className="dash-news-row" href={it.url} target="_blank" rel="noreferrer">
+                <div className="dash-news-title">{it.title}</div>
+                <div className="dash-news-meta">
+                  {dashCatTag(it.category)}
+                  <span className="muted" style={{ fontSize: 10.5, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
+                    {it.source} · {relTime(it.publishedAt)}
+                  </span>
+                </div>
+              </a>
+            ))}
+          </div>
+        ) : loading ? (
+          <div className="empty-state">
+            <span className="spinner" style={{ display: 'inline-block', marginRight: 8 }} /> 加载中…
+          </div>
+        ) : error ? (
+          <div className="empty-state">拉取失败，点右上角刷新重试</div>
+        ) : (
+          <div className="empty-state">暂无资讯</div>
+        )}
       </div>
     </div>
   );

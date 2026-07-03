@@ -7,7 +7,7 @@ import { Icon } from '../lib/icons';
 import { useEpaperStore, epdClient, buildStationData, sortMemos, type EpdScanDevice } from '../store/epaper';
 import { EpdCmd, canvasSizes, canvasSizeLabels, epdDrivers, hex2bytes, parseHolidayData, buildHolidayPayload, DEFAULT_HOLIDAYS_2026, DEFAULT_HOLIDAYS_2027 } from '../lib/epaper/protocol';
 import { ditherImageDataAsync, processImageData, type DitherMode, type DitherAlgorithm } from '../lib/epaper/dithering';
-import { renderStation, STATION_MEMO_MAX, type StationMemoItem } from '../lib/epaper/station';
+import { renderStation, estimateVisibleMemoCount, type StationMemoItem } from '../lib/epaper/station';
 import { sendCanvasToEpd, epdSendBusy } from '../lib/epaper/sendImage';
 import { appAlert, appConfirm } from '../lib/dialog';
 import { PaintManager, type PaintTool } from '../lib/epaper/paint';
@@ -114,6 +114,7 @@ export function EpaperScreen() {
   const memos = useEpaperStore(s => s.memos);
   const memoArchive = useEpaperStore(s => s.memoArchive);
   const stationAutoMin = useEpaperStore(s => s.stationAutoMin);
+  const stationAdaptive = useEpaperStore(s => s.stationAdaptive);
   const stationPushing = useEpaperStore(s => s.stationPushing);
   const stationLastPush = useEpaperStore(s => s.stationLastPush);
   const stationLeave = useEpaperStore(s => s.stationLeave);
@@ -228,8 +229,17 @@ export function EpaperScreen() {
   }, [addLog]);
 
   const applyDither = React.useCallback(() => {
+    // 工作台收起时画布处于 display:none，getBoundingClientRect 宽高为 0，finishCrop 用它算
+    // 缩放会得到 Infinity/NaN：白底填完图片却画不上去，画布内容直接丢失。此时跳过重铺背景，
+    // 只对现有画布内容重跑抖动。
+    const rect = canvasRef.current?.getBoundingClientRect();
+    if (!rect || rect.width === 0 || rect.height === 0) {
+      addLog('画布未展开，已跳过背景重绘，直接按当前内容重新抖动');
+      void convertDithering();
+      return;
+    }
     cropRef.current?.finishCrop(() => void convertDithering());
-  }, [convertDithering]);
+  }, [convertDithering, addLog]);
 
   // 去抖版 applyDither：仅供强度/对比度滑块拖动时调用，拖停约 200ms 才重算一次，
   // 避免连续 onChange 在大画布上反复全图重算阻塞 UI（见 ditherDebounceRef 说明）。
@@ -262,6 +272,9 @@ export function EpaperScreen() {
       if (!liveCanvas || !liveCtx || !livePaint || !liveCrop) return;
       if (image.width / image.height === liveCanvas.width / liveCanvas.height) {
         if (liveCrop.isCropMode()) liveCrop.exitCropMode();
+        // 比例匹配直绘不进裁剪，但上一张图裁剪可能留下 zoom/pan：之后 finishCrop 重画本图
+        // 会套用旧变换截出错误局部，先重置回默认
+        liveCrop.resetStates();
         liveCtx.drawImage(image, 0, 0, image.width, image.height, 0, 0, liveCanvas.width, liveCanvas.height);
         void convertDithering();
       } else {
@@ -282,8 +295,20 @@ export function EpaperScreen() {
     const size = canvasSizes.find(s => s.name === name);
     const canvas = canvasRef.current;
     if (!size || !canvas) return;
+    const sizeChanged = canvas.width !== size.width || canvas.height !== size.height;
     canvas.width = size.width;
     canvas.height = size.height;
+    if (sizeChanged) {
+      // 尺寸变了历史就失效（同 rotateCanvas）：撤销把旧尺寸快照 putImageData 回新画布会错乱，
+      // 旧坐标的笔迹/文字之后重绘也会按旧位置复现。铺白底后重建历史基线。
+      fillCanvas('white');
+      const paint = paintRef.current;
+      if (paint) {
+        paint.clearHistory();
+        paint.clearElements();
+        paint.saveToHistory();
+      }
+    }
     updateImage();
   }, [updateImage]);
 
@@ -352,7 +377,9 @@ export function EpaperScreen() {
 
   // ===== 设备控制 =====
 
-  const ctrlDisabled = !connected || sending;
+  // 发送图片与信息站推送期间都要禁用设备控制：BLE 命令插进 15-25 秒的图像分块传输
+  // 会破坏本次刷屏，INIT/SET_PINS 还会直接改掉设备驱动状态
+  const ctrlDisabled = !connected || sending || stationPushing;
 
   const syncTime = async (mode: 1 | 2) => {
     if (mode === 2) {
@@ -384,11 +411,21 @@ export function EpaperScreen() {
   const sendCmd = async () => {
     if (cmdText === '') return;
     const bytes = hex2bytes(cmdText);
+    // hex2bytes 对非法输入返回 null，不拦下取 bytes[0] 会直接抛错
+    if (!bytes || bytes.length === 0) {
+      addLog('命令不是合法的 16 进制（只允许 0-9/a-f，长度为偶数）');
+      return;
+    }
     await epdClient.write(bytes[0], bytes.length > 1 ? bytes.slice(1) : null);
   };
 
   const setDriverCmd = async () => {
-    await epdClient.write(EpdCmd.SET_PINS, pins);
+    // 引脚写入失败（如非法 hex 已被 ble 层拦截返回 false）就不再发 INIT，
+    // 避免设备在旧引脚配置上重新初始化
+    if (!(await epdClient.write(EpdCmd.SET_PINS, pins))) {
+      addLog('引脚设置未发送成功，已取消驱动初始化');
+      return;
+    }
     await epdClient.write(EpdCmd.INIT, driver);
   };
 
@@ -481,6 +518,8 @@ export function EpaperScreen() {
   const onFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     fileRef.current = e.target.files && e.target.files.length > 0 ? e.target.files[0] : null;
     updateImage();
+    // 清空 value：Chromium 下重选同一文件不会再触发 change，清掉后同名文件也能重新载入
+    e.target.value = '';
   };
 
   const sendImg = async () => {
@@ -527,6 +566,19 @@ export function EpaperScreen() {
 
   // ===== 信息站（按设计稿 墨水屏信息站.dc.html：Claude 额度 + 备忘录 + 日历）=====
 
+  // 预览画布尺寸跟随设备驱动（与 store 的 pushStation 同一取值逻辑），
+  // 保证预览的排版换行/截断位置与实际推送一致
+  const stationSize = React.useMemo(() => {
+    const drv = epdDrivers.find(d => d.value === driver);
+    return canvasSizes.find(c => c.name === drv?.size) ?? { width: 400, height: 300 };
+  }, [driver]);
+
+  // 尺寸变化（设备回传驱动/手动换驱动）时 React 更新 canvas 宽高属性会把位图清空，
+  // 预览若停留在"已渲染"态就是一块空白画布——退回占位按钮让用户重新渲染
+  React.useEffect(() => {
+    setStationPreviewed(false);
+  }, [stationSize]);
+
   // 渲染信息站预览（绘制在信息站卡片内的专属画布上，效果与推屏一致）
   const renderStationPreview = async () => {
     const canvas = stationCanvasRef.current;
@@ -554,6 +606,10 @@ export function EpaperScreen() {
 
   // 展示序：未完成在上、已完成沉底（底层数组保持添加顺序，取消勾选回到原位置）
   const sortedMemos = React.useMemo(() => sortMemos(memos), [memos]);
+
+  // 实际可上屏条数：与 station.ts 绘制同口径（长文本换行后超出列表区会从尾部整项丢弃，
+  // 可能少于上限 6 条），「屏外」徽标用它判断才和真实推屏结果一致
+  const visibleMemoCount = React.useMemo(() => estimateVisibleMemoCount(sortedMemos), [sortedMemos]);
 
   // FLIP 动画：排序/增删导致条目位移时，从旧位置平滑滑动到新位置（勾选沉底 / 取消勾选浮回）
   const memoListRef = React.useRef<HTMLDivElement | null>(null);
@@ -678,6 +734,9 @@ export function EpaperScreen() {
       fillCanvas('white');
       paint.clearElements();
       if (crop.isCropMode()) crop.exitCropMode();
+      // 源文件引用一并清掉：否则之后调抖动参数，finishCrop 检测到文件会把已清除的图片画回来
+      fileRef.current = null;
+      if (fileInputRef.current) fileInputRef.current.value = '';
       paint.saveToHistory();
     }
   };
@@ -893,8 +952,8 @@ export function EpaperScreen() {
                 <div className="ep-station-preview">
                   <canvas
                     ref={stationCanvasRef}
-                    width={400}
-                    height={300}
+                    width={stationSize.width}
+                    height={stationSize.height}
                     style={{ display: stationPreviewed ? undefined : 'none' }}
                   />
                   {!stationPreviewed && (
@@ -905,7 +964,7 @@ export function EpaperScreen() {
                     >
                       <Icon.Epaper size={30} />
                       <span className="ep-station-ph-title">{stationRendering ? '渲染中…' : '点击渲染预览'}</span>
-                      <span className="ep-station-ph-sub">400×300 · 三色量化 · 与推屏效果一致</span>
+                      <span className="ep-station-ph-sub">{stationSize.width}×{stationSize.height} · 三色量化 · 与推屏效果一致</span>
                     </button>
                   )}
                 </div>
@@ -928,7 +987,7 @@ export function EpaperScreen() {
               {/* 右：备忘录 + 推送/请假设置 */}
               <div className="ep-station-right">
                 <div className="row" style={{ justifyContent: 'space-between', alignItems: 'baseline' }}>
-                  <span className="field-label">备忘录（屏上展示前 {STATION_MEMO_MAX} 条）</span>
+                  <span className="field-label">备忘录（屏上展示前 {visibleMemoCount} 条）</span>
                   <span className="ep-hint-inline mono">{memos.filter(m => m.done).length} / {memos.length}</span>
                 </div>
                 <div className="ep-memo-list" ref={memoListRef}>
@@ -958,7 +1017,7 @@ export function EpaperScreen() {
                       ) : (
                         <span className="ep-memo-text" title="双击修改" onDoubleClick={() => startMemoEdit(m)}>{m.text}</span>
                       )}
-                      {i >= STATION_MEMO_MAX && <span className="ep-badge" title="超出屏幕展示条数">屏外</span>}
+                      {i >= visibleMemoCount && <span className="ep-badge" title="超出屏幕展示条数">屏外</span>}
                       {memoEditId !== m.id && (
                         <button className="ep-memo-edit-btn" title="修改" onClick={() => startMemoEdit(m)}>
                           <Icon.Pencil size={13} />
@@ -1043,7 +1102,20 @@ export function EpaperScreen() {
                     <option value={120}>每 2 小时</option>
                     <option value={240}>每 4 小时</option>
                   </select>
-                  <span className="ep-hint-inline">到点未连接会先自动重连再推送；间隔过密影响屏幕寿命</span>
+                  <label className="ep-leave-toggle" title="跟随 Claude 5 小时额度窗口刷新">
+                    <input
+                      type="checkbox"
+                      checked={stationAdaptive}
+                      disabled={stationAutoMin <= 0}
+                      onChange={e => store().setStationAdaptive(e.target.checked)}
+                    />
+                    自适应
+                  </label>
+                  <span className="ep-hint-inline">
+                    {stationAdaptive
+                      ? '跟随 Claude 5 小时额度窗口，在第 2 / 4 / 5 小时各刷新一次；拿不到额度时退回按上面的间隔推送'
+                      : '到点未连接会先自动重连再推送；间隔过密影响屏幕寿命'}
+                  </span>
                 </div>
 
                 {/* 倒置渲染：屏幕倒挂安装时勾选，发送/推送统一旋转 180°（跨重启记忆） */}
@@ -1442,7 +1514,7 @@ export function EpaperScreen() {
               </div>
               <div className="row" style={{ justifyContent: 'flex-end', gap: 8 }}>
                 <button className="btn" onClick={() => setHolidayOpen(false)}>取消</button>
-                <button className="btn btn-primary" onClick={() => void sendHolidayData()}>发送到设备</button>
+                <button className="btn btn-primary" disabled={ctrlDisabled} onClick={() => void sendHolidayData()}>发送到设备</button>
               </div>
             </div>
           </div>

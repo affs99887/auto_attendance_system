@@ -313,6 +313,8 @@ class Config:
             cur.update(patch)
             dynamic['PROXY'] = cur
             cls._save_dynamic_config()
+            # 代理配置变了（启停/换端口）就作废探测缓存，避免开关后最长 5 秒仍按旧结果走
+            cls._local_proxy_cache = (None, 0.0)
             return cls.get_proxy_config()
 
     @classmethod
@@ -480,6 +482,11 @@ class Config:
         )
         return None
 
+    # get_local_proxy 探测结果短缓存：(结果, 失效时刻)。该函数在汇率/AI资讯/Claude额度的
+    # 每次请求路径上都被调用，TCP 探测最坏要 1 秒，5 秒内直接复用上次结果摊薄成本。
+    # 多线程并发写最坏也只是多探测一次（结果一致），无需加锁。
+    _local_proxy_cache = (None, 0.0)
+
     @classmethod
     def get_local_proxy(cls):
         """供 requests 类后台服务（汇率/AI资讯/Claude额度）使用的本地代理 dict，或 None（直连）。
@@ -490,21 +497,27 @@ class Config:
         不可用时这些周期拉取"全军覆没"的直接根因。与 get_telegram_proxy 的回退理念一致；区别是这里用
         即时端口探测而非死等：它们是一次性周期拉取，端口不通时直连/回退旧缓存即可，下个周期 mihomo
         复活后自然恢复，无需像 Telegram 长连接那样等待。
+        探测结果缓存 5 秒（见 _local_proxy_cache），代理刚启停最坏 5 秒后才被感知，可接受。
         """
+        now = time.time()
+        cached_value, cached_until = cls._local_proxy_cache
+        if now < cached_until:
+            return cached_value
+        result = None
         try:
-            if not cls.get_proxy_enabled():
-                return None
-            port = cls.get_proxy_local_port()
-            try:
-                with socket.create_connection(('127.0.0.1', port), timeout=1.0):
-                    pass
-            except (OSError, socket.timeout):
-                return None
-            url = f"http://127.0.0.1:{port}"
-            return {'http': url, 'https': url}
+            if cls.get_proxy_enabled():
+                port = cls.get_proxy_local_port()
+                try:
+                    with socket.create_connection(('127.0.0.1', port), timeout=1.0):
+                        url = f"http://127.0.0.1:{port}"
+                        result = {'http': url, 'https': url}
+                except (OSError, socket.timeout):
+                    result = None
         except Exception:
             logging.warning('判断本地代理状态异常，转为直连', exc_info=True)
-            return None
+            result = None
+        cls._local_proxy_cache = (result, now + 5.0)
+        return result
 
     @classmethod
     def get_user_configs(cls):

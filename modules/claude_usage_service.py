@@ -5,7 +5,8 @@ Claude Code 额度服务模块
 调用官方 usage 接口获取「5 小时会话窗口 / 周限额」用量与重置时间，供墨水屏信息站渲染。
 
 设计与 exchange_rate_service 一致：
-- TTL 内存缓存（默认 300 秒）+ force 跳过；失败回退旧缓存，绝不外抛。
+- TTL 内存缓存（默认 300 秒）+ force 跳过；失败回退旧缓存但有陈旧上限（超龄按不可用返回），
+  失败后短时间内不重复发请求（负缓存），绝不外抛。
 - 若内置网络加速（mihomo）已启用，requests 自动走 http://127.0.0.1:{local_port}；否则直连。
 - 只读凭据文件，不做 token 刷新（Claude Code 自身会维护 token 有效性）；
   token 过期时返回 available=False + error 提示，不影响其他功能。
@@ -42,13 +43,24 @@ _OAUTH_BETA = 'oauth-2025-04-20'
 # 缓存惰性刷新 TTL（秒）
 _TTL_SECONDS = 300
 
+# 负缓存 TTL（秒）：一次刷新尝试（无论成败）后的这段时间内不再发起新请求，
+# 避免网络故障时每个调用都硬吃一次 15 秒超时
+_FAIL_TTL_SECONDS = 60
+
+# 缓存陈旧上限（秒）：旧数据超龄后按不可用返回——5 小时窗口的 resets_at/用量
+# 早已失真，继续当有效数据返回会让前端把冻结数据当真
+_STALE_SECONDS = _TTL_SECONDS * 3
+
 # 内存缓存（额度数据无需跨进程持久化）
 _lock = threading.Lock()
 _cache = {
-    'updated_at': None,   # unix 秒
-    'data': None,         # 上次成功的契约 dict（不含 updated_at/available）
+    'updated_at': None,     # unix 秒（最近一次成功刷新）
+    'data': None,           # 上次成功的契约 dict（不含 updated_at/available）
     'error': None,
+    'last_attempt': None,   # 最近一次发起刷新的时刻（成功失败都记，用于负缓存）
 }
+# 是否已有线程在锁外做网络请求；置位期间其他调用直接返回现有缓存，不排队等待
+_fetching = False
 
 
 def _credentials_path():
@@ -144,7 +156,12 @@ def _fetch_usage():
 
 
 def get_claude_usage(force=False):
-    """读取额度（带 TTL 惰性刷新）。永不抛异常。"""
+    """读取额度（TTL 惰性刷新 + 失败负缓存）。永不抛异常。
+
+    网络请求（最长 15 秒超时）放在锁外执行，锁内只读写缓存；
+    已有线程在拉取时其余调用不排队等待，直接返回现有缓存。
+    """
+    global _fetching
     with _lock:
         now = time.time()
         fresh = (
@@ -155,9 +172,38 @@ def get_claude_usage(force=False):
         if fresh and not force:
             return _build_result()
 
-        data, err = _fetch_usage()
+        # 负缓存：上次尝试后的短时间内不再发请求（成功场景已被 fresh 拦住，
+        # 这里主要拦失败），防止网络不通时每次调用都硬吃一次超时
+        if (
+            not force
+            and _cache['last_attempt'] is not None
+            and now - _cache['last_attempt'] < _FAIL_TTL_SECONDS
+        ):
+            return _build_result()
+
+        if _fetching:
+            # 别的线程正在锁外拉取：不重复请求，先用现有缓存应付本次调用
+            return _build_result()
+        _fetching = True
+        _cache['last_attempt'] = now
+
+    data, err = None, None
+    try:
+        try:
+            data, err = _fetch_usage()
+        except Exception:
+            # _fetch_usage 内部已各自兜底，这里是最后保险
+            logger.warning('[Claude额度] 刷新过程异常', exc_info=True)
+            err = '刷新 Claude 额度时发生内部错误'
+    finally:
+        # 复位放 finally：即便冒出非 Exception 的异常，也不能让"正在拉取"标记
+        # 永久卡 True（那会连 force 刷新都被短路，额度数据冻结到进程重启）
+        with _lock:
+            _fetching = False
+
+    with _lock:
         if data is not None:
-            _cache['updated_at'] = int(now)
+            _cache['updated_at'] = int(time.time())
             _cache['data'] = data
             _cache['error'] = None
         else:
@@ -168,7 +214,7 @@ def get_claude_usage(force=False):
 
 
 def _build_result():
-    """由缓存组装对外契约。"""
+    """由缓存组装对外契约（须在持有 _lock 时调用）。"""
     data = _cache['data']
     if data is None:
         return {
@@ -177,6 +223,17 @@ def _build_result():
             'five_hour': None,
             'seven_day': None,
             'error': _cache['error'] or '暂无数据',
+        }
+    # 陈旧上限：上游长期失败时旧数据的 resets_at/用量早已失真，
+    # 按不可用返回，让前端走降级逻辑而不是拿冻结数据当真
+    age = time.time() - _cache['updated_at']
+    if age > _STALE_SECONDS:
+        return {
+            'available': False,
+            'updated_at': _cache['updated_at'],
+            'five_hour': None,
+            'seven_day': None,
+            'error': f'数据已过期，最后成功于 {int(age // 60)} 分钟前',
         }
     return {
         'available': True,

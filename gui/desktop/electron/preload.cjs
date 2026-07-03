@@ -103,3 +103,9 @@ contextBridge.exposeInMainWorld('AAS_EPD', {
   // 追加一条墨水屏日志到主进程 logs/epaper.log（主进程防抖落盘，保留长历史可外部翻查）
   appendLog: (line) => ipcRenderer.send('epd:log-append', line),
 });
+
+contextBridge.exposeInMainWorld('AAS_POWER', {
+  // 订阅系统休眠唤醒通知（主进程 powerMonitor resume 广播）；休眠中蓝牙必掉，
+  // 墨水屏侧收到后应立即校验连接状态/触发重连，而不是等下一次定时推送
+  onResume: (cb) => ipcRenderer.on('power:resume', () => cb()),
+});
