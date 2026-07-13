@@ -6,7 +6,18 @@ import { USERS } from '../lib/data';
 import type { PunchRec, RecentActivityEntry, User } from '../lib/types';
 import { useSystemStore } from '../store/system';
 import { usePunchStore } from '../store/punch';
-import { api } from '../lib/api';
+import { api, type WeatherResponse } from '../lib/api';
+import {
+  FIXED_WEATHER_LOCATION,
+  aqiTone,
+  getCachedWeather,
+  loadWeatherData,
+  roundWeather,
+  skyInfo,
+  weatherDayLabel,
+  weatherErrorMessage,
+  windDirection,
+} from '../lib/weather';
 import { FxSection } from '../components/ExchangeRatePanel';
 import { useAiNewsStore, CATEGORY_BY_SLUG, relTime } from '../store/aiNews';
 import { useToastStore } from '../store/toast';
@@ -394,6 +405,143 @@ function useMatchHeight(): [React.RefObject<HTMLDivElement>, number | null] {
   return [ref, h];
 }
 
+function WeatherCard({
+  onOpenWeather,
+  onOpenSettings,
+}: {
+  onOpenWeather: () => void;
+  onOpenSettings: () => void;
+}) {
+  const initial = getCachedWeather();
+  const [data, setData] = React.useState<WeatherResponse | null>(initial);
+  const [loading, setLoading] = React.useState(!initial);
+  const [error, setError] = React.useState<string | null>(null);
+
+  const refresh = React.useCallback(async (force: boolean) => {
+    setLoading(true);
+    setError(null);
+    try {
+      setData(await loadWeatherData(force));
+    } catch (err) {
+      setError(weatherErrorMessage(err));
+    } finally {
+      setLoading(false);
+    }
+  }, []);
+
+  React.useEffect(() => {
+    if (!initial) void refresh(false);
+  }, [initial, refresh]);
+
+  const current = data?.realtime;
+  const sky = skyInfo(current?.skycon);
+  const updateLabel = data
+    ? new Date(data.updated_at * 1000).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit', hour12: false })
+    : null;
+  const currentAqiTone = aqiTone(current?.aqi ?? null);
+
+  return (
+    <div className="card weather-card">
+      <div className="card-header weather-header">
+        <div className="row gap-2" style={{ minWidth: 0 }}>
+          <div className="weather-mark"><Icon.Cloud size={15} /></div>
+          <div style={{ minWidth: 0 }}>
+            <div className="card-title weather-address">
+              {data?.location.address || FIXED_WEATHER_LOCATION.address}
+            </div>
+            <div className="card-sub">
+              {data
+                ? `${data.source} · ${updateLabel} 更新${data.cached ? ' · 已缓存' : ''}`
+                : '固定地点 · 彩云天气'}
+            </div>
+          </div>
+        </div>
+        <div className="row gap-2">
+          {error && data && <span className="weather-refresh-error" title={error}>刷新失败</span>}
+          <button className="btn btn-sm" onClick={onOpenWeather}>详细天气</button>
+          <button
+            className="btn btn-ico btn-sm"
+            title="刷新固定地点天气"
+            disabled={loading}
+            onClick={() => void refresh(true)}
+          >
+            <span className={loading ? 'spin-ic' : ''} style={{ display: 'inline-flex' }}>
+              <Icon.Refresh size={13} />
+            </span>
+          </button>
+        </div>
+      </div>
+      <div className="card-body weather-body">
+        {!data && loading ? (
+          <div className="weather-empty">
+            <span className="spinner" />
+            <div>
+              <div className="weather-empty-title">正在获取固定地点天气</div>
+              <div className="muted">{FIXED_WEATHER_LOCATION.address}</div>
+            </div>
+          </div>
+        ) : !data ? (
+          <div className="weather-empty weather-error">
+            <Icon.AlertTriangle size={20} />
+            <div style={{ flex: 1 }}>
+              <div className="weather-empty-title">天气暂不可用</div>
+              <div className="muted">{error || '请稍后重试'}</div>
+            </div>
+            <button className="btn btn-sm" onClick={() => void refresh(true)}>重新加载</button>
+            <button className="btn btn-sm" onClick={onOpenSettings}>天气设置</button>
+          </div>
+        ) : (
+          <div className="weather-grid">
+            <div className="weather-current">
+              <div className={`weather-glyph ${sky.tone}`}>{sky.glyph}</div>
+              <div>
+                <div className="row" style={{ gap: 7, alignItems: 'baseline' }}>
+                  <span className="weather-temperature">{roundWeather(current?.temperature ?? null)}</span>
+                  <span className="weather-degree">°C</span>
+                </div>
+                <div className="weather-condition">
+                  {sky.label} · 体感 {roundWeather(current?.apparent_temperature ?? null, '°')}
+                </div>
+              </div>
+            </div>
+
+            <div className="weather-summary">
+              <div className="weather-keypoint">
+                {data.forecast_keypoint || data.hourly_description || '暂无短时天气提示'}
+              </div>
+              <div className="weather-stats">
+                <span>湿度 <b>{roundWeather(current?.humidity ?? null, '%')}</b></span>
+                <span>{windDirection(current?.wind_direction ?? null)} <b>{roundWeather(current?.wind_speed ?? null, ' km/h')}</b></span>
+                <span>能见度 <b>{roundWeather(current?.visibility ?? null, ' km')}</b></span>
+                <span className={`pill pill-${currentAqiTone}`}>AQI {roundWeather(current?.aqi ?? null)} {current?.aqi_description || ''}</span>
+              </div>
+              {data.address_warning && <div className="weather-address-warning">{data.address_warning}</div>}
+            </div>
+
+            <div className="weather-days">
+              {data.daily.slice(0, 5).map((day, index) => {
+                const info = skyInfo(day.skycon);
+                return (
+                  <div className="weather-day" key={`${day.date}-${index}`}>
+                    <div className="weather-day-name">{weatherDayLabel(day.date, index)}</div>
+                    <div className={`weather-day-glyph ${info.tone}`} title={info.label}>{info.glyph}</div>
+                    <div className="weather-day-temp mono">
+                      {roundWeather(day.temperature_max, '°')} <span>{roundWeather(day.temperature_min, '°')}</span>
+                    </div>
+                    <div className="weather-day-rain">
+                      降水 {roundWeather(day.precipitation_probability, '%')}
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
 // 仪表盘 AI 资讯模块 —— 竖向精选列表（与今日打卡同一行，高度对齐）
 function DashNewsCard({ matchH }: { matchH: number | null }) {
   const items = useAiNewsStore(s => s.cats.all.items);
@@ -635,6 +783,15 @@ export function DashboardScreen() {
             {modeLabel}
           </div>
         </div>
+      </div>
+
+      {/* 固定地点 + 彩云天气 */}
+      <div className="col gap-2">
+        <div className="kicker">天气 · 固定地点</div>
+        <WeatherCard
+          onOpenWeather={() => setScreen('weather')}
+          onOpenSettings={() => setScreen('settings')}
+        />
       </div>
 
       {/* 今日打卡 + AI 资讯 · 同一行 */}

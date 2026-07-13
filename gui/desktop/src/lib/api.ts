@@ -82,6 +82,79 @@ export interface ExchangeRateResponse {
   points: ExchangeRatePoint[]; // 按时间升序
 }
 
+// ===== 彩云天气（固定地点，后端代调彩云 v2.6 综合接口）=====
+export interface WeatherDailyItem {
+  date: string;
+  skycon: string | null;
+  temperature_min: number | null;
+  temperature_max: number | null;
+  precipitation_probability: number | null;
+}
+
+export interface WeatherHourlyItem {
+  datetime: string;
+  temperature: number | null;
+  apparent_temperature: number | null;
+  skycon: string | null;
+  precipitation: number | null;
+  precipitation_probability: number | null;
+  humidity: number | null;
+  wind_speed: number | null;
+  wind_direction: number | null;
+  aqi: number | null;
+}
+
+export interface WeatherAlertItem {
+  id: string;
+  title: string;
+  description: string;
+  code: string;
+  status: string;
+  location: string;
+  source: string;
+  published_at: number;
+}
+
+export interface WeatherResponse {
+  success: true;
+  source: '彩云天气';
+  updated_at: number;
+  location: {
+    latitude: number;
+    longitude: number;
+    name: string;
+    address: string;
+    resolved: boolean;
+  };
+  realtime: {
+    temperature: number | null;
+    apparent_temperature: number | null;
+    humidity: number | null;
+    skycon: string | null;
+    wind_speed: number | null;
+    wind_direction: number | null;
+    visibility: number | null;
+    pressure: number | null;
+    cloudrate: number | null;
+    precipitation_intensity: number | null;
+    nearest_precipitation_distance: number | null;
+    aqi: number | null;
+    aqi_description: string | null;
+    pm25: number | null;
+    pm10: number | null;
+    uv_description: string | null;
+    comfort_description: string | null;
+  };
+  forecast_keypoint: string | null;
+  hourly_description: string | null;
+  minutely_description: string | null;
+  hourly: WeatherHourlyItem[];
+  daily: WeatherDailyItem[];
+  alerts: WeatherAlertItem[];
+  address_warning: string | null;
+  cached: boolean;
+}
+
 // ===== AI 资讯（AI HOT，后端聚合中文 AI 资讯并按版块归类）=====
 export interface AiNewsItem {
   id: string;
@@ -346,6 +419,14 @@ export const api = {
     if (force) qs.set('force', '1');
     return request<ExchangeRateResponse>(`/api/v1/exchange-rate?${qs.toString()}`);
   },
+
+  // 彩云天气：精确坐标仅发往本机后端；固定地址可跳过额外的逆地理编码请求。
+  getWeather: (latitude: number, longitude: number, force = false, address?: string) =>
+    request<WeatherResponse>('/api/v1/weather', {
+      method: 'POST',
+      body: { latitude, longitude, force, address },
+      timeoutMs: 25_000,
+    }),
 
   // AI 资讯（AI HOT 聚合）；force 跳过后端缓存强制刷新（首屏），cursor 游标续拉"加载更多"，
   // category 按版块服务端过滤（缺省即"全部"），mode='selected' 只取主编精选（"只看精选"）；
