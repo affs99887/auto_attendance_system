@@ -8,10 +8,10 @@ import { useSystemStore } from '../store/system';
 import { usePunchStore } from '../store/punch';
 import { useStartupStore } from '../store/startup';
 import {
-  selectActiveWeatherEntry,
-  selectActiveWeatherLocation,
+  selectDefaultWeatherEntry,
   useWeatherStore,
 } from '../store/weather';
+import { DEFAULT_WEATHER_LOCATION } from '../lib/weatherLocations';
 import { api } from '../lib/api';
 import {
   WeatherOverviewCard,
@@ -412,15 +412,17 @@ function WeatherCard({
 }) {
   const startupStatus = useStartupStore(s => s.status);
   const startupReason = useStartupStore(s => s.reason);
-  const location = useWeatherStore(selectActiveWeatherLocation);
-  const { data, loading, error, hasAttempted } = useWeatherStore(selectActiveWeatherEntry);
-  const refresh = useWeatherStore(s => s.refresh);
+  const location = DEFAULT_WEATHER_LOCATION;
+  const { data, loading, error, hasAttempted } = useWeatherStore(selectDefaultWeatherEntry);
+  const refreshLocation = useWeatherStore(s => s.refreshLocation);
 
   React.useEffect(() => {
     // Electron 窗口会先于 Python HTTP 服务出现；等统一探活确认 ready 后再首拉，
     // 后端从 starting → ready 时也会自动补拉，避免首次 Failed to fetch 永久停在错误态。
-    if (startupStatus === 'ready' && !data && !hasAttempted && !loading) void refresh(false);
-  }, [startupStatus, data, hasAttempted, loading, refresh]);
+    if (startupStatus === 'ready' && !data && !hasAttempted && !loading) {
+      void refreshLocation(DEFAULT_WEATHER_LOCATION.id, false);
+    }
+  }, [startupStatus, data, hasAttempted, loading, refreshLocation]);
 
   return (
     <div className="weather-fusion-shell">
@@ -428,7 +430,7 @@ function WeatherCard({
         <div className="card weather-empty" role="status" aria-live="polite" aria-busy="true">
           <span className="spinner" />
           <div>
-            <div className="weather-empty-title">正在获取当前地点天气</div>
+            <div className="weather-empty-title">正在获取华山路1076号天气</div>
             <div className="muted">{location.address}</div>
           </div>
         </div>
@@ -441,7 +443,7 @@ function WeatherCard({
               {error || (startupStatus === 'failed' ? startupReason : null) || '请稍后重试'}
             </div>
           </div>
-          <button className="btn btn-sm" onClick={() => void refresh(true)}>重新加载</button>
+          <button className="btn btn-sm" onClick={() => void refreshLocation(DEFAULT_WEATHER_LOCATION.id, true)}>重新加载</button>
           <button className="btn btn-sm" onClick={onOpenSettings}>天气设置</button>
         </div>
       ) : (
@@ -455,7 +457,7 @@ function WeatherCard({
             data={data}
             size="m"
             loading={loading}
-            onRefresh={() => void refresh(true)}
+            onRefresh={() => void refreshLocation(DEFAULT_WEATHER_LOCATION.id, true)}
             onOpenDetails={onOpenWeather}
           />
         </>
@@ -660,6 +662,12 @@ export function DashboardScreen() {
       return h * 60 + m - 8 * 60;
     });
 
+  const openHomeWeatherDetails = React.useCallback(() => {
+    void useWeatherStore.getState()
+      .setActiveLocation(DEFAULT_WEATHER_LOCATION.id)
+      .then(() => setScreen('weather'));
+  }, [setScreen]);
+
   return (
     <div className="col gap-6">
       {/* KPI row */}
@@ -731,11 +739,11 @@ export function DashboardScreen() {
         </div>
       </div>
 
-      {/* 当前收藏地点 + 彩云天气 */}
+      {/* 首页固定地点 + 彩云天气 */}
       <div className="col gap-2">
-        <div className="kicker">天气 · 当前地点</div>
+        <div className="kicker">天气 · 华山路1076号</div>
         <WeatherCard
-          onOpenWeather={() => setScreen('weather')}
+          onOpenWeather={openHomeWeatherDetails}
           onOpenSettings={() => setScreen('settings')}
         />
       </div>

@@ -43,7 +43,9 @@ export interface WeatherState {
   hydrated: boolean;
   hydrate: () => Promise<void>;
   refresh: (force?: boolean) => Promise<void>;
+  refreshLocation: (locationId: string, force?: boolean) => Promise<void>;
   refreshAfterCurrent: (force?: boolean) => void;
+  refreshLocationAfterCurrent: (locationId: string, force?: boolean) => void;
   setActiveLocation: (locationId: string) => Promise<void>;
   addFavorite: (location: WeatherLocation) => Promise<string | null>;
   removeFavorite: (locationId: string) => Promise<boolean>;
@@ -232,6 +234,16 @@ export const useWeatherStore = create<WeatherState>((set, get) => {
     }
   };
 
+  const runRefreshAfterCurrent = async (locationId: string, force: boolean): Promise<void> => {
+    await get().hydrate();
+    const entry = get().entries[locationId] || EMPTY_WEATHER_ENTRY;
+    if (entry.loading) {
+      queuedRefreshes.set(locationId, (queuedRefreshes.get(locationId) || false) || force);
+      return;
+    }
+    await runRefresh(locationId, force);
+  };
+
   return {
     locations: initialPreferences.locations,
     activeLocationId: initialPreferences.activeLocationId,
@@ -270,17 +282,17 @@ export const useWeatherStore = create<WeatherState>((set, get) => {
       await runRefresh(get().activeLocationId, force);
     },
 
+    async refreshLocation(locationId, force = false) {
+      await get().hydrate();
+      await runRefresh(locationId, force);
+    },
+
     refreshAfterCurrent(force = false) {
-      void (async () => {
-        await get().hydrate();
-        const locationId = get().activeLocationId;
-        const entry = get().entries[locationId] || EMPTY_WEATHER_ENTRY;
-        if (entry.loading) {
-          queuedRefreshes.set(locationId, (queuedRefreshes.get(locationId) || false) || force);
-          return;
-        }
-        await runRefresh(locationId, force);
-      })();
+      void get().hydrate().then(() => runRefreshAfterCurrent(get().activeLocationId, force));
+    },
+
+    refreshLocationAfterCurrent(locationId, force = false) {
+      void runRefreshAfterCurrent(locationId, force);
     },
 
     async setActiveLocation(locationId) {
@@ -357,4 +369,8 @@ export const selectActiveWeatherLocation = (state: WeatherState): WeatherLocatio
 
 export const selectActiveWeatherEntry = (state: WeatherState): WeatherEntry => (
   state.entries[state.activeLocationId] || EMPTY_WEATHER_ENTRY
+);
+
+export const selectDefaultWeatherEntry = (state: WeatherState): WeatherEntry => (
+  state.entries[DEFAULT_WEATHER_LOCATION.id] || EMPTY_WEATHER_ENTRY
 );
