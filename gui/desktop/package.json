@@ -2,7 +2,7 @@
   "name": "auto-attendance-desktop",
   "private": true,
   "version": "0.2.0",
-  "aasCodeVersion": "2.0.0",
+  "aasCodeVersion": "3.0.0",
   "aasRequirementsHash": "800f0a5b853d2f44fc39d146247477cd9f31469e013bcf1cc677a64c718fc356",
   "aasOtaTrust": {
     "keyId": "aas-ota-ed25519-2026-01",

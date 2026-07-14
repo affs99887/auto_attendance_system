@@ -1,6 +1,7 @@
-# electron-builder 配置 — 打包 Windows NSIS 安装包
+# electron-builder 配置 — 打包 Windows NSIS 安装版与单文件便携版
 #
-# 输出：<项目根>/release/AutoAttendance-Setup-<version>.exe
+# 输出：<项目根>/release/AutoAttendance-Setup-<version>-x64.exe
+#       <项目根>/release/AutoAttendance-Portable-<version>-x64.exe
 #       （output 相对于本配置文件所在的 gui/desktop/，用 ../../ 指向项目根）
 # 安装后目录结构：
 #   <Install>\AutoAttendance.exe
@@ -69,8 +70,13 @@ win:
   target:
     - target: nsis
       arch: [x64]
+    - target: portable
+      arch: [x64]
   icon: electron/app-icon.png
   artifactName: AutoAttendance-Setup-${version}-${arch}.${ext}
+
+portable:
+  artifactName: AutoAttendance-Portable-${version}-${arch}.${ext}
 
 nsis:
   oneClick: false
