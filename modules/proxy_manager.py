@@ -181,7 +181,13 @@ class ProxyManager:
 
     # ------------------------------------------------------------------ 路径
     def _bin_dir(self):
-        # bin/ 随代码打包（resources/backend/bin），与可写数据根 proxy_runtime 解耦。
+        # bin/（mihomo 二进制 + geo）体积大且极少变。瘦壳 + 代码 OTA 方案下，后端 .py 经更新会迁到
+        # 外部版本目录，其 code_root/bin 不含 mihomo（bin 不进代码包，由壳子固定发一次）；此时壳子
+        # 经环境变量 AAS_BIN_DIR 把 bin 指回壳子稳定位置（resources/backend/bin）。
+        # 未设 AAS_BIN_DIR（dev / 源码方案 / 内置基线，bin 就在 code_root/bin）时沿用原行为，完全向后兼容。
+        env_bin = os.environ.get('AAS_BIN_DIR')
+        if env_bin:
+            return env_bin
         return os.path.join(self.code_root, 'bin')
 
     def mihomo_path(self):

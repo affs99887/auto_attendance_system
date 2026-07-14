@@ -23,6 +23,7 @@ files:
   - dist/**/*
   - electron/main.cjs
   - electron/preload.cjs
+  - electron/updater.cjs
   - electron/tray-icon.png
   - electron/tray-icon@2x.png
   - package.json

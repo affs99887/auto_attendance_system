@@ -6,7 +6,7 @@
 //  - effect2：仅 status==='ready' 时才拉状态/日志、起定时刷新、订阅 WS。
 //  - effect3：ready/失败的 toast 边沿提示。
 import { useEffect } from 'react';
-import { announceBackend, setBackendOverride, type StartupPayload } from '../lib/backend';
+import { announceBackend, setBackendOverride, type StartupPayload, type UpdateStatus } from '../lib/backend';
 import { wsClient } from '../lib/ws';
 import { api } from '../lib/api';
 import { useSystemStore } from './system';
@@ -19,6 +19,7 @@ import { useExchangeRateStore } from './exchangeRate';
 import { useAiNewsStore } from './aiNews';
 import { useStartupLogStore } from './startupLog';
 import { useServiceStore } from './service';
+import { appConfirm } from '../lib/dialog';
 
 const REFRESH_INTERVAL_MS = 15_000;
 const FX_REFRESH_INTERVAL_MS = 5 * 60_000; // 汇率轮询：5 分钟
@@ -48,6 +49,47 @@ export function useBackendBootstrap() {
       .catch(() => { /* ignore */ });
     const off = service.onStatus(p => useServiceStore.getState().setRunning(!!p?.running));
     return off; // StrictMode 安全：cleanup 即取消订阅
+  }, []);
+
+  // effect0.5：OTA 状态全局接入。下载完成后无论用户在哪个页面都明确提示，并由用户确认是否立即重启；
+  // 取消后仍可在「关于 & 命令」页手动重启。网络检查失败只留系统日志，避免离线时每 6 小时弹一次错误。
+  useEffect(() => {
+    const update = window.AAS_UPDATE;
+    if (!update) return;
+    let cancelled = false;
+    let promptedVersion = '';
+    let promptInFlight = false;
+
+    const handle = (s: UpdateStatus) => {
+      if (cancelled || !s) return;
+      if (s.status === 'shell-outdated') {
+        useToastStore.getState().push('err', `发现代码版本 ${s.version}，但客户端壳需升级到 ${s.requiredShell}`, 10_000);
+        return;
+      }
+      if (s.status === 'dependencies-outdated') {
+        useToastStore.getState().push('err', `代码版本 ${s.version} 修改了 Python 依赖，请先升级客户端并更新 Python 环境`, 10_000);
+        return;
+      }
+      if (s.status !== 'staged' || promptedVersion === s.version || promptInFlight) return;
+      promptedVersion = s.version;
+      promptInFlight = true;
+      useToastStore.getState().push('ok', `新版本 ${s.version} 已安全下载，等待重启生效`, 10_000);
+      void (async () => {
+        const restart = await appConfirm(
+          `新版本 ${s.version} 已下载并通过签名校验。是否立即重启应用使其生效？\n\n若正在打卡，可选择“稍后”，之后在“关于 & 命令”页面重启。`,
+          { title: '更新已就绪', confirmText: '立即重启', cancelText: '稍后' },
+        );
+        if (!cancelled && restart) {
+          const result = await update.relaunch();
+          if (!result.ok) useToastStore.getState().push('err', result.error || '重启失败');
+        }
+        promptInFlight = false;
+      })();
+    };
+
+    const off = update.onStatus(handle);
+    void update.getStatus().then(handle).catch(() => { /* ignore */ });
+    return () => { cancelled = true; off(); };
   }, []);
 
   // effect1：监听启动状态 + ping/status 探活
@@ -91,9 +133,10 @@ export function useBackendBootstrap() {
       if (p.state === 'failed') { st.setFailed(p.reason); return; }
       // p.state === 'token'
       setBackendOverride({ token: p.token, httpUrl: p.httpUrl, wsUrl: p.wsUrl });
-      // 去重（did-finish-load 补推 / 重复推送）；但失败态须放行——否则重试后唯一的
-      // 恢复路径（同一 token 的补推）也被丢弃，UI 永久卡在 starting。
-      if (p.token === st.currentToken && st.status !== 'failed') return;
+      // 只在“同 token 且已经 ready”时去重 did-finish-load 补推。starting/failed 即使 token 相同也
+      // 必须重新探活：系统唤醒或后端重启会开启新代际，若在这里提前返回，UI 会永久卡在 starting，
+      // 壳子的 OTA 联合健康门也收不到这一代的 renderer-ready 握手。
+      if (p.token === st.currentToken && st.status === 'ready') return;
       const wasReady = st.status === 'ready';
       st.setCurrentToken(p.token);
       if (wasReady) {
@@ -294,4 +337,10 @@ export function useBackendBootstrap() {
       useToastStore.getState().push('err', st.reason || '后端启动失败');
     }
   }, [status, overlayDismissed]);
+
+  // React 已经挂载，且 effect1 已完成 /ping + 鉴权 /status 的真实探活；通知壳子前后端都健康。
+  useEffect(() => {
+    if (status !== 'ready') return;
+    void window.AAS_UPDATE?.rendererReady?.().catch(() => { /* 旧壳/纯浏览器降级 */ });
+  }, [status]);
 }

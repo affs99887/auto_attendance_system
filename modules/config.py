@@ -13,8 +13,10 @@ import threading
 import time
 from dotenv import load_dotenv
 
-# 加载环境变量
-load_dotenv()
+# 配置属于稳定数据根，不属于可替换的 OTA 代码目录。Electron 壳显式传 AAS_DATA_DIR；
+# 源码/看门狗模式回退 cwd，二者都确保读取用户实际维护的 .env，而不是按 config.py 所在目录向上找。
+_data_dir = os.environ.get('AAS_DATA_DIR') or os.getcwd()
+load_dotenv(os.path.join(_data_dir, '.env'))
 
 
 def _int_env(name, default):
@@ -342,13 +344,16 @@ class Config:
         [M60] 二进制不存在属"重试多少次都不会好"的确定性失败——此时 mihomo 永远不会就绪，
         若 get_telegram_proxy 仍返回内置死端口，Telegram 全链路会永久不可用。这里只做纯文件
         存在性判断（无副作用），不导入/实例化 ProxyManager（其 __init__ 有迁移副作用，且会引入
-        与 modules.proxy_manager 的循环导入）。路径派生与 ProxyManager.mihomo_path() 保持一致：
-        <project_root>/bin/mihomo(.exe)，二者同在 modules/ 下故 __file__ 推导出的根目录相同。
+        与 modules.proxy_manager 的循环导入）。路径派生与 ProxyManager._bin_dir() 严格一致：
+        优先 AAS_BIN_DIR（瘦壳方案下壳子指向其固定 bin），未设时回退 <project_root>/bin（二者同在
+        modules/ 下故 __file__ 推导出的根目录相同）。两处必须同口径，否则误判二进制缺失会错误触发回退。
         """
         try:
-            project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+            env_bin = os.environ.get('AAS_BIN_DIR')
+            bin_dir = env_bin if env_bin else os.path.join(
+                os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'bin')
             name = 'mihomo.exe' if os.name == 'nt' else 'mihomo'
-            return not os.path.isfile(os.path.join(project_root, 'bin', name))
+            return not os.path.isfile(os.path.join(bin_dir, name))
         except Exception:
             # 探测自身异常时保守认为"未缺失"，沿用原有"等待 mihomo 启动"的行为，避免误回退。
             return False

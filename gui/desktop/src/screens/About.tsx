@@ -3,6 +3,9 @@ import * as React from 'react';
 import { Icon } from '../lib/icons';
 import { COMMANDS } from '../lib/data';
 import { ServiceControls } from '../components/ServiceControls';
+import type { UpdateStatus } from '../lib/backend';
+import { appConfirm } from '../lib/dialog';
+import { useToastStore } from '../store/toast';
 
 const DATA_FLOW = `  ┌─────────────────┐
   │  Telegram Bot   │ ◄── 用户命令 (/punch_in 等)
@@ -39,6 +42,121 @@ const MODULES = [
 ];
 
 export function AboutScreen() {
+  // 当前运行的代码版本（瘦壳 + OTA）：经 Electron preload 的 AAS_UPDATE 拉取主进程实际加载的代码包版本。
+  // 纯浏览器 / 旧 preload 下 AAS_UPDATE 为 undefined，回退显示静态 'v2.0'。
+  const [verLabel, setVerLabel] = React.useState('v2.0.0');
+  const [shellVersion, setShellVersion] = React.useState('—');
+  const [updateStatus, setUpdateStatus] = React.useState<UpdateStatus>({ status: 'idle' });
+  const [availableVersion, setAvailableVersion] = React.useState<string | null>(null);
+  const [updateBusy, setUpdateBusy] = React.useState(false);
+  // 主进程 push 是权威实时状态。异步 getStatus/check/apply 只能在请求期间没有收到新 push 时回写，
+  // 防止旧快照晚到后把 staged/error 等新状态覆盖回 idle/available。
+  const pushedStatusRevision = React.useRef(0);
+  React.useEffect(() => {
+    let alive = true;
+    const update = window.AAS_UPDATE;
+    if (!update) return () => { alive = false; };
+    update.getInfo().then(info => {
+      if (!alive || !info) return;
+      // ota/env 来源标注代码来源便于排障；builtin/dev 只显版本号
+      const tag = info.source === 'ota' ? ' · 已更新' : info.source === 'env' ? ' · 外部' : '';
+      setVerLabel(`v${info.codeVersion}${tag}`);
+      setShellVersion(info.shellVersion);
+    }).catch(() => { /* 拉取失败保留默认 */ });
+    const acceptStatus = (s: UpdateStatus) => {
+      if (!alive) return;
+      setUpdateStatus(s);
+      // availableVersion 只描述一次 check 的 idle 结果；任何实际更新状态都应取代它。
+      if (s.status !== 'idle') setAvailableVersion(null);
+    };
+    const off = update.onStatus(s => {
+      pushedStatusRevision.current += 1;
+      acceptStatus(s);
+    });
+    const snapshotRevision = pushedStatusRevision.current;
+    void update.getStatus().then(s => {
+      if (pushedStatusRevision.current === snapshotRevision) acceptStatus(s);
+    }).catch(() => { /* ignore */ });
+    return () => { alive = false; off(); };
+  }, []);
+
+  const checkUpdate = async () => {
+    const update = window.AAS_UPDATE;
+    if (!update) return;
+    setUpdateBusy(true);
+    setAvailableVersion(null);
+    setUpdateStatus({ status: 'checking' });
+    const requestRevision = pushedStatusRevision.current;
+    try {
+      const result = await update.check();
+      if (pushedStatusRevision.current !== requestRevision) return;
+      if (result.status === 'error') {
+        setUpdateStatus({ status: 'error', error: result.error });
+      } else if (result.status === 'available') {
+        setAvailableVersion(result.latest);
+        setUpdateStatus({ status: 'idle' });
+        useToastStore.getState().push('ok', `发现新版本 ${result.latest}`);
+      } else if (result.status === 'shell-outdated') {
+        setUpdateStatus(result);
+        useToastStore.getState().push('err', `版本 ${result.version} 需要先升级客户端壳到 ${result.requiredShell}`);
+      } else if (result.status === 'dependencies-outdated') {
+        setUpdateStatus(result);
+        useToastStore.getState().push('err', `版本 ${result.version} 修改了 Python 依赖，需先升级客户端并更新 Python 环境`);
+      } else {
+        setUpdateStatus({ status: 'up-to-date', currentVersion: result.currentVersion });
+        useToastStore.getState().push('ok', '当前已经是最新版本');
+      }
+    } catch (e) {
+      if (pushedStatusRevision.current !== requestRevision) return;
+      const error = e instanceof Error ? e.message : String(e);
+      setUpdateStatus({ status: 'error', error });
+      useToastStore.getState().push('err', error);
+    } finally {
+      setUpdateBusy(false);
+    }
+  };
+
+  const applyUpdate = async () => {
+    const update = window.AAS_UPDATE;
+    if (!update) return;
+    setUpdateBusy(true);
+    // 一旦开始应用更新，后续文案和操作都以 apply/onStatus 的真实状态为准。
+    setAvailableVersion(null);
+    const requestRevision = pushedStatusRevision.current;
+    try {
+      const result = await update.apply();
+      if (pushedStatusRevision.current === requestRevision) setUpdateStatus(result);
+      if (result.status === 'error') useToastStore.getState().push('err', result.error);
+    } catch (e) {
+      if (pushedStatusRevision.current !== requestRevision) return;
+      const error = e instanceof Error ? e.message : String(e);
+      setAvailableVersion(null);
+      setUpdateStatus({ status: 'error', error });
+      useToastStore.getState().push('err', error);
+    } finally {
+      setUpdateBusy(false);
+    }
+  };
+
+  const relaunchForUpdate = async () => {
+    const update = window.AAS_UPDATE;
+    if (!update) return;
+    if (!(await appConfirm('应用将立即重启并加载已验证的新版本，是否继续？', {
+      title: '重启应用更新', confirmText: '立即重启', cancelText: '取消',
+    }))) return;
+    const result = await update.relaunch();
+    if (!result.ok) useToastStore.getState().push('err', result.error || '重启失败');
+  };
+
+  const canApplyAvailableUpdate = updateStatus.status === 'idle' && availableVersion !== null;
+  const updateText = updateStatus.status === 'checking' ? '正在从 GitHub 检查并验证更新…'
+    : updateStatus.status === 'up-to-date' ? '当前已经是最新版本'
+      : updateStatus.status === 'staged' ? `版本 ${updateStatus.version} 已下载并验签，等待重启`
+        : updateStatus.status === 'shell-outdated' ? `版本 ${updateStatus.version} 需要客户端壳 ${updateStatus.requiredShell} 或更高版本`
+          : updateStatus.status === 'dependencies-outdated' ? `版本 ${updateStatus.version} 修改了 Python 依赖，需先升级客户端并更新 Python 环境`
+            : updateStatus.status === 'error' ? `更新失败：${updateStatus.error}`
+              : canApplyAvailableUpdate ? `发现新版本 ${availableVersion}，尚未下载`
+                : window.AAS_UPDATE ? '尚未手动检查；系统每 6 小时自动检查' : '当前运行环境不支持应用内更新';
   return (
     <div className="col gap-6">
       <div className="grid" style={{ gridTemplateColumns: '1fr 1.4fr', gap: 16 }}>
@@ -51,7 +169,7 @@ export function AboutScreen() {
               <div>
                 <div className="h1">AAS</div>
                 <div className="muted" style={{ fontSize: 13, marginTop: 4 }}>
-                  Auto Attendance System · v2.0
+                  Auto Attendance System · {verLabel}
                 </div>
                 <div className="row gap-2" style={{ marginTop: 12 }}>
                   <span className="pill pill-info"><span className="dot" />Python 3.12</span>
@@ -70,6 +188,32 @@ export function AboutScreen() {
             <div className="divider" />
             {/* 服务控制（启动/重启/终止/重连 + 心跳）— 统一走 ServiceControls bar 形态 */}
             <ServiceControls variant="bar" />
+            <div className="divider" />
+            <div className="col gap-2" style={{ fontSize: 12 }}>
+              <div className="spread">
+                <span style={{ fontWeight: 600 }}>代码更新</span>
+                <span className="mono muted">壳 v{shellVersion}</span>
+              </div>
+              <div
+                className="muted"
+                style={updateStatus.status === 'error' || updateStatus.status === 'shell-outdated' || updateStatus.status === 'dependencies-outdated' ? { color: 'var(--danger)' } : undefined}
+              >
+                {updateText}
+              </div>
+              <div className="row gap-2" style={{ flexWrap: 'wrap', marginTop: 4 }}>
+                <button className="btn" disabled={!window.AAS_UPDATE || updateBusy || updateStatus.status === 'checking' || updateStatus.status === 'staged'} onClick={() => { void checkUpdate(); }}>
+                  {updateBusy || updateStatus.status === 'checking' ? '处理中…' : '检查更新'}
+                </button>
+                {canApplyAvailableUpdate && (
+                  <button className="btn btn-primary" disabled={updateBusy} onClick={() => { void applyUpdate(); }}>
+                    下载并验证 v{availableVersion}
+                  </button>
+                )}
+                {updateStatus.status === 'staged' && (
+                  <button className="btn btn-primary" onClick={() => { void relaunchForUpdate(); }}>重启生效</button>
+                )}
+              </div>
+            </div>
           </div>
         </div>
 

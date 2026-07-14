@@ -161,12 +161,20 @@ function Sidebar({ screen, setScreen }: SidebarProps) {
 
 function TitleBar() {
   const win = window.AAS_WINDOW;
+  const [codeVersion, setCodeVersion] = React.useState('2.0.0');
+  React.useEffect(() => {
+    let alive = true;
+    void window.AAS_UPDATE?.getInfo()
+      .then(info => { if (alive && info?.codeVersion) setCodeVersion(info.codeVersion); })
+      .catch(() => { /* 保留内置版本 */ });
+    return () => { alive = false; };
+  }, []);
   return (
     <div className="titlebar">
       <div className="titlebar-app">
         <div className="app-mark">A</div>
         <span>AAS</span>
-        <span style={{ color: 'var(--text-muted)', fontWeight: 400, marginLeft: 4 }}>v2.0</span>
+        <span style={{ color: 'var(--text-muted)', fontWeight: 400, marginLeft: 4 }}>v{codeVersion}</span>
       </div>
       <div className="titlebar-title">Auto Attendance · 赖得鑫@localhost</div>
       <div className="window-controls">

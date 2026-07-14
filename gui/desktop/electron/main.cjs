@@ -12,19 +12,184 @@
 const { app, BrowserWindow, Tray, Menu, nativeImage, shell, dialog, ipcMain, screen, powerMonitor, net } = require('electron');
 const path = require('node:path');
 const fs = require('node:fs');
+const { fileURLToPath } = require('node:url');
 const { spawn, execFileSync } = require('node:child_process');
+const updater = require('./updater.cjs'); // 代码 OTA：查 manifest/下载校验/落地 versions+current 指针
+const SHELL_PACKAGE = require('../package.json');
+// 启动加载复验与联网更新必须使用同一可信仓库。正式包固定默认仓库；仅 dev/测试允许 env 覆盖。
+const UPDATE_REPO = (!app.isPackaged && process.env.AAS_UPDATE_REPO) || updater.DEFAULT_REPO;
 
-// 项目根目录：
-//  - dev: gui/desktop/electron/../../../ → C:\auto_attendance_system
-//  - packaged: resources/backend/（由 electron-builder.yml extraResources 复制）
-const PROJECT_ROOT = app.isPackaged
-  ? path.join(process.resourcesPath, 'backend')
-  : path.resolve(__dirname, '..', '..', '..');
-// 后端可写数据根：dev=项目根；打包=用户指定的现有数据目录（含真实记录/截图/配置）。
+// ============================================================================
+// 代码目录解析（瘦壳 + 代码 OTA 的地基）
+//  壳子（Electron 运行时 + main.cjs/preload + 内置 bin）固定不变，后端 .py 与前端 dist
+//  作为可更新的「代码包」独立存在。本函数决定本次启动到底跑哪一份代码，优先级：
+//    1) 环境变量 AAS_CODE_DIR：显式指向一个含 backend/ 与 dist/ 的目录（dev/测试/手动覆盖）
+//    2) <userData>/aas-code/versions/<current 指针>：OTA 更新落地的版本目录（阶段2写入）
+//    3) 内置基线：打包=resources/backend + resources/app/dist；dev=仓库源码 + gui/desktop/dist
+//  返回 { backendDir, frontendDir, version, source }。backend 与 frontend 分开定位：
+//  内置态二者父目录不同（resources/backend vs resources/app/dist），外部代码包则同根。
+//  任一外部来源结构校验失败 → 回退下一优先级，保证「更新坏了也能用内置版起来」。
+// ============================================================================
+const REPO_ROOT = path.resolve(__dirname, '..', '..', '..'); // dev: 仓库根 C:\auto_attendance_system
+// userData 仅在此取一次并经 CODE_HOME/CODE_VERSIONS_DIR/CODE_CURRENT_PTR 全程复用。
+// 阶段2 实现 OTA 写入时必须复用这三个常量、禁止再次 app.getPath('userData')——否则 package.json 的
+// name(auto-attendance-desktop) 与 electron-builder 的 productName(AutoAttendance) 差异会让读/写目录
+// 错位（壳子读 A 目录、OTA 写 B 目录），永远读不到更新。
+const CODE_HOME = path.join(app.getPath('userData'), 'aas-code');
+const CODE_VERSIONS_DIR = path.join(CODE_HOME, 'versions');
+const CODE_CURRENT_PTR = path.join(CODE_HOME, 'current');
+
+// 读取代码包元数据，失败返回 null。正式 OTA 会额外核对版本与当前壳支持的依赖指纹。
+function readBundleMetadata(dir) {
+  try {
+    const o = JSON.parse(fs.readFileSync(path.join(dir, 'bundle.json'), 'utf-8'));
+    return o && typeof o === 'object' && !Array.isArray(o) ? o : null;
+  } catch { return null; }
+}
+
+function readBundleVersion(dir) {
+  const meta = readBundleMetadata(dir);
+  return (meta && typeof meta.version === 'string' && meta.version) || null;
+}
+
+function otaBundleCompatibilityError(dir, expectedVersion) {
+  try {
+    updater.verifyInstalledBundle({
+      dir,
+      expectedVersion,
+      repo: UPDATE_REPO,
+      shellVersion: app.getVersion(),
+    });
+  } catch (e) {
+    return e && e.message ? e.message : 'bundle.json 兼容性字段非法';
+  }
+  return null;
+}
+
+// 校验一个「代码包目录」结构是否完整：必须同时有 backend/main.py 与 dist/index.html，
+// 缺任一即视为损坏/未就绪，触发回退到下一优先级（绝不加载半截代码导致白屏或起不来）。
+function isValidBundleDir(dir) {
+  try {
+    return !!dir
+      && fs.existsSync(path.join(dir, 'backend', 'main.py'))
+      && fs.existsSync(path.join(dir, 'dist', 'index.html'));
+  } catch { return false; }
+}
+
+// 内置基线（优先级3）：打包态 = 安装包内 resources/backend + resources/app/dist；
+// dev = 仓库源码 + gui/desktop/dist。永远存在，作为首装/离线/更新损坏时的兜底。
+function builtinCodeDir() {
+  if (app.isPackaged) {
+    const backendDir = path.join(process.resourcesPath, 'backend');
+    return {
+      backendDir,
+      frontendDir: path.join(process.resourcesPath, 'app', 'dist'),
+      version: readBundleVersion(backendDir) || SHELL_PACKAGE.aasCodeVersion || app.getVersion(),
+      source: 'builtin',
+    };
+  }
+  return {
+    backendDir: REPO_ROOT,
+    frontendDir: path.join(REPO_ROOT, 'gui', 'desktop', 'dist'),
+    version: readBundleVersion(REPO_ROOT) || SHELL_PACKAGE.aasCodeVersion || 'dev',
+    source: 'dev',
+  };
+}
+
+// 版本目录名白名单：只允许纯数字三段版本（如 2.1.0）的单段名。
+// 这样 ../、绝对路径、路径分隔符一律被拒，杜绝 current 指针（将来由阶段2 OTA 写入，或被外部篡改）
+// 经 path.join 穿越出 versions/ 目录、诱导壳子加载并 spawn 任意目录下的 main.py。
+function isSafeVersionName(ver) {
+  return /^\d+\.\d+\.\d+$/.test(ver);
+}
+
+function resolveCodeDir() {
+  // 1) 显式覆盖（AAS_CODE_DIR 指向含 backend/ 与 dist/ 的代码包根）。
+  //    仅 dev/测试承认：打包态(app.isPackaged)一律忽略——正式安装包不给「环境变量指向任意本机代码」留
+  //    注入口（可信外壳不应被用户级环境变量诱导加载/spawn 任意代码）。打包态的代码更新只走优先级2 的
+  //    OTA 版本目录（受 versions/ 容器 + isSafeVersionName 约束，及阶段2 的下发校验）。
+  //    相对路径先 path.resolve 归一，避免相对主进程 cwd（托盘/快捷方式启动时不固定）解析出不可预期目录。
+  if (!app.isPackaged && process.env.AAS_CODE_DIR) {
+    const envDir = path.resolve(process.env.AAS_CODE_DIR);
+    if (isValidBundleDir(envDir)) {
+      return {
+        backendDir: path.join(envDir, 'backend'),
+        frontendDir: path.join(envDir, 'dist'),
+        version: readBundleVersion(envDir) || 'env',
+        source: 'env',
+      };
+    }
+    console.warn('[aas-electron] AAS_CODE_DIR 结构无效（缺 backend/main.py 或 dist/index.html），忽略：', envDir);
+  }
+  // 2) OTA 版本目录（current 指针指向 versions/<version>）。dev 默认忽略，避免本机安装版遗留的
+  // current 让开发启动悄悄运行旧 OTA 代码；需要联调时显式 AAS_USE_OTA=1。
+  if (app.isPackaged || process.env.AAS_USE_OTA === '1') {
+    try {
+      if (fs.existsSync(CODE_CURRENT_PTR)) {
+        const ver = fs.readFileSync(CODE_CURRENT_PTR, 'utf-8').trim();
+        if (ver && isSafeVersionName(ver)) {
+          const builtinVersion = SHELL_PACKAGE.aasCodeVersion;
+          if (isSafeVersionName(builtinVersion) && updater.compareVersions(ver, builtinVersion) <= 0) {
+            console.info(`[aas-electron] 内置代码 ${builtinVersion} 不低于磁盘 OTA ${ver}，优先使用新版内置代码`);
+            return builtinCodeDir();
+          }
+          const dir = path.join(CODE_VERSIONS_DIR, ver);
+          if (isValidBundleDir(dir)) {
+            const compatibilityError = otaBundleCompatibilityError(dir, ver);
+            if (!compatibilityError) {
+              return {
+                backendDir: path.join(dir, 'backend'),
+                frontendDir: path.join(dir, 'dist'),
+                version: ver,
+                source: 'ota',
+              };
+            }
+            console.warn(`[aas-electron] current 指向的 OTA 版本不兼容（${compatibilityError}），回退内置：`, dir);
+          } else {
+            console.warn('[aas-electron] current 指向的版本目录无效，回退内置：', dir);
+          }
+        } else if (ver) {
+          console.warn('[aas-electron] current 指针含非法版本名，回退内置：', ver);
+        }
+      }
+    } catch (e) {
+      console.warn('[aas-electron] 读取 current 指针失败，回退内置：', e.message);
+    }
+  }
+  // 3) 内置基线
+  return builtinCodeDir();
+}
+
+const CODE = resolveCodeDir();
+// 后端代码根（含 main.py / modules / templates）。原 PROJECT_ROOT 语义不变，仅来源可被 OTA 覆盖。
+const PROJECT_ROOT = CODE.backendDir;
+// 前端编译产物目录（含 index.html / assets）。prod 用 file:// 从此加载（vite base:'./' 故相对路径可解析）。
+const FRONTEND_DIR = CODE.frontendDir;
+const CODE_VERSION = CODE.version;
+// 壳子固定 bin（mihomo 二进制 + geo）：体积大且极少变，不随代码包更新而下发。
+// 经 AAS_BIN_DIR 注入给后端，使迁到外部目录的后端仍能找到它（详见 spawnPython 的 env）。
+//  - 打包：resources/backend/bin（extraResources 随壳子发一次，永远存在）
+//  - dev ：仓库根 bin（由 scripts/fetch-mihomo.ps1 准备）
+const STABLE_BIN_DIR = app.isPackaged
+  ? path.join(process.resourcesPath, 'backend', 'bin')
+  : path.join(REPO_ROOT, 'bin');
+// Edge 驱动同样属于壳子稳定资源，不进入 OTA 代码包。后端不能再按自身 __file__（OTA 版本目录）寻找。
+const STABLE_EDGE_DRIVER_PATH = app.isPackaged
+  ? path.join(process.resourcesPath, 'backend', 'msedgedriver.exe')
+  : path.join(REPO_ROOT, 'msedgedriver.exe');
+console.info(`[aas-electron] code source=${CODE.source} version=${CODE_VERSION} backend=${PROJECT_ROOT}`);
+// 后端 Python 解释器：可由 AAS_PYTHON 指定，否则按平台取 python/python3。
+const PY_CMD = process.env.AAS_PYTHON || (process.platform === 'win32' ? 'python' : 'python3');
+// 最近一次成功启动的 OTA 版本（供失败回滚）。
+const CODE_LASTGOOD_PTR = path.join(CODE_HOME, 'last-good');
+const CODE_BLACKLIST_PATH = path.join(CODE_HOME, 'blacklist'); // 启动失败被回滚过的版本，不再自动重装
+// 后端可写数据根：dev=仓库根 REPO_ROOT；打包=用户指定的现有数据目录（含真实记录/截图/配置）。
+// 数据根锚定「壳子/机器」而非「代码包」：dev 用固定 REPO_ROOT（不随 AAS_CODE_DIR/OTA 漂移），
+// 否则切换代码包会把 punch_records/screenshots/logs/.gui_token 等写到代码包目录、读不到真实数据。
 // 可用环境变量 AAS_DATA_DIR 覆盖，便于将来切到 %APPDATA% 等。
 const LEGACY_DATA_DIR = 'C:\\auto_attendance_system';
 const DATA_DIR = process.env.AAS_DATA_DIR
-  || (app.isPackaged ? LEGACY_DATA_DIR : PROJECT_ROOT);
+  || (app.isPackaged ? LEGACY_DATA_DIR : REPO_ROOT);
 const TOKEN_PATH = path.join(DATA_DIR, 'logs', '.gui_token');
 // 窗口尺寸/位置/最大化状态持久化文件（关窗缩托盘不退进程，靠 resize/move 防抖落盘覆盖关闭场景）
 const WINDOW_STATE_PATH = path.join(DATA_DIR, 'window-state.json');
@@ -125,25 +290,164 @@ function ingestChunk(text) {
   pushLogLines(out);
 }
 
+// ============================================================================
+// OTA 版本健康门 / 回滚（阶段3）
+//  - 新 staged 的 OTA 版本首次启动若「拿不到 token / 反复崩溃」，自动回退到上一个已知良好版本并重启；
+//    无良好版本可退则清除 current 指针 → 下次启动回退内置基线（离线兜底由 resolveCodeDir 保证）。
+//  - 后端 token + 前端真实 API 探活同时成功并稳定运行 90 秒，才记为 last-good。
+//  - rolledBack 一次性：回滚后重启加载的就是 good/内置，CODE_VERSION 不再等于失败版本，不会再触发，杜绝死循环。
+// ============================================================================
+function readLastGood() {
+  try { return fs.readFileSync(CODE_LASTGOOD_PTR, 'utf-8').trim() || null; } catch { return null; }
+}
+function readBlacklist() {
+  try { return fs.readFileSync(CODE_BLACKLIST_PATH, 'utf-8').split('\n').map((s) => s.trim()).filter(Boolean); } catch { return []; }
+}
+function addToBlacklist(ver) {
+  if (!ver) return;
+  try {
+    if (!readBlacklist().includes(ver)) { fs.mkdirSync(CODE_HOME, { recursive: true }); fs.appendFileSync(CODE_BLACKLIST_PATH, ver + '\n', 'utf-8'); }
+  } catch { /* ignore */ }
+}
+function writeCurrentPointer(ver) {
+  fs.mkdirSync(path.dirname(CODE_CURRENT_PTR), { recursive: true });
+  const tmp = `${CODE_CURRENT_PTR}.tmp`;
+  fs.writeFileSync(tmp, ver, 'utf-8');
+  fs.renameSync(tmp, CODE_CURRENT_PTR);
+}
+let goodTimer = null; // 「稳定运行」确认计时器：后端+渲染端均健康后延时仍未崩才记 good
+let rendererReadyTimer = null; // 后端已就绪后等待当前渲染代际完成真实 API 探活
+let backendReadyGen = 0;
+let rendererReady = false;
+function clearGoodTimer() { if (goodTimer) { clearTimeout(goodTimer); goodTimer = null; } }
+function clearRendererReadyTimer() {
+  if (rendererReadyTimer) { clearTimeout(rendererReadyTimer); rendererReadyTimer = null; }
+}
+function cleanupOldCodeVersions() {
+  // 清理的硬门禁：当前实际运行版本必须已经写成 last-good；否则它仍处于待验证阶段，绝不回收任何正式版本。
+  if (appQuitting || readLastGood() !== CODE_VERSION) return;
+  if (CODE.source !== 'ota' || otaBundleCompatibilityError(path.join(CODE_VERSIONS_DIR, CODE_VERSION), CODE_VERSION)) return;
+  updater.cleanupOldVersions({
+    versionsDir: CODE_VERSIONS_DIR,
+    currentPtr: CODE_CURRENT_PTR,
+    lastGoodPtr: CODE_LASTGOOD_PTR,
+    runningVersion: CODE_VERSION,
+    log: (line) => { console.info(line); pushLogLines([line]); },
+  });
+}
+function markCurrentGood() {
+  if (!app.isPackaged) return;                        // dev 不参与 OTA 健康门
+  if (CODE.source !== 'ota' || !CODE_VERSION) return; // 只记 OTA 版本；内置/dev 本就是兜底
+  const integrityError = otaBundleCompatibilityError(path.join(CODE_VERSIONS_DIR, CODE_VERSION), CODE_VERSION);
+  if (integrityError) {
+    // 90 秒稳定窗口内若代码目录发生损坏/意外写入，绝不能先污染 last-good；按确定性坏版本回滚并拉黑。
+    maybeRollback(`代码包完整性复验失败: ${integrityError}`, { blacklist: true });
+    return;
+  }
+  if (readLastGood() !== CODE_VERSION) {
+    try {
+      fs.mkdirSync(CODE_HOME, { recursive: true });
+      const tmp = `${CODE_LASTGOOD_PTR}.tmp`;
+      fs.writeFileSync(tmp, CODE_VERSION, 'utf-8');
+      fs.renameSync(tmp, CODE_LASTGOOD_PTR);
+    } catch { return; }
+  }
+  // 指针已原子落盘且回读确认后才清理；cleanupOldVersions 还会额外保护 current、last-good 与运行中版本。
+  cleanupOldCodeVersions();
+}
+// 后端拿到 token 且 React 完成真实 API 探活后才启动稳定计时；任一端失败/重载都会取消。
+const STABLE_RUN_MS = 90_000;
+const RENDERER_READY_TIMEOUT_MS = 60_000;
+function maybeScheduleMarkGood(gen) {
+  if (!app.isPackaged || CODE.source !== 'ota') return;
+  if (readLastGood() === CODE_VERSION) { cleanupOldCodeVersions(); return; }
+  if (gen !== readyGen || backendReadyGen !== gen || !rendererReady || appQuitting) return;
+  if (goodTimer) return;
+  clearRendererReadyTimer();
+  clearGoodTimer();
+  goodTimer = setTimeout(() => {
+    goodTimer = null;
+    if (gen === readyGen && backendReadyGen === gen && rendererReady && !appQuitting) markCurrentGood();
+  }, STABLE_RUN_MS);
+}
+function scheduleRendererReadyDeadline(gen) {
+  clearRendererReadyTimer();
+  if (!app.isPackaged || CODE.source !== 'ota' || readLastGood() === CODE_VERSION || rendererReady) return;
+  if (gen <= 0 || backendReadyGen !== gen) return; // 后端 token 尚未就绪时不开始计算前端探活时限
+  rendererReadyTimer = setTimeout(() => {
+    rendererReadyTimer = null;
+    if (gen === readyGen && backendReadyGen === gen && !rendererReady && !appQuitting) {
+      // 页面能加载但应用级探活始终不成功：回退当前版本；不拉黑，给网络/机器偶发慢启动留重试机会。
+      maybeRollback('前端健康探测超时', { blacklist: false });
+    }
+  }, RENDERER_READY_TIMEOUT_MS);
+}
+let rolledBack = false;
+// reason=失败原因；opts.blacklist=是否拉黑当前版本（崩溃=确定性坏→拉黑；超时=可能只是慢→不拉黑，留待重试）。
+function maybeRollback(reason, opts) {
+  const blacklist = !opts || opts.blacklist !== false;
+  if (rolledBack || appQuitting) return false;
+  if (!app.isPackaged) return false;       // 回滚只在打包态生效（dev 即便残留 current 指针也不 relaunch/quit）
+  if (CODE.source !== 'ota') return false; // 只回滚 OTA 加载的版本；内置/dev 失败属真实问题，不回滚
+  if (readLastGood() === CODE_VERSION) return false; // 已证明稳定的版本不因后来偶发系统/驱动故障被误回滚
+  clearGoodTimer();                        // 失败了，撤销「稳定运行」确认
+  clearRendererReadyTimer();               // 回滚流程已开始，不再保留前端健康截止计时
+  const good = readLastGood();
+  // 可用的回退目标：存在、非当前失败版本、结构完整，且仍兼容当前壳/依赖指纹。
+  // 新壳升级过依赖后，旧 last-good 可能已不兼容；此时直接回退内置，避免写入一个下次启动仍会拒绝的指针。
+  const goodDir = good && isSafeVersionName(good) ? path.join(CODE_VERSIONS_DIR, good) : '';
+  const goodUsable = goodDir && good !== CODE_VERSION
+    && isValidBundleDir(goodDir) && !otaBundleCompatibilityError(goodDir, good);
+  let msg;
+  if (goodUsable) {
+    try { writeCurrentPointer(good); } catch { return false; } // 写指针失败：本次不回滚，保持可重试
+    msg = `新版本 ${CODE_VERSION} 启动失败(${reason})，回滚到 ${good} 并重启`;
+  } else {
+    // 无 good / good 目录失效 / good 就是当前失败版本 → 清 current 指针，下次启动经 resolveCodeDir 回退内置基线
+    try { fs.rmSync(CODE_CURRENT_PTR, { force: true }); } catch { return false; }
+    msg = `新版本 ${CODE_VERSION} 启动失败(${reason})，无可用回退版本，清除指针回退内置并重启`;
+  }
+  rolledBack = true;
+  if (blacklist) addToBlacklist(CODE_VERSION); // 仅崩溃路径拉黑：自动更新不会再装回来；超时不拉黑以免误封健康慢启动版本
+  console.warn('[aas-electron] ' + msg);
+  pushLogLines([msg]);
+  appQuitting = true;
+  app.relaunch();
+  app.quit();
+  return true;
+}
+
 // 每次 spawn 后重新 arm：等 token → 推给渲染进程；超时/失败 → 推 failed
 function armReadiness() {
   const gen = ++readyGen;
+  backendReadyGen = 0;
+  // 每一轮后端启动都必须由渲染端针对这一轮 token/API 重新探活，不能沿用上一轮的健康握手。
+  rendererReady = false;
+  clearGoodTimer();
+  clearRendererReadyTimer();
   pushStatus({ state: 'starting', reason: null });
-  waitForToken(120_000)
+  // 未验证过的 OTA 新版本首启给更长超时（重依赖冷启动可能数分钟），常规启动仍用 120s，避免把慢启动误判为坏。
+  const isUnprovenOta = app.isPackaged && CODE.source === 'ota' && readLastGood() !== CODE_VERSION;
+  const tokenTimeout = isUnprovenOta ? 300_000 : 120_000;
+  waitForToken(tokenTimeout)
     .then(token => {
       if (gen !== readyGen) return; // 已有更新的 spawn，丢弃过期 token
       console.info('[aas-electron] token ready, notifying renderer');
+      backendReadyGen = gen;
       pushStatus({
         state: 'token',
         token,
         httpUrl: `http://127.0.0.1:${HTTP_PORT}`,
         wsUrl: `ws://127.0.0.1:${WS_PORT}`,
       });
+      scheduleRendererReadyDeadline(gen);
+      maybeScheduleMarkGood(gen);
     })
     .catch(err => {
       if (gen !== readyGen) return;
       console.error('[aas-electron] token wait failed:', err.message);
       pushStatus({ state: 'failed', reason: `后端启动超时：${err.message}（端口可能被占用，请查看日志）` });
+      maybeRollback('启动超时', { blacklist: false }); // 超时可能只是慢：回滚但不拉黑，下次仍可重试该版本
     });
 }
 
@@ -171,7 +475,7 @@ function spawnPython() {
   logBuffer = [];
   logCarry = '';
 
-  const pyCmd = process.env.AAS_PYTHON || (process.platform === 'win32' ? 'python' : 'python3');
+  const pyCmd = PY_CMD;
   console.info('[aas-electron] spawning:', pyCmd, mainPy, '--gui', '(cwd:', DATA_DIR + ')');
   // 用绝对脚本路径运行打包内 main.py（sys.path[0]=resources/backend → 导入打包副本的 modules），
   // 但 cwd 指向数据根 DATA_DIR，使后端所有相对路径（punch_records/screenshots/logs/.env 等）命中真实数据。
@@ -184,7 +488,21 @@ function spawnPython() {
     detached: false,
     // GUI/管道环境：朴素文本(去 ANSI/清屏) + 行不缓冲(实时) + 强制 UTF-8(中文不乱码)。
     // configure_console_encoding 只设 errors=replace 不强制 utf-8，故 PYTHONIOENCODING 必须显式给。
-    env: { ...process.env, AAS_PLAIN_CONSOLE: '1', PYTHONUNBUFFERED: '1', PYTHONIOENCODING: 'utf-8' },
+    // AAS_BIN_DIR：把 mihomo 所在 bin 指向壳子固定位置——后端代码经 OTA 迁到外部目录后，
+    //   其 __file__ 推导的 code_root/bin 已不含 mihomo（bin 不进代码包），靠此环境变量回指壳子 bin。
+    //   后端 proxy_manager._bin_dir / config._mihomo_binary_missing 读取该变量，未设时沿用原 code_root/bin。
+    env: {
+      ...process.env,
+      AAS_PLAIN_CONSOLE: '1',
+      PYTHONUNBUFFERED: '1',
+      PYTHONIOENCODING: 'utf-8',
+      // OTA 目录必须保持签名文件树不变；禁止 import 生成未签名 __pycache__/*.pyc，
+      // 否则下一次启动的 treeSha256 复验会拒绝刚运行过的健康版本。
+      PYTHONDONTWRITEBYTECODE: '1',
+      AAS_DATA_DIR: DATA_DIR,
+      AAS_BIN_DIR: STABLE_BIN_DIR,
+      AAS_MSEDGEDRIVER_PATH: STABLE_EDGE_DRIVER_PATH,
+    },
   });
   // 闭包捕获本次 spawn 出的 proc：用它与全局 pythonProc 比对，过滤掉「过期进程」的迟到 error/exit。
   const proc = pythonProc;
@@ -221,6 +539,8 @@ function spawnPython() {
       console.warn('[aas-electron] 忽略过期 Python 进程的 exit（引用已被新进程占用）');
       return;
     }
+    clearGoodTimer(); // 后端退出（崩溃/重启/停止）：撤销「稳定运行」确认，不把当前版本误记为良好
+    clearRendererReadyTimer(); // 后端代际已结束，前端对该代际的探活截止计时作废
     // 本进程是被 service:stop/restart 主动 kill 的：此 exit 到达即解除并发拒绝，放行后续 service:* 请求。
     killPending = false;
     if (appQuitting) return;
@@ -249,6 +569,7 @@ function spawnPython() {
       // 不再弹系统 showErrorBox：pushStatus(failed) 已把原因推给渲染端（系统横幅/启动覆盖层展示）
       pushStatus({ state: 'failed', reason: `Python 后端反复崩溃（1 小时内 ${restartHistory.length} 次），已停止自动重启。请查看 logs/attendance_system.log 后手动重启。` });
       pushServiceStatus(false); // 彻底放弃自动重启：服务已停止
+      maybeRollback('反复崩溃'); // 若崩的是新 OTA 版本，回滚到上个良好版本再重启
       return;
     }
     restartHistory.push(now);
@@ -638,9 +959,33 @@ async function createWindow() {
   win.webContents.on('did-finish-load', () => {
     pushStatus(latestStatus);
     pushServiceStatus(lastServiceRunning); // 补推服务运行状态（解决 push 早于渲染进程注册监听的竞态）
+    try { win.webContents.send('update:status', lastUpdateStatus); } catch { /* ignore */ } // 补推 OTA 状态
     if (logBuffer.length) {
       try { win.webContents.send('backend:log', { lines: logBuffer.slice() }); } catch { /* ignore */ }
     }
+  });
+
+  // OTA 首次启动的健康判定不能只看 Python token：前端 bundle 语法错误/资源缺失会白屏，后端仍可能正常。
+  // React 在完成后端真实探活后经 update:renderer-ready 握手；在此之前若主框架加载失败或渲染进程崩溃，
+  // 立即按坏版本回滚。已记 last-good 的版本不参与自动回滚（maybeRollback 内有门禁）。
+  win.webContents.on('did-fail-load', (_event, code, desc, _url, isMainFrame) => {
+    if (!isMainFrame || code === -3) return; // ERR_ABORTED 常见于正常导航替换，不判坏
+    rendererReady = false;
+    clearGoodTimer();
+    clearRendererReadyTimer();
+    maybeRollback(`前端加载失败 ${code}: ${desc}`);
+  });
+  win.webContents.on('render-process-gone', (_event, details) => {
+    rendererReady = false;
+    clearGoodTimer();
+    clearRendererReadyTimer();
+    maybeRollback(`前端进程退出: ${details && details.reason ? details.reason : 'unknown'}`);
+  });
+  win.on('unresponsive', () => {
+    rendererReady = false;
+    clearGoodTimer();
+    clearRendererReadyTimer();
+    maybeRollback('前端无响应', { blacklist: false });
   });
 
   win.on('close', e => {
@@ -659,7 +1004,13 @@ async function createWindow() {
   // 重载（dev HMR / webContents.reload）：旧页面随导航销毁，其 pending requestDevice 的 callback
   // 不会被渲染层调用，须在主帧开始导航时兜底解析，释放扫描状态。
   win.webContents.on('did-start-navigation', (_e, _url, isInPlace, isMainFrame) => {
-    if (isMainFrame && !isInPlace) resolvePendingBleRequests();
+    if (isMainFrame && !isInPlace) {
+      rendererReady = false;
+      clearGoodTimer();
+      clearRendererReadyTimer();
+      scheduleRendererReadyDeadline(readyGen); // 后端仍健康时，给新页面代际重新开启探活截止时间
+      resolvePendingBleRequests();
+    }
   });
 
   // 外链用系统浏览器打开，不在 Electron 内部跳转。
@@ -679,7 +1030,23 @@ async function createWindow() {
   // 等桥接 API 会随窗口可用，若渲染进程被诱导导航到远程页面，这些能力将暴露给该远程页面。
   // 只允许停留在本应用页面（dev=Vite dev server，prod=本地 dist 的 file://），其余一律拦截改用外部浏览器打开。
   win.webContents.on('will-navigate', (e, url) => {
-    const allowed = IS_DEV ? url.startsWith(DEV_SERVER_URL) : url.startsWith('file://');
+    // dev：只放行 Vite dev server；prod：只放行「停留在 FRONTEND_DIR 目录内」的 file:// 页面。
+    // 收紧理由：前端来源已可被 OTA/内置切换到不同（甚至用户可写的）目录，若仍放行任意 file://，
+    // 被投毒/XSS 的页面可整页导航到本机任意 html，并继承 preload 的 AAS_SERVICE/AAS_FILES 等能力。
+    // 故按来源目录前缀收口；fileURLToPath 跨平台正确处理盘符与百分号编码。
+    let allowed = false;
+    if (IS_DEV) {
+      allowed = url.startsWith(DEV_SERVER_URL);
+    } else {
+      try {
+        const u = new URL(url);
+        if (u.protocol === 'file:') {
+          const target = path.resolve(fileURLToPath(url));
+          const base = path.resolve(FRONTEND_DIR);
+          allowed = target === base || target.startsWith(base + path.sep);
+        }
+      } catch { /* 非法/非 file: url 不放行 */ }
+    }
     if (allowed) return;
     e.preventDefault();
     try {
@@ -691,7 +1058,9 @@ async function createWindow() {
   if (IS_DEV) {
     await win.loadURL(DEV_SERVER_URL);
   } else {
-    await win.loadFile(path.join(__dirname, '..', 'dist', 'index.html'));
+    // prod 从 FRONTEND_DIR 加载（内置=resources/app/dist；OTA=外部版本目录的 dist）。
+    // 仍是 file:// 协议，will-navigate 白名单的 startsWith('file://') 照旧放行，无需改动。
+    await win.loadFile(path.join(FRONTEND_DIR, 'index.html'));
   }
 }
 
@@ -861,6 +1230,121 @@ ipcMain.handle('system:open-logs', () => {
   return shell.openPath(dir); // 返回空串=成功，非空=错误信息
 });
 
+// 当前运行的代码信息（瘦壳 + OTA）：codeVersion=本次加载的代码包版本；
+// shellVersion=壳子(package.json)版本；source=代码来源（env/ota/builtin/dev）。供「关于」页展示。
+ipcMain.handle('app:get-code-version', () => ({
+  codeVersion: CODE_VERSION,
+  shellVersion: app.getVersion(),
+  source: CODE.source,
+}));
+
+// ============================================================================
+// 代码 OTA 自更新（阶段2）：查 manifest → 下载校验 → 落地 versions/<ver> + 写 current 指针。
+//  - 落地后「下次启动」由 resolveCodeDir 加载新代码（壳子不重打包）；可经 update:relaunch 立即重启生效。
+//  - 仅打包态自动触发：dev 自动触发会把 OTA 代码 stage 进 userData，下次 dev 启动反而加载它而非仓库源码。
+//  - 失败安全：网络/校验失败只记日志+推状态，绝不影响当前已加载版本的运行。
+// ============================================================================
+// 仅 dev/测试承认 env 覆盖仓库/镜像；打包态一律用 updater 硬编码可信源——与 AAS_CODE_DIR「打包态忽略」一致，
+// 杜绝用户级环境变量把 OTA 改向攻击者仓库（借受信任安装包持久化执行任意代码）。
+const UPDATE_MIRRORS = (!app.isPackaged && process.env.AAS_UPDATE_MIRRORS)
+  ? process.env.AAS_UPDATE_MIRRORS.split(',').map((s) => s.trim())
+  : updater.DEFAULT_MIRRORS;
+let lastUpdateStatus = { status: 'idle' };
+let updateInFlight = null; // 进行中的 Promise：去重 + 让并发 apply 都 await 到同一最终结果
+let updateInFlightAllowsBlacklisted = false;
+let updateInterval = null;
+let updateStartupTimer = null;
+const UPDATE_INTERVAL_MS = 6 * 60 * 60 * 1000;
+
+function pushUpdateStatus(payload) {
+  lastUpdateStatus = payload;
+  if (mainWindow && !mainWindow.isDestroyed() && !appQuitting) {
+    try { mainWindow.webContents.send('update:status', payload); } catch { /* ignore */ }
+  }
+}
+
+// 检查并（若有新版）下载落地。updateInFlight 持有进行中的 Promise：并发调用（启动自动触发 + 用户手动 apply）
+// 复用同一次执行、并都 await 到同一最终结果，避免并发跑两遍下载/解压到同一 versionsDir。
+function triggerUpdate({ allowBlacklisted = false } = {}) {
+  if (appQuitting) return Promise.resolve({ status: 'error', error: '应用正在退出' });
+  if (updateInFlight) {
+    // 用户点击“下载”撞上自动检查时，先复用网络请求；若自动流程只因黑名单跳过，再立即以手动权限重试。
+    if (allowBlacklisted && !updateInFlightAllowsBlacklisted) {
+      return updateInFlight.then((r) => r && r.skippedBad ? triggerUpdate({ allowBlacklisted: true }) : r);
+    }
+    return updateInFlight;
+  }
+  if (lastUpdateStatus.status === 'staged') return Promise.resolve(lastUpdateStatus);
+  pushUpdateStatus({ status: 'checking' });
+  const log = (line) => { console.info(line); pushLogLines([line]); };
+  updateInFlightAllowsBlacklisted = allowBlacklisted;
+  updateInFlight = (async () => {
+    try {
+      const r = await updater.runAutoUpdate({
+        repo: UPDATE_REPO,
+        mirrors: UPDATE_MIRRORS,
+        currentVersion: CODE_VERSION,
+        shellVersion: app.getVersion(),
+        versionsDir: CODE_VERSIONS_DIR,
+        currentPtr: CODE_CURRENT_PTR,
+        blacklist: readBlacklist(),
+        allowBlacklisted,
+        log,
+      });
+      pushUpdateStatus(r);
+      return r;
+    } finally {
+      updateInFlight = null;
+      updateInFlightAllowsBlacklisted = false;
+    }
+  })();
+  return updateInFlight;
+}
+
+ipcMain.handle('update:check', async () => {
+  try {
+    const { available, manifest } = await updater.checkForUpdate({
+      repo: UPDATE_REPO, currentVersion: CODE_VERSION,
+      log: (l) => console.info(l),
+    });
+    if (!available) return { status: 'up-to-date', currentVersion: CODE_VERSION, latest: manifest.version };
+    const compatibilityBlocker = updater.getManifestCompatibilityBlocker({
+      manifest,
+      shellVersion: app.getVersion(),
+    });
+    if (compatibilityBlocker) return compatibilityBlocker;
+    return { status: 'available', currentVersion: CODE_VERSION, latest: manifest.version };
+  } catch (e) {
+    return { status: 'error', error: e.message };
+  }
+});
+
+// 手动操作是显式用户选择，允许重试曾被健康门拉黑的版本；定时/启动自动更新仍严格跳过。
+ipcMain.handle('update:apply', () => triggerUpdate({ allowBlacklisted: true }));
+
+ipcMain.handle('update:get-status', () => lastUpdateStatus);
+
+// React 只有在自身已挂载且用当前 token 完成 /ping + /status 探活后才调用此握手。
+// 与 backendReadyGen 同时满足后才开始 90 秒稳定计时，防止前端白屏却把 OTA 标成 last-good。
+ipcMain.handle('update:renderer-ready', (event) => {
+  if (!mainWindow || mainWindow.isDestroyed() || event.sender !== mainWindow.webContents) {
+    return { ok: false, error: 'invalid renderer' };
+  }
+  rendererReady = true;
+  clearRendererReadyTimer();
+  maybeScheduleMarkGood(readyGen);
+  return { ok: true };
+});
+
+// 立即重启壳子使已落地的新版本生效（resolveCodeDir 重新读 current 指针）。
+ipcMain.handle('update:relaunch', () => {
+  if (lastUpdateStatus.status !== 'staged') return { ok: false, error: '当前没有待应用的更新' };
+  appQuitting = true;
+  app.relaunch();
+  app.quit();
+  return { ok: true };
+});
+
 // 用系统默认图片查看器打开本地截图原图（入参为后端返回的相对路径，如 screenshots\user\punch_in\xxx.png）
 // 返回空串=成功，非空=错误信息（resolve 给渲染进程）
 ipcMain.handle('screenshot:open', (_e, relPath) => {
@@ -995,14 +1479,25 @@ app.on('ready', async () => {
       return;
     }
   }
-  // 窗口与后端并行：先拉起后端，再立刻建窗口（窗口不等 token）
+  // 先建窗口显示（覆盖层先出来），再拉起后端。代码 OTA 只接受与当前壳依赖指纹一致的包，
+  // 不会在客户端运行时联网执行 pip；依赖变化必须通过新版客户端交付。
   migrateLegacyDataIfNeeded();
-  spawnPython();
   await createWindow();
   createTray();
+  spawnPython();
   // 监听系统唤醒：睡眠跨过启动/探活窗口后，唤醒重新侦测就绪 + 探活后端（详见 handleResume）。
   // powerMonitor 须在 app ready 后注册。
   powerMonitor.on('resume', () => { void handleResume(); });
+  // 代码 OTA：仅打包态在启动后延迟触发一次自动检查/下载（dev 不自动，避免把 OTA 代码 stage 进 userData
+  // 后下次 dev 启动反加载它而非仓库源码）。延迟让后端/窗口先就绪，全程非阻塞、失败安全。
+  if (app.isPackaged) {
+    updateStartupTimer = setTimeout(() => {
+      updateStartupTimer = null;
+      void triggerUpdate();
+    }, 8000);
+    // 应用长期驻留托盘时也能发现更新；已有 staged 版本时 triggerUpdate 会幂等短路。
+    updateInterval = setInterval(() => { void triggerUpdate(); }, UPDATE_INTERVAL_MS);
+  }
 });
 
 app.on('window-all-closed', () => {
@@ -1016,6 +1511,10 @@ app.on('window-all-closed', () => {
 app.on('before-quit', () => {
   appQuitting = true;
   clearPendingRestart(); // 退出前取消挂起的重启定时器，防止其到点后又把后端拉起
+  clearGoodTimer();      // 取消「稳定运行」确认计时器
+  clearRendererReadyTimer(); // 取消前端健康截止计时器
+  if (updateStartupTimer) { clearTimeout(updateStartupTimer); updateStartupTimer = null; }
+  if (updateInterval) { clearInterval(updateInterval); updateInterval = null; }
   flushGuiSettings();
   flushEpaperLog();
   killPython();

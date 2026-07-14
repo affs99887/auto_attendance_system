@@ -1,13 +1,21 @@
 {
   "name": "auto-attendance-desktop",
   "private": true,
-  "version": "0.1.0",
+  "version": "0.2.0",
+  "aasCodeVersion": "2.0.0",
+  "aasRequirementsHash": "800f0a5b853d2f44fc39d146247477cd9f31469e013bcf1cc677a64c718fc356",
+  "aasOtaTrust": {
+    "keyId": "aas-ota-ed25519-2026-01",
+    "publicKeySpkiBase64": "MCowBQYDK2VwAyEAcb7aF14fZH4OCln4EtuuIZgEahOZFO4c0bihyPDPuTU="
+  },
   "type": "module",
   "main": "electron/main.cjs",
   "description": "AAS GUI（Electron + React + TS）",
   "scripts": {
     "dev": "vite",
+    "prebuild": "node scripts/build-code-bundle.mjs --verify-config",
     "build": "tsc -b && vite build",
+    "bundle": "npm run build && node scripts/build-code-bundle.mjs",
     "preview": "vite preview",
     "electron": "electron .",
     "electron:dev": "cross-env AAS_DEV=1 electron .",
@@ -25,6 +33,7 @@
     "zustand": "^4.5.5"
   },
   "devDependencies": {
+    "adm-zip": "^0.5.16",
     "@types/node": "^25.9.0",
     "@types/react": "^18.3.12",
     "@types/react-dom": "^18.3.1",

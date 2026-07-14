@@ -1,0 +1,98 @@
+name: Release code bundle
+
+# 打 tag code-v<版本>（如 code-v2.1.0）即触发：构建前端 + 组装「代码包」+ 发 GitHub Release。
+# 这里只产『可热更的代码包』（已编译 dist + 后端 .py），不含 Electron 壳子与 mihomo/bin——
+# 壳子极少变、单独手工打 NSIS 安装包；代码包由客户端经 manifest.json 下载校验后原子切换（OTA）。
+on:
+  push:
+    tags:
+      - 'code-v*'
+
+permissions:
+  contents: write   # 创建/更新 Release 需要写权限
+
+# 同一 tag 的重跑串行化；首个发布完成后，后续重跑会被下方存在性检查拒绝。
+concurrency:
+  group: release-code-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  bundle:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: gui/desktop
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      # Release 资产是签名 manifest + 对应 ZIP 的不可分割配对；同 tag 覆盖可能在部分上传失败时拆散配对。
+      - name: 拒绝覆盖已发布的代码版本
+        uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea # v7.0.1
+        with:
+          script: |
+            try {
+              const { data: release } = await github.rest.repos.getReleaseByTag({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                tag: context.ref.replace('refs/tags/', ''),
+              });
+              if (release.draft) {
+                // action-gh-release 上传中断会留下半套 draft；删掉后从干净状态重建，不能续传不同 builtAt 的产物。
+                await github.rest.repos.deleteRelease({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  release_id: release.id,
+                });
+                core.info(`已删除上次失败遗留的 draft Release ${release.id}`);
+              } else {
+                core.setFailed('该 code-v tag 已存在已发布 Release；代码包不可覆盖，请提升版本并创建新 tag。');
+              }
+            } catch (error) {
+              if (error.status !== 404) throw error;
+            }
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: '20'
+          cache: npm
+          cache-dependency-path: gui/desktop/package-lock.json
+
+      # tag code-v2.1.0 → 版本号 2.1.0（与壳子 isSafeVersionName / 打包器版本号校验同口径）
+      - name: 从 tag 解析版本号
+        id: ver
+        run: echo "version=${GITHUB_REF_NAME#code-v}" >> "$GITHUB_OUTPUT"
+
+      - name: 安装依赖
+        run: npm ci
+
+      - name: 构建前端 dist
+        run: npm run build
+
+      # --repo 注入并签名仓库标识；壳子只接受与内置可信仓库完全一致的 manifest。
+      - name: 组装代码包 + manifest
+        env:
+          # Ed25519 PKCS#8 PEM；公钥已固化在 Electron 壳。Secret 缺失/无效时打包器会失败，
+          # 绝不发布可被镜像同时伪造 manifest+zip 的未签名更新。
+          AAS_OTA_SIGNING_KEY: ${{ secrets.AAS_OTA_SIGNING_KEY }}
+        run: node scripts/build-code-bundle.mjs --version "${{ steps.ver.outputs.version }}" --repo "${{ github.repository }}"
+
+      # Release 与资产均按版本不可变；预检查 + overwrite_files:false 双重拒绝同 tag 覆盖。
+      - name: 发布到 GitHub Release
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: 代码包 ${{ steps.ver.outputs.version }}
+          body: |
+            自动打卡系统「代码包」（瘦壳 OTA 热更新单元）。
+
+            - 版本：${{ steps.ver.outputs.version }}
+            - 内容：已编译前端 dist + 后端 .py 源码（**不含** mihomo/bin、**不含** Electron 壳子）
+            - 客户端先用壳内 Ed25519 公钥验证 `manifest.json`，再下载 zip、校验 SHA256 后原子切换。
+            - Python 依赖必须与当前客户端壳的固定指纹一致；依赖变化需先发布新版客户端并更新 Python 环境，不会在运行时联网执行 pip。
+          # files 的相对基准是仓库根（非 working-directory）；打包器写到 <repo>/release/code-bundle/。
+          # fail_on_unmatched_files：zip/manifest 任一 glob 匹配不到即让该 step 失败，避免发出空资产 Release 而 CI 仍绿。
+          fail_on_unmatched_files: true
+          overwrite_files: false
+          files: |
+            release/code-bundle/${{ steps.ver.outputs.version }}/aas-code-${{ steps.ver.outputs.version }}.zip
+            release/code-bundle/${{ steps.ver.outputs.version }}/manifest.json

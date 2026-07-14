@@ -371,7 +371,10 @@ class SeleniumLoginController:
                 else:
                     edge_options = self._setup_edge_options()
                     import os
-                    project_driver_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'msedgedriver.exe')
+                    # OTA 后 __file__ 位于用户版本目录，而 msedgedriver 仍由固定壳资源携带。
+                    # Electron 经 AAS_MSEDGEDRIVER_PATH 显式回指；源码/命令行模式保持原路径回退。
+                    project_driver_path = os.environ.get('AAS_MSEDGEDRIVER_PATH') or os.path.join(
+                        os.path.dirname(os.path.dirname(__file__)), 'msedgedriver.exe')
                     # 打卡路径不联网下载驱动：先用本地已有驱动(优先 webdriver-manager 缓存里版本最高者，
                     # 否则项目自带的 msedgedriver.exe)立即启动。即便本地驱动版本低于当前 Edge 也先用旧的，
                     # 避免每次打卡前白等十几秒下载、且离线时也能照常打卡。

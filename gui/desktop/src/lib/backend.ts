@@ -22,6 +22,24 @@ export type StartupPayload =
   | { state: 'failed'; reason: string }
   | StartupPayloadToken;
 
+/** 代码 OTA 更新状态（主进程 update:status 推送 / apply/getStatus 返回）。
+ *  staged=已落地新版；shell/dependencies-outdated=需先升级客户端；error=失败但不影响当前运行。 */
+export type UpdateStatus =
+  | { status: 'idle' }
+  | { status: 'checking' }
+  | { status: 'up-to-date'; currentVersion?: string }
+  | { status: 'staged'; version: string }
+  | { status: 'shell-outdated'; version: string; requiredShell: string }
+  | { status: 'dependencies-outdated'; version: string }
+  | { status: 'error'; error: string; skippedBad?: string };
+
+export type UpdateCheckResult =
+  | { status: 'available'; currentVersion: string; latest: string }
+  | { status: 'up-to-date'; currentVersion: string; latest: string }
+  | { status: 'shell-outdated'; version: string; requiredShell: string }
+  | { status: 'dependencies-outdated'; version: string }
+  | { status: 'error'; error: string };
+
 declare global {
   interface Window {
     AAS_BACKEND?: {
@@ -88,6 +106,30 @@ declare global {
       tryGestureReconnect: () => Promise<boolean>;
       /** 追加一条墨水屏日志到主进程 logs/epaper.log（防抖落盘，保留长历史；旧 preload / 纯浏览器下为 undefined） */
       appendLog?: (line: string) => void;
+    };
+    /** 瘦壳 + 代码 OTA 自更新桥（旧 preload / 纯浏览器下为 undefined）。
+     *  壳子固定不变，后端 .py 与前端 dist 作为可更新「代码包」独立存在；
+     *  getInfo 返回本次启动实际加载的代码来源与版本，check/apply 查/下更新，relaunch 重启生效。 */
+    AAS_UPDATE?: {
+      /** 当前运行的代码信息：codeVersion=代码包版本；shellVersion=壳子(package.json)版本；
+       *  source=代码来源（env 覆盖 / ota 更新目录 / builtin 内置 / dev 源码）。 */
+      getInfo: () => Promise<{
+        codeVersion: string;
+        shellVersion: string;
+        source: 'env' | 'ota' | 'builtin' | 'dev';
+      }>;
+      /** 仅查询是否有新版（不下载）。 */
+      check: () => Promise<UpdateCheckResult>;
+      /** 检查并下载落地新版（与启动自动触发互斥去重）。落地后需 relaunch 或下次启动生效。 */
+      apply: () => Promise<UpdateStatus>;
+      /** 拉取最近一次更新状态（兜底 push 早于监听注册）。 */
+      getStatus: () => Promise<UpdateStatus>;
+      /** React 已挂载且完成后端真实探活；用于防止白屏版本被误标为 last-good。 */
+      rendererReady?: () => Promise<{ ok: boolean; error?: string }>;
+      /** 立即重启壳子使已落地新版生效。 */
+      relaunch: () => Promise<{ ok: boolean; error?: string }>;
+      /** 订阅更新状态推送，返回注销函数。 */
+      onStatus: (cb: (s: UpdateStatus) => void) => () => void;
     };
   }
 }

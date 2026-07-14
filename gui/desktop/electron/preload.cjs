@@ -80,6 +80,28 @@ contextBridge.exposeInMainWorld('AAS_SETTINGS', {
   set: (key, value) => ipcRenderer.send('settings:set', key, value),
 });
 
+contextBridge.exposeInMainWorld('AAS_UPDATE', {
+  // 当前运行的代码信息：{ codeVersion, shellVersion, source }，供「关于」页展示与更新判断。
+  getInfo: () => ipcRenderer.invoke('app:get-code-version'),
+  // 仅查询是否有新版（不下载）；也会返回 shell/dependencies-outdated 兼容性门禁状态。
+  check: () => ipcRenderer.invoke('update:check'),
+  // 检查并下载落地新版（去重，与启动自动触发互斥）：resolve 该次执行的最终态。
+  // 注意：并发去重时多个 apply 复用同一次执行，UI 实时进度请以 onStatus 推送为准。
+  apply: () => ipcRenderer.invoke('update:apply'),
+  // 拉取最近一次更新状态（兜底 push 早于监听注册）
+  getStatus: () => ipcRenderer.invoke('update:get-status'),
+  // React 已挂载且完成后端真实探活；与 Python token 联合作为 OTA 首启健康门。
+  rendererReady: () => ipcRenderer.invoke('update:renderer-ready'),
+  // 立即重启壳子使已落地新版生效
+  relaunch: () => ipcRenderer.invoke('update:relaunch'),
+  // 订阅更新状态推送，返回注销函数
+  onStatus: (cb) => {
+    const handler = (_e, payload) => cb(payload);
+    ipcRenderer.on('update:status', handler);
+    return () => ipcRenderer.removeListener('update:status', handler);
+  },
+});
+
 contextBridge.exposeInMainWorld('AAS_EPD', {
   // 订阅主进程推送的蓝牙设备流（select-bluetooth-device 拦截后实时转发）
   onDevices: (cb) => {

@@ -80,11 +80,9 @@ def acquire_single_instance_lock():
     - 若锁文件残留但持有者已不在（旧进程崩溃未释放），OS 层独占锁本就不会拦截，可正常抢占。
 
     [M70] 锁必须锚定到“真正被争用的资源”——Telegram bot token 本身，而非脚本目录、也不是 CWD。
-    实测 config.py 的 load_dotenv()（无参）走 python-dotenv 的 find_dotenv：以真实脚本运行时
-    （python main.py，非 REPL/frozen）它从“调用者文件(config.py)所在目录”向上回溯找 .env，
-    而不是从 CWD 找。于是打包态 GUI 的 main.py 副本(resources/backend/)与仓库手动启动/watchdog 的
-    main.py 即便 CWD 相同(DATA_DIR)，也各自解析到不同目录的 .env——既不能按 __file__、也不能按
-    CWD 放锁来兜住“同一 token 双实例”。故直接用最终加载到的 token 派生系统级命名互斥：把锁文件放在
+    config.py 现已显式从 AAS_DATA_DIR（回退 CWD）加载 .env，保证 OTA/内置/源码模式读取同一数据根；
+    但锁仍直接用最终加载到的 token 派生系统级命名互斥，避免未来启动目录或数据目录配置变化重新引入
+    “同一 token 双实例”。锁文件放在
     系统临时目录（对同一用户、与 CWD/脚本位置无关地稳定一致），文件名带 token 哈希。这样任何最终
     用到同一 token 的实例——无论从哪个目录、哪份副本启动——都竞争同一把锁，409 与重复打卡被根除。
     未配置 token 时退回固定通用名，保持“同机仅一份 main.py”的原有单实例语义。
