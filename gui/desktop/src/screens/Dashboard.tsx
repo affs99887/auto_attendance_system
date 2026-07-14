@@ -6,7 +6,16 @@ import { USERS } from '../lib/data';
 import type { PunchRec, RecentActivityEntry, User } from '../lib/types';
 import { useSystemStore } from '../store/system';
 import { usePunchStore } from '../store/punch';
+import { useStartupStore } from '../store/startup';
+import {
+  selectActiveWeatherEntry,
+  selectActiveWeatherLocation,
+  useWeatherStore,
+} from '../store/weather';
 import { api } from '../lib/api';
+import {
+  WeatherOverviewCard,
+} from '../components/WeatherPanel';
 import { FxSection } from '../components/ExchangeRatePanel';
 import { useAiNewsStore, CATEGORY_BY_SLUG, relTime } from '../store/aiNews';
 import { useToastStore } from '../store/toast';
@@ -394,6 +403,67 @@ function useMatchHeight(): [React.RefObject<HTMLDivElement>, number | null] {
   return [ref, h];
 }
 
+function WeatherCard({
+  onOpenWeather,
+  onOpenSettings,
+}: {
+  onOpenWeather: () => void;
+  onOpenSettings: () => void;
+}) {
+  const startupStatus = useStartupStore(s => s.status);
+  const startupReason = useStartupStore(s => s.reason);
+  const location = useWeatherStore(selectActiveWeatherLocation);
+  const { data, loading, error, hasAttempted } = useWeatherStore(selectActiveWeatherEntry);
+  const refresh = useWeatherStore(s => s.refresh);
+
+  React.useEffect(() => {
+    // Electron 窗口会先于 Python HTTP 服务出现；等统一探活确认 ready 后再首拉，
+    // 后端从 starting → ready 时也会自动补拉，避免首次 Failed to fetch 永久停在错误态。
+    if (startupStatus === 'ready' && !data && !hasAttempted && !loading) void refresh(false);
+  }, [startupStatus, data, hasAttempted, loading, refresh]);
+
+  return (
+    <div className="weather-fusion-shell">
+      {!data && (loading || (!hasAttempted && startupStatus !== 'failed')) ? (
+        <div className="card weather-empty" role="status" aria-live="polite" aria-busy="true">
+          <span className="spinner" />
+          <div>
+            <div className="weather-empty-title">正在获取当前地点天气</div>
+            <div className="muted">{location.address}</div>
+          </div>
+        </div>
+      ) : !data ? (
+        <div className="card weather-empty weather-error" role="alert">
+          <Icon.AlertTriangle size={20} />
+          <div style={{ flex: 1 }}>
+            <div className="weather-empty-title">天气暂不可用</div>
+            <div className="muted">
+              {error || (startupStatus === 'failed' ? startupReason : null) || '请稍后重试'}
+            </div>
+          </div>
+          <button className="btn btn-sm" onClick={() => void refresh(true)}>重新加载</button>
+          <button className="btn btn-sm" onClick={onOpenSettings}>天气设置</button>
+        </div>
+      ) : (
+        <>
+          {error && (
+            <div className="weather-fusion-inline-error" title={error} role="alert">
+              <Icon.AlertTriangle size={13} />刷新失败，当前展示上次成功的数据
+            </div>
+          )}
+          <WeatherOverviewCard
+            data={data}
+            size="m"
+            loading={loading}
+            onRefresh={() => void refresh(true)}
+            onOpenDetails={onOpenWeather}
+          />
+        </>
+      )}
+    </div>
+  );
+}
+
 // 仪表盘 AI 资讯模块 —— 竖向精选列表（与今日打卡同一行，高度对齐）
 function DashNewsCard({ matchH }: { matchH: number | null }) {
   const items = useAiNewsStore(s => s.cats.all.items);
@@ -659,6 +729,15 @@ export function DashboardScreen() {
           </div>
           <DashNewsCard matchH={punchH} />
         </div>
+      </div>
+
+      {/* 当前收藏地点 + 彩云天气 */}
+      <div className="col gap-2">
+        <div className="kicker">天气 · 当前地点</div>
+        <WeatherCard
+          onOpenWeather={() => setScreen('weather')}
+          onOpenSettings={() => setScreen('settings')}
+        />
       </div>
 
       {/* Exchange rate: chart + converter（接真实 useExchangeRateStore） */}

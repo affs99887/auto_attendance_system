@@ -269,9 +269,12 @@ class SeleniumLoginController:
     def _setup_edge_options(self) -> Options:
         """设置Edge浏览器选项"""
         options = Options()
-        
+
         if self.headless:
             options.add_argument("--headless")
+            # 新版无头模式并非不创建窗口，而是创建后隐藏(尺寸即 --window-size)；Edge 偶发会把它
+            # 短暂显示成一整块白色窗口(不进 Alt+Tab)。把窗口坐标挪到屏幕外，即使被显示也看不见。
+            options.add_argument("--window-position=-32000,-32000")
         
         # 最小化配置，只保留必要选项
         options.add_argument("--no-sandbox")
@@ -297,9 +300,11 @@ class SeleniumLoginController:
     def _setup_chrome_options(self) -> ChromeOptions:
         """设置Chrome浏览器选项"""
         options = ChromeOptions()
-        
+
         if self.headless:
             options.add_argument("--headless")
+            # 同 Edge：无头的隐藏窗口偶发被显示成白色窗口，挪到屏幕外保证永不可见
+            options.add_argument("--window-position=-32000,-32000")
         
         # 基础配置
         options.add_argument("--no-sandbox")

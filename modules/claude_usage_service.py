@@ -7,7 +7,7 @@ Claude Code 额度服务模块
 设计与 exchange_rate_service 一致：
 - TTL 内存缓存（默认 300 秒）+ force 跳过；失败回退旧缓存但有陈旧上限（超龄按不可用返回），
   失败后短时间内不重复发请求（负缓存），绝不外抛。
-- 若内置网络加速（mihomo）已启用，requests 自动走 http://127.0.0.1:{local_port}；否则直连。
+- 若内置网络加速（mihomo）已启用则优先走本地代理；代理连接失败时立即回退默认网络。
 - 只读凭据文件，不做 token 刷新（Claude Code 自身会维护 token 有效性）；
   token 过期时返回 available=False + error 提示，不影响其他功能。
 - 日志中绝不输出 token 本体。
@@ -29,9 +29,7 @@ import time
 import logging
 import threading
 
-import requests
-
-from modules.config import config
+from modules.proxy_manager import request_get_with_local_proxy_fallback
 
 logger = logging.getLogger(__name__)
 
@@ -93,15 +91,6 @@ def _read_access_token():
         return None, '读取 Claude Code 凭据文件失败'
 
 
-def _proxies():
-    """内置加速启用且本地端口在监听时走本地代理，否则直连。
-
-    端口不通（mihomo 未就绪/已崩/确定性失败）时返回 None 直连，不再硬打死端口报 ProxyError。
-    判定集中在 config.get_local_proxy()，与 汇率/AI资讯/Telegram 口径一致。
-    """
-    return config.get_local_proxy()
-
-
 def _parse_window(obj):
     """把接口返回的单个限额窗口归一化为 {'used_pct', 'resets_at'}。
 
@@ -129,7 +118,8 @@ def _fetch_usage():
         'Accept': 'application/json',
     }
     try:
-        resp = requests.get(_USAGE_URL, headers=headers, proxies=_proxies(), timeout=15)
+        resp = request_get_with_local_proxy_fallback(
+            'claude_usage', _USAGE_URL, headers=headers, timeout=15)
     except Exception:
         logger.warning('[Claude额度] usage 接口请求失败', exc_info=True)
         return None, '请求 Claude usage 接口失败（网络不可达）'

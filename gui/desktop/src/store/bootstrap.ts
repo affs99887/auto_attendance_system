@@ -17,6 +17,7 @@ import { useToastStore } from './toast';
 import { useProxyStore } from './proxy';
 import { useExchangeRateStore } from './exchangeRate';
 import { useAiNewsStore } from './aiNews';
+import { useWeatherStore } from './weather';
 import { useStartupLogStore } from './startupLog';
 import { useServiceStore } from './service';
 import { appConfirm } from '../lib/dialog';
@@ -24,6 +25,7 @@ import { appConfirm } from '../lib/dialog';
 const REFRESH_INTERVAL_MS = 15_000;
 const FX_REFRESH_INTERVAL_MS = 5 * 60_000; // 汇率轮询：5 分钟
 const AI_NEWS_REFRESH_INTERVAL_MS = 15 * 60_000; // AI 资讯轮询：15 分钟
+const WEATHER_REFRESH_INTERVAL_MS = 15 * 60_000; // 天气轮询：15 分钟
 const PING_INTERVAL_MS = 400;
 const READY_TIMEOUT_MS = 35_000;
 
@@ -43,11 +45,21 @@ export function useBackendBootstrap() {
       useServiceStore.getState().setRunning(true);
       return;
     }
+    const applyRunning = (running: boolean) => {
+      const serviceState = useServiceStore.getState();
+      const wasRunning = serviceState.running;
+      serviceState.setRunning(running);
+      if (!wasRunning && running && useStartupStore.getState().status === 'ready') {
+        // 服务快速重启时，旧天气请求可能仍在超时窗口内；排队一次强制刷新，
+        // 等旧请求收尾后自动补跑，不能被 loading 去重吞掉。
+        useWeatherStore.getState().refreshAfterCurrent(true);
+      }
+    };
     useServiceStore.getState().setAvailable(true);
     void service.getStatus()
-      .then(p => useServiceStore.getState().setRunning(!!p?.running))
+      .then(p => applyRunning(!!p?.running))
       .catch(() => { /* ignore */ });
-    const off = service.onStatus(p => useServiceStore.getState().setRunning(!!p?.running));
+    const off = service.onStatus(p => applyRunning(!!p?.running));
     return off; // StrictMode 安全：cleanup 即取消订阅
   }, []);
 
@@ -115,6 +127,9 @@ export function useBackendBootstrap() {
           await api.getStatus();   // 带 token，确认 token 有效（防僵尸进程占端口的假就绪）
           if (cancelled || useStartupStore.getState().epoch !== epoch) return;
           useStartupStore.getState().setReady();
+          // 真正通过 HTTP 探活后再触发天气；若重启前的旧请求仍未结束，
+          // refreshAfterCurrent 会把这次强制刷新排到旧请求之后执行。
+          useWeatherStore.getState().refreshAfterCurrent(true);
           return;
         } catch {
           // 还没起来 / token 暂不可用，继续轮询
@@ -144,6 +159,7 @@ export function useBackendBootstrap() {
         wsClient.stop();
         wsClient.start();
         void useSystemStore.getState().refresh();
+        useWeatherStore.getState().refreshAfterCurrent(true);
         return;
       }
       st.setPhase('正在确认服务可用…');
@@ -201,6 +217,8 @@ export function useBackendBootstrap() {
     // AI 资讯首屏拉取（NewsScreen 自身不触发首拉；WS ai_news:update 仅触发重拉，
     // 首份缓存由这里负责拉到）
     void useAiNewsStore.getState().refresh();
+    // 天气首屏拉取；与 AI 资讯一样由统一 bootstrap 管理轮询和窗口恢复补刷。
+    void useWeatherStore.getState().refresh();
 
     const refreshTimer = window.setInterval(() => {
       void useSystemStore.getState().refresh();
@@ -239,16 +257,28 @@ export function useBackendBootstrap() {
     // AI 资讯 15 分钟轮询（与上述轮询同期生命周期，cleanup 一并清理）；
     // 用户已"加载更多"的视图跳过，避免把列表缩回首屏 / 丢失滚动位置
     const aiNewsTimer = window.setInterval(refreshAiNewsViews, AI_NEWS_REFRESH_INTERVAL_MS);
+    const weatherRefreshTimer = window.setInterval(() => {
+      void useWeatherStore.getState().refresh();
+    }, WEATHER_REFRESH_INTERVAL_MS);
 
-    const onVisible = () => {
-      if (document.visibilityState === 'visible') {
+    // Electron 恢复窗口时通常会连续触发 visible + focus；合并为一次补刷，
+    // 避免上游快速失败时同一轮恢复连续发出两次请求。
+    let resumeRefreshTimer: number | null = null;
+    const scheduleResumeRefresh = () => {
+      if (document.visibilityState !== 'visible') return;
+      if (resumeRefreshTimer !== null) window.clearTimeout(resumeRefreshTimer);
+      resumeRefreshTimer = window.setTimeout(() => {
+        resumeRefreshTimer = null;
         void useExchangeRateStore.getState().refresh();
         refreshAiNewsViews();
-      }
+        void useWeatherStore.getState().refresh();
+      }, 200);
+    };
+    const onVisible = () => {
+      if (document.visibilityState === 'visible') scheduleResumeRefresh();
     };
     const onFocus = () => {
-      void useExchangeRateStore.getState().refresh();
-      refreshAiNewsViews();
+      scheduleResumeRefresh();
     };
     document.addEventListener('visibilitychange', onVisible);
     window.addEventListener('focus', onFocus);
@@ -319,6 +349,8 @@ export function useBackendBootstrap() {
       window.clearInterval(refreshTimer);
       window.clearInterval(fxRefreshTimer);
       window.clearInterval(aiNewsTimer);
+      window.clearInterval(weatherRefreshTimer);
+      if (resumeRefreshTimer !== null) window.clearTimeout(resumeRefreshTimer);
       document.removeEventListener('visibilitychange', onVisible);
       window.removeEventListener('focus', onFocus);
       unsubs.forEach(fn => fn());

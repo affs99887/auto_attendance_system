@@ -22,12 +22,111 @@ import asyncio
 import zipfile
 import platform
 import subprocess
+import threading
 
 import requests
 
 from modules.config import config
 
 logger = logging.getLogger(__name__)
+
+# 业务接口共用的本地代理快速回退。端口可连接只说明 mihomo 进程已监听，不能证明当前
+# 节点/DNS/上游已可用；按服务隔离熔断，避免一个目标站故障影响其他目标站。
+_PROXY_FALLBACK_COOLDOWN_SECONDS = 60.0
+_proxy_request_circuits = {}
+_proxy_request_circuit_lock = threading.Lock()
+_proxy_request_generation = 0
+
+
+def reset_proxy_request_circuits():
+    """清空业务请求的代理熔断状态（代理启动、重载或切换节点后调用）。"""
+    global _proxy_request_generation
+    with _proxy_request_circuit_lock:
+        _proxy_request_generation += 1
+        _proxy_request_circuits.clear()
+
+
+def _claim_local_proxy_attempt(service_key, now):
+    """返回 (是否尝试本地代理, 是否为冷却后的单次探测, 当前代次)。"""
+    with _proxy_request_circuit_lock:
+        generation = _proxy_request_generation
+        state = _proxy_request_circuits.get(service_key)
+        if state is None:
+            return True, False, generation
+        if now < state['open_until']:
+            return False, False, generation
+        if state['probe_inflight']:
+            return False, False, generation
+        state['probe_inflight'] = True
+        return True, True, generation
+
+
+def _open_proxy_request_circuit(service_key, generation):
+    with _proxy_request_circuit_lock:
+        # 切换节点/重载后的旧在途请求不能重新熔断新配置。
+        if generation != _proxy_request_generation:
+            return
+        _proxy_request_circuits[service_key] = {
+            'open_until': time.monotonic() + _PROXY_FALLBACK_COOLDOWN_SECONDS,
+            'probe_inflight': False,
+        }
+
+
+def _close_proxy_request_circuit(service_key, generation):
+    with _proxy_request_circuit_lock:
+        # 同理，旧请求成功也不能清掉新代次刚建立的熔断。
+        if generation == _proxy_request_generation:
+            _proxy_request_circuits.pop(service_key, None)
+
+
+def _release_proxy_probe(service_key, generation):
+    with _proxy_request_circuit_lock:
+        if generation != _proxy_request_generation:
+            return
+        state = _proxy_request_circuits.get(service_key)
+        if state is not None:
+            state['probe_inflight'] = False
+
+
+def request_get_with_local_proxy_fallback(service_key, url, **kwargs):
+    """优先经本地 mihomo 发 GET；连接/超时失败时立即改走默认网络。
+
+    熔断按 service_key 隔离，冷却期间不再撞故障代理；HTTP 状态码和响应解析错误
+    不属于代理连通性问题，由调用方按原逻辑处理。日志不输出 URL，避免泄露路径凭据。
+    """
+    try:
+        local_proxy = config.get_local_proxy()
+    except Exception as exc:
+        logger.warning(
+            '读取本地代理配置失败，服务 %s 改走默认网络（%s）',
+            service_key, type(exc).__name__,
+        )
+        return requests.get(url, **kwargs)
+
+    if not local_proxy:
+        return requests.get(url, **kwargs)
+
+    should_try_proxy, half_open_probe, generation = _claim_local_proxy_attempt(
+        service_key, time.monotonic())
+    if not should_try_proxy:
+        return requests.get(url, **kwargs)
+
+    try:
+        response = requests.get(url, proxies=local_proxy, **kwargs)
+    except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as exc:
+        _open_proxy_request_circuit(service_key, generation)
+        logger.warning(
+            '本地代理请求失败，服务 %s 在 %.0f 秒内改走默认网络（%s）',
+            service_key, _PROXY_FALLBACK_COOLDOWN_SECONDS, type(exc).__name__,
+        )
+        return requests.get(url, **kwargs)
+    except Exception:
+        if half_open_probe:
+            _release_proxy_probe(service_key, generation)
+        raise
+    else:
+        _close_proxy_request_circuit(service_key, generation)
+        return response
 
 # Telegram 走代理的规则（订阅模式自生成；仅域名/IP，不依赖 geo 数据库）
 _TELEGRAM_RULES = [
@@ -529,6 +628,7 @@ class ProxyManager:
         if not self.binary_available():
             return False, f'未找到 mihomo 二进制：{self.mihomo_path()}（请确认 bin/ 已打包）'
         if self.is_running():
+            reset_proxy_request_circuits()
             return True, '已在运行'
 
         try:
@@ -595,6 +695,7 @@ class ProxyManager:
                 if r.status_code == 200:
                     logger.info('mihomo 已就绪：本地端口 %s', config.get_proxy_local_port())
                     self._reselect_node_if_needed()
+                    reset_proxy_request_circuits()
                     return True, '已启动'
             except Exception:
                 pass
@@ -672,6 +773,7 @@ class ProxyManager:
             )
             if r.status_code in (200, 204):
                 self._reselect_node_if_needed()
+                reset_proxy_request_circuits()
                 return True, '已重载'
         except Exception:
             logger.warning('热重载失败，改为重启', exc_info=True)
@@ -767,6 +869,7 @@ class ProxyManager:
         )
         if r.status_code in (200, 204):
             config.set_proxy_config({'selected_node': name})
+            reset_proxy_request_circuits()
             return True
         r.raise_for_status()
         return False

@@ -289,6 +289,7 @@ async def initialize_system(fast_boot=False):
     attendance_system = None
     schedule_task = None
     monitor_task = None
+    bot_started = False
     
     for i, (step_name, step_func) in enumerate(steps):
         current_step = i + 1
@@ -356,15 +357,15 @@ async def initialize_system(fast_boot=False):
                 await _tick(0.5)
             elif current_step == 9:  # 启动机器人应用
                 await _tick(0.3)  # 显示进度
-                # bot 降级时 app 为 None，跳过启动（避免 NoneType 崩溃）
-                if attendance_system.bot.app is not None:
-                    await attendance_system.bot.app.start()
+                # GUI 模式由 _start_bot_deferred 接管；控制台模式即使 app.start()/轮询失败
+                # 也只降级 Telegram，不让异常中断 AI、调度器等主启动链。
+                if not fast_boot and attendance_system.bot.app is not None:
+                    bot_started = await _activate_initialized_bot(attendance_system)
                 await _tick(0.4)
             elif current_step == 10:  # 启动连接监控
                 await _tick(0.3)  # 显示进度
-                # 同样在 bot 可用时才启动轮询与连接监控；降级时 monitor_task 保持为 None
-                if attendance_system.bot.app is not None:
-                    await attendance_system.bot.start_polling()
+                # 轮询已由统一激活函数启动；仅成功时挂连接监控。
+                if bot_started:
                     monitor_task = asyncio.create_task(attendance_system.bot.monitor_connection())
                 await _tick(0.3)
         
@@ -391,6 +392,47 @@ async def initialize_system(fast_boot=False):
     return attendance_system, schedule_task, monitor_task
 
 
+async def _activate_initialized_bot(attendance_system):
+    """完整激活 Telegram；任何失败只标记降级，不向主启动链抛出。"""
+    bot = attendance_system.bot
+    # 与 GUI 手动重连、后台监控共用同一生命周期锁；锁顺序保持
+    # _reconnect_lock -> _initialization_lock，避免并发 stop/shutdown/start_polling。
+    async with bot._reconnect_lock:
+        try:
+            await bot._ensure_app_initialized()
+            if bot.app is None:
+                raise RuntimeError("Telegram Bot 初始化失败：应用未创建")
+            await bot.app.start()
+            await bot.start_polling()
+        except Exception as exc:
+            attendance_system.bot_available = False
+            attendance_system.bot_error = str(exc)[:500]
+            logging.warning("Telegram Bot 激活失败，主程序继续降级运行: %r", exc)
+
+            app = bot.app
+            if app is not None:
+                try:
+                    await bot.stop_polling()
+                except Exception:
+                    pass
+                try:
+                    await app.stop()
+                except Exception:
+                    pass
+                try:
+                    await app.shutdown()
+                except Exception:
+                    pass
+            bot.is_polling = False
+            bot._is_initialized = False
+            bot.app = None
+            return False
+
+        attendance_system.bot_available = True
+        attendance_system.bot_error = None
+        return True
+
+
 async def _bot_recovery_loop(attendance_system):
     """bot 初始化降级后的后台自动恢复（指数退避重连）。
 
@@ -406,7 +448,7 @@ async def _bot_recovery_loop(attendance_system):
         await asyncio.sleep(delay)
         attempt += 1
         try:
-            ok, msg = await attendance_system.bot.reconnect()
+            ok, msg = await attendance_system.bot.reconnect(force=False)
         except Exception as e:
             logging.warning(f"bot 后台恢复第 {attempt} 次重连异常，稍后重试: {e!r}")
             continue
@@ -435,25 +477,9 @@ async def _start_bot_deferred(attendance_system):
     里的 8:15 提醒验证，整体搬到 GUI 后端 await 启动之后由本协程后台执行——GUI 秒级就绪，bot 在后台
     按原有重试 / 降级 / 恢复语义连接，互不阻塞。仅 GUI 模式调用；控制台 / watchdog 模式仍走原同步链路。
     """
-    try:
-        await attendance_system.bot._ensure_app_initialized()
-        if not attendance_system.bot.app:
-            raise Exception("Telegram Bot 初始化失败")
-    except Exception as e:
-        # 与原 step5 一致的降级处理：标记降级并交给 _bot_recovery_loop 后台退避重连
-        # （其成功后会自行补启动连接监控）。
-        logging.warning(f"Telegram Bot 初始化失败，转为降级运行（GUI 仍可用）: {e!r}")
-        attendance_system.bot_available = False
-        attendance_system.bot_error = str(e)[:500]
+    if not await _activate_initialized_bot(attendance_system):
+        # 初始化、app.start 或轮询任一步失败都进入同一后台恢复路径。
         await _bot_recovery_loop(attendance_system)
-        return
-
-    # 初始化成功：对应原 step9 / step10（启动应用 + 轮询）
-    try:
-        await attendance_system.bot.app.start()
-        await attendance_system.bot.start_polling()
-    except Exception:
-        logging.exception("Telegram Bot 启动 / 轮询失败")
         return
 
     # 对应原 main() 中的 8:15 提醒任务验证（bot 就绪后才有意义）

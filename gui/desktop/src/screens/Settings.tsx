@@ -65,6 +65,7 @@ type TabKey =
   | 'users'
   | 'schedule'
   | 'automation'
+  | 'weather'
   | 'telegram'
   | 'email'
   | 'advanced';
@@ -83,7 +84,10 @@ export function SettingsScreen() {
 
   // 敏感字段：后端 getConfigAll 返回掩码（••••），前端置空，留空=不修改，避免保存时覆盖真实值
   const SENSITIVE = React.useMemo(
-    () => new Set(['LOGIN_PASSWORD', 'LOGIN_PASSWORD2', 'TELEGRAM_BOT_TOKEN', 'EMAIL_PASSWORD']),
+    () => new Set([
+      'LOGIN_PASSWORD', 'LOGIN_PASSWORD2', 'TELEGRAM_BOT_TOKEN', 'EMAIL_PASSWORD',
+      'CAIYUN_WEATHER_APP_KEY', 'CAIYUN_WEATHER_APP_SECRET', 'CAIYUN_WEATHER_TOKEN',
+    ]),
     [],
   );
 
@@ -236,6 +240,7 @@ export function SettingsScreen() {
             { id: 'users', l: '账户与登录' },
             { id: 'schedule', l: '打卡时间' },
             { id: 'automation', l: '自动化模式' },
+            { id: 'weather', l: '天气' },
             { id: 'telegram', l: 'Telegram' },
             { id: 'email', l: '邮件' },
             { id: 'advanced', l: '高级' },
@@ -567,6 +572,78 @@ export function SettingsScreen() {
             </div>
           </Section>
         </div>
+      )}
+
+      {tab === 'weather' && (
+        <Section
+          title="彩云天气"
+          sub="多地点天气 · 彩云 v2.6 综合天气"
+          icon="Cloud"
+        >
+          <div className="field-row">
+            <div className="field">
+              <div className="field-label">App Key CAIYUN_WEATHER_APP_KEY</div>
+              <input
+                className="input mono"
+                type="password"
+                value={envFields['CAIYUN_WEATHER_APP_KEY'] ?? ''}
+                placeholder={secretPlaceholder('CAIYUN_WEATHER_APP_KEY')}
+                onChange={e => updateField('CAIYUN_WEATHER_APP_KEY', e.target.value)}
+              />
+            </div>
+            <div className="field">
+              <div className="field-label">App Secret CAIYUN_WEATHER_APP_SECRET</div>
+              <input
+                className="input mono"
+                type="password"
+                value={envFields['CAIYUN_WEATHER_APP_SECRET'] ?? ''}
+                placeholder={secretPlaceholder('CAIYUN_WEATHER_APP_SECRET')}
+                onChange={e => updateField('CAIYUN_WEATHER_APP_SECRET', e.target.value)}
+              />
+            </div>
+          </div>
+          <div className="field">
+            <div className="field-label">兼容 Token CAIYUN_WEATHER_TOKEN</div>
+            <input
+              className="input mono"
+              type="password"
+              value={envFields['CAIYUN_WEATHER_TOKEN'] ?? ''}
+              placeholder={secretPlaceholder('CAIYUN_WEATHER_TOKEN')}
+              onChange={e => updateField('CAIYUN_WEATHER_TOKEN', e.target.value)}
+            />
+            <div className="field-hint">
+              优先使用更安全的 App Key + App Secret；只有旧版凭据时再填写 Token。
+            </div>
+          </div>
+          <div
+            style={{
+              padding: 12,
+              background: 'var(--bg-inset)',
+              border: '1px solid var(--border-soft)',
+              borderRadius: 6,
+              fontSize: 11,
+              lineHeight: 1.7,
+              color: 'var(--text-secondary)',
+            }}
+          >
+            默认地点为上海市长宁区华山路1076号。收藏地点与当前地点请在“天气预报”页面
+            管理和切换；城市搜索使用本地行政区划数据。认证凭据只由本机 Python 后端读取。
+          </div>
+          <div className="divider" />
+          <div className="row gap-2" style={{ justifyContent: 'flex-end' }}>
+            <button
+              className="btn btn-primary"
+              disabled={envLoading}
+              onClick={() => saveFields([
+                'CAIYUN_WEATHER_APP_KEY',
+                'CAIYUN_WEATHER_APP_SECRET',
+                'CAIYUN_WEATHER_TOKEN',
+              ])}
+            >
+              <Icon.Check size={12} />保存到 .env（需重启）
+            </button>
+          </div>
+        </Section>
       )}
 
       {tab === 'telegram' && (

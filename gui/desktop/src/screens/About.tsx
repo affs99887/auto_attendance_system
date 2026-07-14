@@ -2,7 +2,6 @@
 import * as React from 'react';
 import { Icon } from '../lib/icons';
 import { COMMANDS } from '../lib/data';
-import { ServiceControls } from '../components/ServiceControls';
 import type { UpdateStatus } from '../lib/backend';
 import { appConfirm } from '../lib/dialog';
 import { useToastStore } from '../store/toast';
@@ -185,9 +184,6 @@ export function AboutScreen() {
               <div className="spread"><span>已运行</span><span className="mono">45m 12s</span></div>
               <div className="spread"><span>看门狗重启</span><span className="mono">0 次</span></div>
             </div>
-            <div className="divider" />
-            {/* 服务控制（启动/重启/终止/重连 + 心跳）— 统一走 ServiceControls bar 形态 */}
-            <ServiceControls variant="bar" />
             <div className="divider" />
             <div className="col gap-2" style={{ fontSize: 12 }}>
               <div className="spread">
