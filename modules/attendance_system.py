@@ -62,9 +62,9 @@ class AttendanceSystem:
         self.bot = TelegramBot(config.TELEGRAM_CHAT_ID)
         # 设置bot的attendance_system引用
         self.bot.attendance_system = self
-        # bot 可用性标记：初始化失败时降级，由 GUI 重连端点恢复（供 snapshot 暴露给前端）
-        self.bot_available = True
-        self.bot_error = None
+        # 只有 Application + 轮询完整启动后才算可用；启动期间/失败时核心业务继续运行。
+        self.bot_available = False
+        self.bot_error = '正在初始化'
 
         # 截图保存路径
         self.screenshot_path = 'logs/temp_screenshot.png'
@@ -693,6 +693,12 @@ class AttendanceSystem:
         # 确保bot已初始化
         if not self.bot:
             logging.warning(f"无法发送通知，Telegram bot实例不存在: {title} - {content}")
+            return
+
+        # Telegram 降级时不在业务流程里同步初始化/重试；事件总线已在上方照常推给 GUI，
+        # Bot 恢复由启动恢复任务或连接监控独立负责。
+        if not getattr(self, 'bot_available', False):
+            logging.debug("Telegram Bot 当前不可用，跳过通知发送: %s", title)
             return
 
         # 使用bot的send_message方法，它会自动处理初始化
@@ -2078,38 +2084,10 @@ class AttendanceSystem:
                     'punch_in_scheduled'
                 )
 
-        # 启动首刷前先等「内置加速真正连好」：mihomo 冷启动到节点连通要数十秒（external-controller
-        # 就绪 ≠ 节点可用），过早拉取必然撞上 SSL EOF / 连接失败并刷错误栈（启动竞态）。这里在 daemon
-        # 线程里轮询「能否通过本地代理连通健康检查 URL」，连通或超时(90s)后再刷，从根上消除汇率/AI
-        # 资讯首刷的启动竞态失败。代理未启用 → 直连不等；mihomo 确定性起不来(二进制缺失/无配置) → 不空等。
-        def _wait_proxy_usable(timeout=90):
-            try:
-                if not config.get_proxy_enabled():
-                    return
-                if config._proxy_deterministic_failure() is not None:
-                    return
-            except Exception:
-                return
-            import requests as _rq
-            _health = 'https://www.gstatic.com/generate_204'
-            deadline = time.time() + timeout
-            while time.time() < deadline:
-                try:
-                    proxies = config.get_local_proxy()  # 端口在监听才返回，否则 None
-                    if proxies:
-                        r = _rq.get(_health, proxies=proxies, timeout=5)
-                        if r.status_code in (200, 204):
-                            return  # mihomo 节点已连通，可以开始拉取
-                except Exception:
-                    pass
-                time.sleep(3)
-            logging.warning('启动首刷：等待内置加速就绪超时(90s)，仍尝试拉取一次（失败则回退缓存）')
-
         # 启动时触发一次汇率首刷（容错、不阻塞启动）：放 daemon 线程，避免阻塞 __init__ 与事件循环。
-        # 线程内先等 mihomo 连好再刷（见 _wait_proxy_usable），避免冷启动竞态导致的 SSL 失败。
+        # 每个服务请求会在本地代理连接失败时立即回退默认网络，不再等待统一健康 URL。
         def _first_exchange_rate_refresh():
             try:
-                _wait_proxy_usable()
                 from modules.exchange_rate_service import refresh as _refresh
                 _refresh(None)
             except Exception as e:
@@ -2124,7 +2102,6 @@ class AttendanceSystem:
         # 启动时触发一次 AI 资讯首刷（容错、不阻塞启动）：放 daemon 线程，避免阻塞 __init__ 与事件循环。
         def _first_ai_news_refresh():
             try:
-                _wait_proxy_usable()
                 from modules.ai_news_service import refresh as _refresh_news
                 started = int(time.time())
                 contract = _refresh_news()

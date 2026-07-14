@@ -26,6 +26,7 @@ import re
 import base64
 import hashlib
 import hmac
+import math
 import uuid
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 from typing import Any, Optional, Set
@@ -302,6 +303,8 @@ def _write_env_atomic(patch: dict, path: str = '.env') -> dict:
 
 _WEATHER_CACHE_TTL = 600
 _WEATHER_CACHE_MAX = 20
+_WEATHER_HOURLY_STEPS = 72
+_WEATHER_DAILY_STEPS = 7
 _weather_cache: dict = {}
 _weather_cache_lock = threading.Lock()
 
@@ -350,14 +353,14 @@ def _caiyun_signature_headers(path: str, query: dict, app_key: str,
 def _caiyun_http_get(base_url: str, path: str, query: dict, headers: dict) -> dict:
     """执行一次彩云 GET；异常中不包含带凭据的完整 URL。"""
     import requests
-    from modules.config import config as cfg
+    from modules.proxy_manager import request_get_with_local_proxy_fallback
 
     try:
-        response = requests.get(
+        response = request_get_with_local_proxy_fallback(
+            'weather',
             base_url + path,
             params=query,
             headers={'Accept': 'application/json', **headers},
-            proxies=cfg.get_local_proxy(),
             timeout=(5, 10),
         )
         response.raise_for_status()
@@ -381,8 +384,9 @@ def _fetch_caiyun_weather_raw(latitude: float, longitude: float) -> dict:
     path = f'/v2.6/{quote(credential, safe="")}/{coordinate}/weather'
     query = {
         'alert': 'true',
-        'dailysteps': '5',
-        'hourlysteps': '24',
+        'dailysteps': str(_WEATHER_DAILY_STEPS),
+        # 新套餐支持未来 3 天逐小时预报，完整保留给详情页与后续业务使用。
+        'hourlysteps': str(_WEATHER_HOURLY_STEPS),
         # metric:v2 让实况/逐时降水统一为 mm/h，距离保持 km。
         'unit': 'metric:v2',
     }
@@ -418,7 +422,8 @@ def _fetch_caiyun_address(latitude: float, longitude: float) -> dict:
 
 def _as_float(value, default=None):
     try:
-        return float(value)
+        number = float(value)
+        return number if math.isfinite(number) else default
     except (TypeError, ValueError):
         return default
 
@@ -428,6 +433,16 @@ def _probability_percent(value):
     if number is None:
         return None
     # 彩云 v2.6 probability 已是 0-100 的百分数，不能把 0.5/1 再放大百倍。
+    return max(0, min(100, int(round(number))))
+
+
+def _fraction_percent(value):
+    """把彩云 0-1 比例字段转换为 0-100 百分数。"""
+    number = _as_float(value)
+    if number is None:
+        return None
+    if 0 <= number <= 1:
+        number *= 100
     return max(0, min(100, int(round(number))))
 
 
@@ -449,7 +464,7 @@ def _normalize_caiyun_weather(data: dict, latitude: float, longitude: float,
     skycons = daily.get('skycon') or []
     precipitations = daily.get('precipitation') or []
     daily_rows = []
-    for index, temp in enumerate(temperatures[:5]):
+    for index, temp in enumerate(temperatures[:_WEATHER_DAILY_STEPS]):
         if not isinstance(temp, dict):
             continue
         sky = skycons[index] if index < len(skycons) and isinstance(skycons[index], dict) else {}
@@ -467,9 +482,13 @@ def _normalize_caiyun_weather(data: dict, latitude: float, longitude: float,
             'precipitation_probability': _probability_percent(precipitation.get('probability')),
         })
 
-    def hourly_item(series, index):
+    def hourly_map(series):
         values = series if isinstance(series, list) else []
-        return values[index] if index < len(values) and isinstance(values[index], dict) else {}
+        return {
+            str(item.get('datetime')): item
+            for item in values
+            if isinstance(item, dict) and item.get('datetime')
+        }
 
     hourly_temperatures = hourly.get('temperature') or []
     hourly_apparent = hourly.get('apparent_temperature') or []
@@ -478,16 +497,32 @@ def _normalize_caiyun_weather(data: dict, latitude: float, longitude: float,
     hourly_winds = hourly.get('wind') or []
     hourly_humidity = hourly.get('humidity') or []
     hourly_aqi = (hourly.get('air_quality') or {}).get('aqi') or []
+    temperature_by_time = hourly_map(hourly_temperatures)
+    apparent_by_time = hourly_map(hourly_apparent)
+    skycon_by_time = hourly_map(hourly_skycons)
+    precipitation_by_time = hourly_map(hourly_precipitations)
+    wind_by_time = hourly_map(hourly_winds)
+    humidity_by_time = hourly_map(hourly_humidity)
+    aqi_by_time = hourly_map(hourly_aqi)
+    hourly_datetimes = sorted(set().union(
+        temperature_by_time,
+        apparent_by_time,
+        skycon_by_time,
+        precipitation_by_time,
+        wind_by_time,
+        humidity_by_time,
+        aqi_by_time,
+    ))[:_WEATHER_HOURLY_STEPS]
+
     hourly_rows = []
-    for index, temp in enumerate(hourly_temperatures[:24]):
-        if not isinstance(temp, dict):
-            continue
-        apparent = hourly_item(hourly_apparent, index)
-        sky = hourly_item(hourly_skycons, index)
-        precipitation = hourly_item(hourly_precipitations, index)
-        wind_row = hourly_item(hourly_winds, index)
-        humidity_row = hourly_item(hourly_humidity, index)
-        aqi_row = hourly_item(hourly_aqi, index)
+    for datetime_value in hourly_datetimes:
+        temp = temperature_by_time.get(datetime_value, {})
+        apparent = apparent_by_time.get(datetime_value, {})
+        sky = skycon_by_time.get(datetime_value, {})
+        precipitation = precipitation_by_time.get(datetime_value, {})
+        wind_row = wind_by_time.get(datetime_value, {})
+        humidity_row = humidity_by_time.get(datetime_value, {})
+        aqi_row = aqi_by_time.get(datetime_value, {})
         aqi_value = aqi_row.get('value')
         if isinstance(aqi_value, dict):
             aqi_value = aqi_value.get('chn')
@@ -501,7 +536,7 @@ def _normalize_caiyun_weather(data: dict, latitude: float, longitude: float,
                 ))),
             )
         hourly_rows.append({
-            'datetime': str(temp.get('datetime') or sky.get('datetime') or ''),
+            'datetime': datetime_value,
             'temperature': _as_float(temp.get('value')),
             'apparent_temperature': _as_float(apparent.get('value')),
             'skycon': sky.get('value'),
@@ -513,8 +548,14 @@ def _normalize_caiyun_weather(data: dict, latitude: float, longitude: float,
             'aqi': _as_float(aqi_value),
         })
 
+    alert_content = alert.get('content') if isinstance(alert, dict) else None
+    alert_payload_ok = (
+        isinstance(alert, dict)
+        and alert.get('status') == 'ok'
+        and isinstance(alert_content, list)
+    )
     alert_rows = []
-    for item in (alert.get('content') or [])[:5]:
+    for index, item in enumerate(alert_content if alert_payload_ok else []):
         if not isinstance(item, dict):
             continue
         title = str(item.get('title') or '').strip()
@@ -522,7 +563,12 @@ def _normalize_caiyun_weather(data: dict, latitude: float, longitude: float,
         if not title and not description:
             continue
         alert_rows.append({
-            'id': str(item.get('alertId') or item.get('code') or title),
+            'id': str(item.get('alertId') or '|'.join((
+                str(item.get('code') or ''),
+                str(item.get('location') or ''),
+                str(item.get('pubtimestamp') or ''),
+                str(index),
+            ))),
             'title': title or '气象预警',
             'description': description,
             'code': str(item.get('code') or ''),
@@ -531,6 +577,11 @@ def _normalize_caiyun_weather(data: dict, latitude: float, longitude: float,
             'source': str(item.get('source') or ''),
             'published_at': int(_as_float(item.get('pubtimestamp'), 0) or 0),
         })
+    # 明确空列表才代表“当前无预警”；若上游声称有内容但一条也无法解析，
+    # 应落到“预警数据不可用”，不能给用户错误的安全结论。
+    alerts_available = bool(
+        alert_payload_ok and (not alert_content or alert_rows)
+    )
 
     humidity = _as_float(realtime.get('humidity'))
     if humidity is not None:
@@ -564,7 +615,7 @@ def _normalize_caiyun_weather(data: dict, latitude: float, longitude: float,
             'wind_direction': _as_float(wind.get('direction')),
             'visibility': _as_float(realtime.get('visibility')),
             'pressure': pressure,
-            'cloudrate': _probability_percent(realtime.get('cloudrate')),
+            'cloudrate': _fraction_percent(realtime.get('cloudrate')),
             'precipitation_intensity': _as_float(local_precipitation.get('intensity')),
             'nearest_precipitation_distance': _as_float(nearest_precipitation.get('distance')),
             'aqi': _as_float(aqi.get('chn')),
@@ -580,6 +631,8 @@ def _normalize_caiyun_weather(data: dict, latitude: float, longitude: float,
         'hourly': hourly_rows,
         'daily': daily_rows,
         'alerts': alert_rows,
+        'alerts_available': alerts_available,
+        'alerts_total': len(alert_rows),
         'address_warning': address_warning,
         'cached': False,
     }

@@ -66,6 +66,9 @@ gui-settings.json
 # 桌面端打包产物（electron-builder 输出到项目根 release/）
 /release/
 
+# Claude Design 设计交接包（仅供编码代理读取设计参考，不是项目源码）
+/.handoff-weather/
+
 # 桌面端 Node 依赖与构建缓存（package-lock.json 入库，其余产物不入库）
 gui/desktop/node_modules/
 gui/desktop/.vite/

@@ -64,8 +64,16 @@ class TelegramBot:
         self.read_timeout = 20
         self.write_timeout = 20
         self.connect_timeout = 20
-        # Telegram代理：按 config.TELEGRAM_PROXY_PORTS 顺序探测，失败则直连
-        self.proxy_url = config.get_telegram_proxy()
+        # Telegram代理：按 config.TELEGRAM_PROXY_PORTS 顺序探测，失败则标记未就绪并交给恢复流程
+        try:
+            self.proxy_url = config.get_telegram_proxy()
+        except Exception as exc:
+            # 构造 AttendanceSystem 时不能因一次代理探测异常拖垮全部模块；初始化/重连会再次探测。
+            self.proxy_url = None
+            logging.warning(
+                "首次读取 Telegram 代理失败，暂按未就绪处理（%s）",
+                type(exc).__name__,
+            )
         # 添加设置定时打卡的状态变量
         self.setting_time_state = {}  # 用于存储用户的设置状态
         self.setting_time_timer = {}  # 用于存储设置超时计时器
@@ -125,8 +133,15 @@ class TelegramBot:
 
                 for attempt_idx in range(max_init_retries):
                     # 每次重试前重新探测代理，避免使用一个早已不通的端口
-                    if attempt_idx > 0:
+                    try:
                         self.proxy_url = config.get_telegram_proxy()
+                    except Exception as probe_error:
+                        self.proxy_url = None
+                        last_error = probe_error
+                        logging.warning(
+                            "探测 Telegram 代理失败（第 %d/%d 次，%s）",
+                            attempt_idx + 1, max_init_retries, type(probe_error).__name__,
+                        )
                     if not self.proxy_url:
                         last_error = RuntimeError(
                             f"未探测到可用 Telegram 代理（已尝试端口 {config.TELEGRAM_PROXY_PORTS}），"
@@ -145,6 +160,7 @@ class TelegramBot:
                         # 如果已有app实例，先清理
                         if self.app:
                             try:
+                                await self.stop_polling()
                                 await self.app.stop()
                                 await self.app.shutdown()
                             except Exception as e:
@@ -805,6 +821,11 @@ class TelegramBot:
 
     async def send_message(self, title, content):
         """发送Telegram消息"""
+        if self.attendance_system and not getattr(
+                self.attendance_system, 'bot_available', True):
+            logging.debug("Telegram Bot 当前不可用，跳过直接消息发送: %s", title)
+            return False
+
         for retry in range(self.max_retries):
             try:
                 # 确保应用已初始化
@@ -839,8 +860,10 @@ class TelegramBot:
 
                 # 检查是否是HTTPXRequest初始化错误
                 if "HTTPXRequest" in error_msg and "not initialized" in error_msg:
-                    self._is_initialized = False  # 标记需要重新初始化
                     error_msg = f"发送Telegram消息时发生HTTPXRequest错误 (尝试 {retry + 1}/{self.max_retries}): {error_msg}"
+                    if self.attendance_system:
+                        self.attendance_system.bot_available = False
+                        self.attendance_system.bot_error = error_msg[:500]
                 elif "NetworkError" in error_type or "TimedOut" in error_type:
                     self.connection_error_count += 1
                     self.last_connection_error = datetime.now()
@@ -856,13 +879,14 @@ class TelegramBot:
                     await asyncio.sleep(self.retry_delay * (retry + 1))
                     continue
 
-                # 最后一次重试失败，检查是否需要重启程序
+                # Telegram 连续网络失败只降级 Bot；AI、GUI、调度器等主程序不应被连带重启。
                 if self.connection_error_count >= self.max_connection_errors:
-                    error_msg = "网络错误次数过多，准备重启程序..."
+                    error_msg = "Telegram 网络错误次数过多，已标记为不可用并等待后台重连"
                     print(error_msg)
                     logging.critical(error_msg)
                     if self.attendance_system:
-                        await self.attendance_system.restart_program()
+                        self.attendance_system.bot_available = False
+                        self.attendance_system.bot_error = error_msg
                     return False
 
         return False
@@ -2046,6 +2070,9 @@ class TelegramBot:
             await self.app.updater.start_polling(
                 allowed_updates=Update.ALL_TYPES,
                 drop_pending_updates=drop_pending_updates,
+                # PTB 默认 -1 会在 bootstrap 阶段无限重试，导致启动/重连永久占锁；
+                # 单次失败交给外层指数退避恢复循环处理。
+                bootstrap_retries=0,
                 poll_interval=1.0,
                 timeout=self.connection_timeout,
                 read_timeout=self.read_timeout,
@@ -2085,14 +2112,19 @@ class TelegramBot:
 
     async def stop_polling(self):
         """停止消息轮询"""
-        if not self.is_polling:
+        updater = getattr(self.app, 'updater', None) if self.app is not None else None
+        try:
+            updater_running = bool(updater is not None and getattr(updater, 'running', False))
+        except Exception:
+            updater_running = self.is_polling
+        if not self.is_polling and not updater_running:
             return
 
         try:
             # 检查updater是否存在且正在运行
-            if self.app and self.app.updater:
+            if updater is not None and updater_running:
                 try:
-                    await self.app.updater.stop()
+                    await updater.stop()
                 except Exception as e:
                     logging.warning(f"停止updater时发生异常，可能已经不在运行状态: {str(e)}")
 
@@ -2105,7 +2137,7 @@ class TelegramBot:
             logging.error(f"停止轮询时发生错误: {str(e)}")
 
     async def restart_polling(self):
-        """重启消息轮询"""
+        """重启消息轮询；成功返回 True，失败返回 False。"""
         # 与 reconnect 共用 _reconnect_lock，确保重启与重连互斥，避免并发清理同一 app
         async with self._reconnect_lock:
             logging.info("正在重启 Telegram Bot 轮询...")
@@ -2137,25 +2169,40 @@ class TelegramBot:
                     await self.start_polling(drop_pending_updates=False)
                 else:
                     logging.error("重启轮询失败：应用初始化失败")
+                    return False
 
             except Exception as e:
                 logging.error(f"重启轮询失败: {str(e)}")
+                return False
 
             self.last_update_time = datetime.now()
             logging.info("Telegram Bot 轮询重启完成")
+            return True
 
     async def _on_error(self, update, context):
         """Telegram 全局错误处理器：统一记录更新处理过程中的未捕获异常"""
         logging.error("Telegram 更新处理异常", exc_info=getattr(context, 'error', None))
 
-    async def reconnect(self) -> tuple[bool, str]:
+    async def reconnect(self, force=True) -> tuple[bool, str]:
         """主动重连 Telegram Bot：停止旧轮询/应用，彻底重建后重新启动。
 
         供 GUI 重连端点调用；与 restart_polling 共用 _reconnect_lock 串行化，避免并发清理。
-        注意：本方法不直接写 attendance_system.bot_available（由端点层根据返回值统一回写）。
+        force=False 供后台恢复/监控使用：等待锁期间若另一协程已恢复健康，则不重复拆建连接。
         """
         async with self._reconnect_lock:
             try:
+                updater = getattr(self.app, 'updater', None) if self.app is not None else None
+                already_healthy = bool(
+                    self._is_initialized
+                    and self.app is not None
+                    and self.is_polling
+                    and updater is not None
+                    and getattr(updater, 'running', False)
+                    and getattr(self.attendance_system, 'bot_available', False)
+                )
+                if not force and already_healthy:
+                    return True, "Bot 已连接"
+
                 await self.stop_polling()
                 if self.app:
                     try:
@@ -2168,73 +2215,114 @@ class TelegramBot:
                 self.daily_reminder_task_set = False
                 await self._ensure_app_initialized()
                 if not self.app:
-                    return False, "Bot 初始化失败：应用未创建"
+                    raise RuntimeError("Bot 初始化失败：应用未创建")
                 await self.app.start()
                 await self.start_polling()
                 self.last_update_time = datetime.now()
+                if self.attendance_system:
+                    self.attendance_system.bot_available = True
+                    self.attendance_system.bot_error = None
                 logging.info("Telegram Bot 重连成功")
                 return True, "Bot 重连成功"
             except Exception as e:
                 logging.error(f"Bot 重连失败: {e!r}", exc_info=True)
+                # 失败也按 updater -> Application -> initialize 状态的顺序彻底收口，
+                # 避免半启动对象在下一轮重连时留下旧 getUpdates 任务。
+                try:
+                    await self.stop_polling()
+                except Exception:
+                    pass
+                app = self.app
+                if app is not None:
+                    try:
+                        await app.stop()
+                    except Exception:
+                        pass
+                    try:
+                        await app.shutdown()
+                    except Exception:
+                        pass
                 self._is_initialized = False
-                return False, f"Bot 重连失败: {e}"
+                self.is_polling = False
+                self.app = None
+                self.daily_reminder_task_set = False
+                message = f"Bot 重连失败: {e}"
+                if self.attendance_system:
+                    self.attendance_system.bot_available = False
+                    self.attendance_system.bot_error = message[:500]
+                return False, message
 
     async def monitor_connection(self):
         """监控连接状态。
 
         超时（update_timeout）只代表"长时间没有 incoming 更新"，单用户长时间不发命令时这属正常空闲，
         不能据此直接重启。故先用 get_me() 主动探测：探测成功=连接健康（仅刷新计时、不重启）；探测失败
-        才重启轮询，并对连续失败做指数退避，避免代理(mihomo)抖动时高频重启刷屏。
+        才完整重连。app 缺失、轮询停止或已标记降级时也会进入同一路径，并对连续失败做指数退避。
         """
-        monitor_fail_count = 0  # 连续探测/重启失败计数，用于指数退避
+        monitor_fail_count = 0  # 连续探测/重连失败计数，用于指数退避
         while True:
             try:
-                # 仅在 bot 可用且 app 存在时自愈，避免与 GUI 重连端点(reconnect)抢同一 app
-                if getattr(self.attendance_system, 'bot_available', True) and self.app is not None and self.last_update_time:
-                    # M92: get_me() 成功只证明 API 出口可达，不能证明 getUpdates 轮询任务存活。
-                    # 若该后台任务因非 NetworkError 异常死亡，updater.running 会变为 False 而 is_polling 仍为 True，
-                    # 监控会一直探测成功、永不重启，bot 永久失聪。此处主动比对二者状态，发现僵死立即强制重启。
-                    updater = getattr(self.app, 'updater', None)
-                    if self.is_polling and updater is not None and not updater.running:
-                        logging.warning("检测到 updater 已停止但 is_polling 仍为 True（getUpdates 轮询任务僵死），强制重启轮询...")
-                        try:
-                            await self.restart_polling()
-                        except Exception as e:
-                            logging.error(f"重启轮询失败: {str(e)}")
-                            self._is_initialized = False
-                            self.app = None
-                        await asyncio.sleep(60)
+                updater = getattr(self.app, 'updater', None) if self.app is not None else None
+                updater_running = bool(updater is not None and getattr(updater, 'running', False))
+                bot_available = bool(getattr(self.attendance_system, 'bot_available', False))
+
+                # 完整检查四层状态，避免 app=None / bot_available=False 后监控永久跳过恢复。
+                if not bot_available or self.app is None or not self.is_polling or not updater_running:
+                    monitor_fail_count += 1
+                    logging.warning(
+                        "Telegram Bot 状态不完整，尝试第 %d 次完整重连",
+                        monitor_fail_count,
+                    )
+                    ok, msg = await self.reconnect(force=False)
+                    if ok:
+                        if self.attendance_system:
+                            self.attendance_system.bot_available = True
+                            self.attendance_system.bot_error = None
+                        self.connection_error_count = 0
+                        monitor_fail_count = 0
+                        logging.info("Telegram Bot 连接监控已恢复轮询")
+                    else:
+                        if self.attendance_system:
+                            self.attendance_system.bot_available = False
+                            self.attendance_system.bot_error = str(msg)[:500]
+                        backoff = min(60 * (2 ** (monitor_fail_count - 1)), 600)
+                        logging.warning("Telegram Bot 重连失败，%d 秒后重试: %s", backoff, msg)
+                        await asyncio.sleep(backoff)
                         continue
 
+                elif self.last_update_time:
                     time_since_last_update = (datetime.now() - self.last_update_time).total_seconds()
-
                     if time_since_last_update > self.update_timeout:
-                        # 主动健康探测：区分"空闲但健康"与"连接已断"
                         try:
                             await self.app.bot.get_me()
-                            # 探测成功说明连接健康，只是单用户长时间没发消息——刷新计时，不重启
                             self.last_update_time = datetime.now()
                             monitor_fail_count = 0
                         except Exception as probe_err:
                             monitor_fail_count += 1
                             logging.warning(
-                                f"已经 {time_since_last_update:.0f} 秒没有收到更新且健康探测失败"
-                                f"(第 {monitor_fail_count} 次): {probe_err!r}，尝试重启轮询..."
+                                "已经 %.0f 秒没有收到更新且健康探测失败（第 %d 次）: %r",
+                                time_since_last_update, monitor_fail_count, probe_err,
                             )
-                            try:
-                                await self.restart_polling()
+                            if self.attendance_system:
+                                self.attendance_system.bot_available = False
+                                self.attendance_system.bot_error = str(probe_err)[:500]
+                            ok, msg = await self.reconnect(force=False)
+                            if ok:
+                                if self.attendance_system:
+                                    self.attendance_system.bot_available = True
+                                    self.attendance_system.bot_error = None
+                                self.connection_error_count = 0
                                 monitor_fail_count = 0
-                            except Exception as e:
-                                logging.error(f"重启轮询失败: {str(e)}")
-                                # 如果重启失败，标记需要重新初始化
-                                self._is_initialized = False
-                                self.app = None
-                            # 连续失败时退避，最长 600 秒，避免代理未就绪时刷屏
-                            backoff = min(60 * (2 ** monitor_fail_count), 600)
-                            await asyncio.sleep(backoff)
-                            continue
+                            else:
+                                if self.attendance_system:
+                                    self.attendance_system.bot_error = str(msg)[:500]
+                                backoff = min(60 * (2 ** (monitor_fail_count - 1)), 600)
+                                await asyncio.sleep(backoff)
+                                continue
 
                 await asyncio.sleep(60)
+            except asyncio.CancelledError:
+                raise
             except Exception as e:
                 logging.error(f"监控连接时发生错误: {str(e)}")
                 await asyncio.sleep(60)

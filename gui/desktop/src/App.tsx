@@ -104,7 +104,7 @@ const SCREEN_SUB: Record<ScreenId, string> = {
   shots: '查看每位用户最近 3 张打卡截图',
   tasks: '查看与终止 schedule 计划任务',
   logs: '实时日志、过滤错误与导出',
-  weather: '华山路 1076 号 · 实况、逐时趋势与未来天气',
+  weather: '多地点实况、逐时趋势与未来天气',
   news: 'AI HOT 中文 AI 资讯 · 模型 / 产品 / 论文 / 行业动态',
   epaper: '蓝牙连接、日历模式、传图与假期数据',
   settings: '环境变量、动态配置与多账户设置',

@@ -577,7 +577,7 @@ export function SettingsScreen() {
       {tab === 'weather' && (
         <Section
           title="彩云天气"
-          sub="固定地点：上海市长宁区华山路1076号 · 彩云 v2.6 综合天气"
+          sub="多地点天气 · 彩云 v2.6 综合天气"
           icon="Cloud"
         >
           <div className="field-row">
@@ -626,8 +626,8 @@ export function SettingsScreen() {
               color: 'var(--text-secondary)',
             }}
           >
-            天气地点已固定为上海市长宁区华山路1076号，不读取 Windows 定位，也不调用
-            逆地理编码。认证凭据只由本机 Python 后端读取并用于调用彩云天气。
+            默认地点为上海市长宁区华山路1076号。收藏地点与当前地点请在“天气预报”页面
+            管理和切换；城市搜索使用本地行政区划数据。认证凭据只由本机 Python 后端读取。
           </div>
           <div className="divider" />
           <div className="row gap-2" style={{ justifyContent: 'flex-end' }}>

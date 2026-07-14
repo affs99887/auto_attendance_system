@@ -1,8 +1,6 @@
 // 关于 & 命令 — 系统信息 + 模块 + Telegram 命令速查 + ASCII 数据流。
-import * as React from 'react';
 import { Icon } from '../lib/icons';
 import { COMMANDS } from '../lib/data';
-import { ServiceControls } from '../components/ServiceControls';
 
 const DATA_FLOW = `  ┌─────────────────┐
   │  Telegram Bot   │ ◄── 用户命令 (/punch_in 等)
@@ -67,9 +65,6 @@ export function AboutScreen() {
               <div className="spread"><span>已运行</span><span className="mono">45m 12s</span></div>
               <div className="spread"><span>看门狗重启</span><span className="mono">0 次</span></div>
             </div>
-            <div className="divider" />
-            {/* 服务控制（启动/重启/终止/重连 + 心跳）— 统一走 ServiceControls bar 形态 */}
-            <ServiceControls variant="bar" />
           </div>
         </div>
 

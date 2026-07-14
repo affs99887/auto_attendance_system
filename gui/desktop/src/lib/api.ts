@@ -82,7 +82,7 @@ export interface ExchangeRateResponse {
   points: ExchangeRatePoint[]; // 按时间升序
 }
 
-// ===== 彩云天气（固定地点，后端代调彩云 v2.6 综合接口）=====
+// ===== 彩云天气（当前地点，后端代调彩云 v2.6 综合接口）=====
 export interface WeatherDailyItem {
   date: string;
   skycon: string | null;
@@ -151,6 +151,8 @@ export interface WeatherResponse {
   hourly: WeatherHourlyItem[];
   daily: WeatherDailyItem[];
   alerts: WeatherAlertItem[];
+  alerts_available: boolean;
+  alerts_total: number;
   address_warning: string | null;
   cached: boolean;
 }
@@ -420,7 +422,7 @@ export const api = {
     return request<ExchangeRateResponse>(`/api/v1/exchange-rate?${qs.toString()}`);
   },
 
-  // 彩云天气：精确坐标仅发往本机后端；固定地址可跳过额外的逆地理编码请求。
+  // 彩云天气：精确坐标仅发往本机后端；已知地址可跳过额外的逆地理编码请求。
   getWeather: (latitude: number, longitude: number, force = false, address?: string) =>
     request<WeatherResponse>('/api/v1/weather', {
       method: 'POST',

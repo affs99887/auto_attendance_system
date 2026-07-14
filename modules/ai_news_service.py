@@ -3,7 +3,7 @@ AI 资讯服务模块（AI HOT）
 
 通过 aihot.virxact.com 公开接口拉取精选 AI 资讯，带本地缓存与惰性刷新：
 - 网络请求统一带浏览器 User-Agent（默认 UA 会被 403）+ Accept: application/json。
-- 若内置网络加速（mihomo）已启用，requests 自动走 http://127.0.0.1:{local_port}；否则直连。
+- 若内置网络加速（mihomo）已启用则优先走本地代理；代理连接失败时立即回退默认网络。
 - 所有网络/解析异常 try/except 捕获，绝不外抛；失败时回退旧缓存。
 - 缓存文件 ai_news_cache.json，定位方式与 scheduled_tasks.json 一致（程序运行根目录）。
 - 不内置任何假数据/快照——只用真实拉取或缓存或空。
@@ -22,9 +22,7 @@ import time
 import logging
 import threading
 
-import requests
-
-from modules.config import config
+from modules.proxy_manager import request_get_with_local_proxy_fallback
 
 logger = logging.getLogger(__name__)
 
@@ -63,15 +61,6 @@ _FAIL_COOLDOWN_SECONDS = 90
 # single-flight：正在拉取中的视图 key 集合（_lock 保护）。同视图并发 TTL-miss 时
 # 只放一个线程真正打上游，后来者直接返回旧缓存（不等待），避免重复请求上游。
 _inflight = set()
-
-
-def _proxies():
-    """内置加速启用且本地端口在监听时走本地代理，否则直连。
-
-    端口不通（mihomo 未就绪/已崩/确定性失败）时返回 None 直连，不再硬打死端口报 ProxyError。
-    判定集中在 config.get_local_proxy()，与 汇率/Claude额度/Telegram 口径一致。
-    """
-    return config.get_local_proxy()
 
 
 def _cache_path():
@@ -180,14 +169,14 @@ def _fetch_from_aihot(cursor=None, take=None, category=None, mode=None):
     if cursor:
         params['cursor'] = cursor
     try:
-        resp = requests.get(
+        resp = request_get_with_local_proxy_fallback(
+            'ai_news',
             _API_URL,
             params=params,
             headers={
                 'User-Agent': _USER_AGENT,
                 'Accept': 'application/json',
             },
-            proxies=_proxies(),
             timeout=10,
         )
         resp.raise_for_status()

@@ -3,7 +3,7 @@
 
 通过 Yahoo chart 接口拉取 CNY->JPY 汇率（最新价 + 历史序列），带本地缓存与惰性刷新：
 - 网络请求统一带 User-Agent，避免 Yahoo 返回 429。
-- 若内置网络加速（mihomo）已启用，requests 自动走 http://127.0.0.1:{local_port}；否则直连。
+- 若内置网络加速（mihomo）已启用则优先走本地代理；代理连接失败时立即回退默认网络。
 - 所有网络/解析异常 try/except 捕获，绝不外抛；失败时回退旧缓存。
 - 缓存文件 exchange_rate_cache.json，定位方式与 scheduled_tasks.json 一致（程序运行根目录）。
 - 方向固定产出 CNY->JPY；JPY->CNY 由前端对 value/price 取 1/x。
@@ -19,9 +19,7 @@ import time
 import logging
 import threading
 
-import requests
-
-from modules.config import config
+from modules.proxy_manager import request_get_with_local_proxy_fallback
 
 logger = logging.getLogger(__name__)
 
@@ -62,15 +60,6 @@ def _normalize_range(range_):
     if range_ in _RANGE_MAP:
         return range_
     return _DEFAULT_RANGE
-
-
-def _proxies():
-    """内置加速启用且本地端口在监听时走本地代理，否则直连。
-
-    端口不通（mihomo 未就绪/已崩/确定性失败）时返回 None 直连，不再硬打死端口报 ProxyError。
-    判定集中在 config.get_local_proxy()，与 AI资讯/Claude额度/Telegram 口径一致。
-    """
-    return config.get_local_proxy()
 
 
 def _cache_path():
@@ -120,11 +109,11 @@ def _fetch_from_yahoo(range_):
         'interval': interval,
     }
     try:
-        resp = requests.get(
+        resp = request_get_with_local_proxy_fallback(
+            'exchange_rate',
             _CHART_URL,
             params=params,
             headers={'User-Agent': _USER_AGENT},
-            proxies=_proxies(),
             timeout=10,
         )
         resp.raise_for_status()
