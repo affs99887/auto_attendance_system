@@ -42,8 +42,8 @@ const MODULES = [
 
 export function AboutScreen() {
   // 当前运行的代码版本（瘦壳 + OTA）：经 Electron preload 的 AAS_UPDATE 拉取主进程实际加载的代码包版本。
-  // 纯浏览器 / 旧 preload 下 AAS_UPDATE 为 undefined，回退显示静态 'v3.0.0'。
-  const [verLabel, setVerLabel] = React.useState('v3.0.0');
+  // 纯浏览器 / 旧 preload 下 AAS_UPDATE 为 undefined，回退显示静态 'v3.0.1'。
+  const [verLabel, setVerLabel] = React.useState('v3.0.1');
   const [shellVersion, setShellVersion] = React.useState('—');
   const [updateStatus, setUpdateStatus] = React.useState<UpdateStatus>({ status: 'idle' });
   const [availableVersion, setAvailableVersion] = React.useState<string | null>(null);

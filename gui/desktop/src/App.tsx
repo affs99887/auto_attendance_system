@@ -165,7 +165,7 @@ function Sidebar({ screen, setScreen }: SidebarProps) {
 
 function TitleBar() {
   const win = window.AAS_WINDOW;
-  const [codeVersion, setCodeVersion] = React.useState('3.0.0');
+  const [codeVersion, setCodeVersion] = React.useState('3.0.1');
   React.useEffect(() => {
     let alive = true;
     void window.AAS_UPDATE?.getInfo()

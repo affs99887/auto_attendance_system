@@ -18,6 +18,7 @@ import { useProxyStore } from './proxy';
 import { useExchangeRateStore } from './exchangeRate';
 import { useAiNewsStore } from './aiNews';
 import { useWeatherStore } from './weather';
+import { DEFAULT_WEATHER_LOCATION } from '../lib/weatherLocations';
 import { useStartupLogStore } from './startupLog';
 import { useServiceStore } from './service';
 import { appConfirm } from '../lib/dialog';
@@ -28,6 +29,31 @@ const AI_NEWS_REFRESH_INTERVAL_MS = 15 * 60_000; // AI 资讯轮询：15 分钟
 const WEATHER_REFRESH_INTERVAL_MS = 15 * 60_000; // 天气轮询：15 分钟
 const PING_INTERVAL_MS = 400;
 const READY_TIMEOUT_MS = 35_000;
+
+async function weatherTargetIds(): Promise<string[]> {
+  await useWeatherStore.getState().hydrate();
+  return Array.from(new Set([
+    DEFAULT_WEATHER_LOCATION.id,
+    useWeatherStore.getState().activeLocationId,
+  ]));
+}
+
+function refreshWeatherTargets(force = false) {
+  void (async () => {
+    const ids = await weatherTargetIds();
+    await Promise.all(ids.map(locationId => (
+      useWeatherStore.getState().refreshLocation(locationId, force)
+    )));
+  })();
+}
+
+function refreshWeatherTargetsAfterCurrent(force = false) {
+  void weatherTargetIds().then(ids => {
+    for (const locationId of ids) {
+      useWeatherStore.getState().refreshLocationAfterCurrent(locationId, force);
+    }
+  });
+}
 
 export function useBackendBootstrap() {
   const status = useStartupStore(s => s.status);
@@ -52,7 +78,7 @@ export function useBackendBootstrap() {
       if (!wasRunning && running && useStartupStore.getState().status === 'ready') {
         // 服务快速重启时，旧天气请求可能仍在超时窗口内；排队一次强制刷新，
         // 等旧请求收尾后自动补跑，不能被 loading 去重吞掉。
-        useWeatherStore.getState().refreshAfterCurrent(true);
+        refreshWeatherTargetsAfterCurrent(true);
       }
     };
     useServiceStore.getState().setAvailable(true);
@@ -128,8 +154,8 @@ export function useBackendBootstrap() {
           if (cancelled || useStartupStore.getState().epoch !== epoch) return;
           useStartupStore.getState().setReady();
           // 真正通过 HTTP 探活后再触发天气；若重启前的旧请求仍未结束，
-          // refreshAfterCurrent 会把这次强制刷新排到旧请求之后执行。
-          useWeatherStore.getState().refreshAfterCurrent(true);
+          // 每个地点都会把这次强制刷新排到各自旧请求之后执行。
+          refreshWeatherTargetsAfterCurrent(true);
           return;
         } catch {
           // 还没起来 / token 暂不可用，继续轮询
@@ -159,7 +185,7 @@ export function useBackendBootstrap() {
         wsClient.stop();
         wsClient.start();
         void useSystemStore.getState().refresh();
-        useWeatherStore.getState().refreshAfterCurrent(true);
+        refreshWeatherTargetsAfterCurrent(true);
         return;
       }
       st.setPhase('正在确认服务可用…');
@@ -218,7 +244,7 @@ export function useBackendBootstrap() {
     // 首份缓存由这里负责拉到）
     void useAiNewsStore.getState().refresh();
     // 天气首屏拉取；与 AI 资讯一样由统一 bootstrap 管理轮询和窗口恢复补刷。
-    void useWeatherStore.getState().refresh();
+    refreshWeatherTargets();
 
     const refreshTimer = window.setInterval(() => {
       void useSystemStore.getState().refresh();
@@ -258,7 +284,7 @@ export function useBackendBootstrap() {
     // 用户已"加载更多"的视图跳过，避免把列表缩回首屏 / 丢失滚动位置
     const aiNewsTimer = window.setInterval(refreshAiNewsViews, AI_NEWS_REFRESH_INTERVAL_MS);
     const weatherRefreshTimer = window.setInterval(() => {
-      void useWeatherStore.getState().refresh();
+      refreshWeatherTargets();
     }, WEATHER_REFRESH_INTERVAL_MS);
 
     // Electron 恢复窗口时通常会连续触发 visible + focus；合并为一次补刷，
@@ -271,7 +297,7 @@ export function useBackendBootstrap() {
         resumeRefreshTimer = null;
         void useExchangeRateStore.getState().refresh();
         refreshAiNewsViews();
-        void useWeatherStore.getState().refresh();
+        refreshWeatherTargets();
       }, 200);
     };
     const onVisible = () => {
