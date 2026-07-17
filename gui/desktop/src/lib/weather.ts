@@ -81,18 +81,16 @@ export async function loadWeatherData(location: WeatherLocation, force: boolean)
 
   const task = (async () => {
     if (location.id === LOCATED_WEATHER_LOCATION.id) {
-      // "当前位置"：先经后端 IP 定位拿坐标，再不带固定地址请求天气，
-      // 让后端做逆地理编码显示真实地名（解析不到时后端自带坐标兜底文案）
+      // "当前位置"：先经后端 IP 定位拿坐标，再不带固定地址请求天气，由后端做逆地理编码。
+      // 展示统一为"当前位置 · 实际地名"（逆地理编码不可用时退回 IP 定位的城市名）；
+      // name 和 address 都用这个标签，因为后端兜底的 address 是经纬度字符串，界面不能出现坐标。
       const geo = await api.getGeolocate(force);
       const response = await api.getWeather(geo.latitude, geo.longitude, force);
+      const placeName = response.location.resolved ? response.location.name : geo.city;
+      const label = placeName ? `当前位置 · ${placeName}` : '当前位置';
       const data: WeatherResponse = {
         ...response,
-        location: {
-          ...response.location,
-          name: response.location.resolved
-            ? `当前位置 · ${response.location.name}`
-            : (geo.city ? `当前位置 · ${geo.city}` : '当前位置'),
-        },
+        location: { ...response.location, name: label, address: label, located: true },
       };
       weatherSessions.set(location.id, { data, fetchedAt: Date.now() });
       return data;

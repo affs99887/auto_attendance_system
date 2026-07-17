@@ -98,6 +98,7 @@ export interface WeatherResponse {
     name: string;
     address: string;
     resolved: boolean;
+    located?: boolean; // 前端"当前位置"模式标记（loadWeatherData 写入，后端不返回）；界面据此不显示经纬度
   };
   realtime: {
     temperature: number | null;

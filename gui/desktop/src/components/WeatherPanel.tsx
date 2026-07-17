@@ -229,7 +229,7 @@ export function WeatherSkyPanel({
           <Icon.Globe size={15} />
           <div className="weather-sky-location-copy">
             <strong>{data.location.address}</strong>
-            {page && <span className="mono">{data.location.longitude.toFixed(4)}, {data.location.latitude.toFixed(4)}</span>}
+            {page && !data.location.located && <span className="mono">{data.location.longitude.toFixed(4)}, {data.location.latitude.toFixed(4)}</span>}
           </div>
         </div>
         <div className="weather-sky-actions">

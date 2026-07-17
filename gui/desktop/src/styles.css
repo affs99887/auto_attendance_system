@@ -1742,7 +1742,9 @@ button.weather-compact-alert:hover { background: rgba(92,54,8,.3); }
 .weather-trend-m .weather-trend-head strong,
 .weather-trend-m .weather-trend-head > span { font-size: 11px; }
 .weather-trend-m .weather-trend-scroll { min-height: 0; flex: 1; overflow: hidden; }
-.weather-trend-m .weather-trend-chart { width: 100%; height: auto; min-width: 0; }
+/* SVG 会按 viewBox 比例随列宽等比增高，宽窗口下会把整卡撑高、左栏拉出大段空白；
+   封顶到设计高度 176px，各平台/窗口宽度下卡片高度保持一致（超宽时图表水平居中） */
+.weather-trend-m .weather-trend-chart { width: 100%; height: auto; max-height: 176px; min-width: 0; }
 .weather-trend-m .weather-chart-temp { font-size: 14px; }
 .weather-trend-m .weather-chart-hour { font-size: 13px; }
 .weather-trend-m .weather-chart-rain-label { font-size: 12px; }
