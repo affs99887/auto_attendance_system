@@ -20,11 +20,16 @@ const { spawn, execFileSync } = require('node:child_process');
 const PROJECT_ROOT = app.isPackaged
   ? path.join(process.resourcesPath, 'backend')
   : path.resolve(__dirname, '..', '..', '..');
-// 后端可写数据根：dev=项目根；打包=用户指定的现有数据目录（含真实记录/截图/配置）。
-// 可用环境变量 AAS_DATA_DIR 覆盖，便于将来切到 %APPDATA% 等。
+// 后端可写数据根：dev=项目根；打包=平台各自的数据目录（含配置与日志）。
+// 可用环境变量 AAS_DATA_DIR 覆盖，便于将来切到其它位置。
 const LEGACY_DATA_DIR = 'C:\\auto_attendance_system';
+// macOS 打包态用系统标准的 userData 目录（~/Library/Application Support/<app>），
+// Windows 沿用历史固定目录以兼容既有用户数据
+const PACKAGED_DATA_DIR = process.platform === 'darwin'
+  ? app.getPath('userData')
+  : LEGACY_DATA_DIR;
 const DATA_DIR = process.env.AAS_DATA_DIR
-  || (app.isPackaged ? LEGACY_DATA_DIR : PROJECT_ROOT);
+  || (app.isPackaged ? PACKAGED_DATA_DIR : PROJECT_ROOT);
 const TOKEN_PATH = path.join(DATA_DIR, 'logs', '.gui_token');
 // 窗口尺寸/位置/最大化状态持久化文件（关窗缩托盘不退进程，靠 resize/move 防抖落盘覆盖关闭场景）
 const WINDOW_STATE_PATH = path.join(DATA_DIR, 'window-state.json');
@@ -42,8 +47,6 @@ let appQuitting = false;
 const RESTART_WINDOW_MS = 3600 * 1000;
 const RESTART_MAX = 5;
 let restartHistory = [];
-let bluetoothRequest = null;
-let pairingRequest = null;
 
 // ============================================================================
 // 服务控制状态机标志（供 service:* IPC 区分「手动停止 / 重启 / 崩溃」三种 exit）
@@ -150,6 +153,20 @@ function armReadiness() {
 // ============================================================================
 // 启动 Python 后端 + 崩溃重启
 // ============================================================================
+function resolvePythonCommand() {
+  if (process.env.AAS_PYTHON) return process.env.AAS_PYTHON;
+  if (process.platform === 'win32') return 'python';
+  if (process.platform === 'darwin') {
+    // Finder 启动的 app 拿到的 PATH 不含 Homebrew 目录，按常见安装位置探测绝对路径；
+    // /usr/bin/python3 放最后（未装 Command Line Tools 时它是个会弹安装窗的替身）
+    const candidates = ['/opt/homebrew/bin/python3', '/usr/local/bin/python3', '/usr/bin/python3'];
+    for (const cand of candidates) {
+      if (fs.existsSync(cand)) return cand;
+    }
+  }
+  return 'python3';
+}
+
 function spawnPython() {
   // 守卫：已有在跟踪的进程时直接返回，杜绝旧进程存活时被新 spawn 覆盖引用（孤儿根因之一）。
   if (pythonProc) {
@@ -165,16 +182,18 @@ function spawnPython() {
     pushStatus({ state: 'failed', reason: `未找到 main.py：${mainPy}` });
     return;
   }
+  // cwd 不存在时 spawn 直接报 ENOENT（mac 首启时 userData 目录尚未建立），先确保存在
+  try { fs.mkdirSync(DATA_DIR, { recursive: true }); } catch { /* ignore */ }
   // 启动前清掉过期 token 文件，避免读到老 token
   try { fs.unlinkSync(TOKEN_PATH); } catch { /* ignore */ }
   // 每轮启动从头展示日志：清空缓冲（崩溃重启时不残留上一轮 traceback）
   logBuffer = [];
   logCarry = '';
 
-  const pyCmd = process.env.AAS_PYTHON || (process.platform === 'win32' ? 'python' : 'python3');
+  const pyCmd = resolvePythonCommand();
   console.info('[aas-electron] spawning:', pyCmd, mainPy, '--gui', '(cwd:', DATA_DIR + ')');
   // 用绝对脚本路径运行打包内 main.py（sys.path[0]=resources/backend → 导入打包副本的 modules），
-  // 但 cwd 指向数据根 DATA_DIR，使后端所有相对路径（punch_records/screenshots/logs/.env 等）命中真实数据。
+  // 但 cwd 指向数据根 DATA_DIR，使后端所有相对路径（logs/.env/dynamic_config.json 等）命中真实数据。
   pythonProc = spawn(pyCmd, [mainPy, '--gui'], {
     cwd: DATA_DIR,
     // 不用 'inherit'：Electron 主进程无 console，inherit 会让 python 自己开一个控制台窗口
@@ -247,7 +266,7 @@ function spawnPython() {
     if (restartHistory.length >= RESTART_MAX) {
       console.error(`[aas-electron] 重启过频（最近 1 小时已 ${restartHistory.length} 次），停止自动重启`);
       // 不再弹系统 showErrorBox：pushStatus(failed) 已把原因推给渲染端（系统横幅/启动覆盖层展示）
-      pushStatus({ state: 'failed', reason: `Python 后端反复崩溃（1 小时内 ${restartHistory.length} 次），已停止自动重启。请查看 logs/attendance_system.log 后手动重启。` });
+      pushStatus({ state: 'failed', reason: `Python 后端反复崩溃（1 小时内 ${restartHistory.length} 次），已停止自动重启。请查看 logs/app.log 后手动重启。` });
       pushServiceStatus(false); // 彻底放弃自动重启：服务已停止
       return;
     }
@@ -270,6 +289,15 @@ function spawnPython() {
 // watchdog 互斥检查
 // ============================================================================
 function checkWatchdogRunning() {
+  if (process.platform === 'darwin') {
+    try {
+      const out = execFileSync('pgrep', ['-f', 'watchdog.py'], { encoding: 'utf8', timeout: 8000 });
+      return String(out).trim().length > 0;
+    } catch {
+      // pgrep 无匹配时以退出码 1 结束，落到这里视为未运行
+      return false;
+    }
+  }
   if (process.platform !== 'win32') return false;
   try {
     const out = execFileSync(
@@ -365,8 +393,8 @@ function pingBackend(timeoutMs = 4000) {
 
 async function handleResume() {
   if (appQuitting) return;
-  // 先向渲染层广播「系统刚唤醒」（power:resume）：休眠中蓝牙链路必掉，墨水屏侧要靠这个
-  // 信号立即校验连接/触发重连，与后端进程是否在跑无关，故放在 pythonProc 判断之前。
+  // 先向渲染层广播「系统刚唤醒」（power:resume），供页面立即补刷数据；
+  // 与后端进程是否在跑无关，故放在 pythonProc 判断之前。
   if (mainWindow && !mainWindow.isDestroyed()) {
     try { mainWindow.webContents.send('power:resume'); } catch { /* ignore */ }
   }
@@ -410,7 +438,7 @@ function saveWindowState(state) {
 // ============================================================================
 // GUI 设置持久化（gui-settings.json）
 //  打包应用以 file:// 加载，渲染进程 localStorage 跨重启不可靠；
-//  墨水屏连接历史 / 备忘录 / 自动推送 / 倒置渲染等需要记忆的数据统一落到该文件，
+//  天气收藏地点等需要记忆的数据统一落到该文件，
 //  经 AAS_SETTINGS（preload）get/set。写盘防抖 300ms，退出前强制 flush。
 // ============================================================================
 const GUI_SETTINGS_PATH = path.join(DATA_DIR, 'gui-settings.json');
@@ -472,64 +500,6 @@ ipcMain.on('settings:set', (_event, key, value) => {
   guiSettingsTimer = setTimeout(flushGuiSettings, 300);
 });
 
-// ============================================================================
-// 墨水屏日志持久化（logs/epaper.log）
-//  渲染进程每条墨水屏日志经 epd:log-append 追加；发送图片时 ⇑/⇓ hex 可达上千条，
-//  故主进程缓冲后防抖 250ms 合并写盘（而非每条同步写）；持续日志会一直重置防抖，
-//  所以另设 max-wait：距队首入队超 2 秒直接落盘，保证长传输期间周期性写盘、内存有界。
-//  单文件超上限按「保留尾部一半」滚动截断，无需外部依赖。退出前 before-quit 强制 flush。
-// ============================================================================
-const EPAPER_LOG_PATH = path.join(DATA_DIR, 'logs', 'epaper.log');
-const EPAPER_LOG_MAX_BYTES = 1024 * 1024; // 1 MB；超出截掉前半，避免无限增长
-const EPAPER_LOG_MAX_WAIT_MS = 2000;      // 防抖强制落盘上限：距队首入队超此时长直接 flush
-let epaperLogDirReady = false;
-let epaperLogQueue = [];     // 待写行缓冲
-let epaperLogTimer = null;   // 防抖落盘定时器
-let epaperLogFirstAt = 0;    // 队首那条日志的入队时刻（max-wait 判定基准）
-
-function flushEpaperLog() {
-  if (epaperLogTimer) { clearTimeout(epaperLogTimer); epaperLogTimer = null; }
-  if (!epaperLogQueue.length) return;
-  const chunk = epaperLogQueue.join('\n') + '\n';
-  try {
-    if (!epaperLogDirReady) {
-      fs.mkdirSync(path.dirname(EPAPER_LOG_PATH), { recursive: true });
-      epaperLogDirReady = true;
-    }
-    fs.appendFileSync(EPAPER_LOG_PATH, chunk, 'utf-8');
-    // 写成功才清队列；若先清再写，写失败这批日志就被静默丢弃了
-    epaperLogQueue = [];
-    // 超过上限：仅保留尾部约一半，并从首个换行后切起避免留下半行
-    const { size } = fs.statSync(EPAPER_LOG_PATH);
-    if (size > EPAPER_LOG_MAX_BYTES) {
-      const buf = fs.readFileSync(EPAPER_LOG_PATH);
-      const tail = buf.subarray(buf.length - Math.floor(EPAPER_LOG_MAX_BYTES / 2));
-      const nl = tail.indexOf(0x0a);
-      fs.writeFileSync(EPAPER_LOG_PATH, nl >= 0 ? tail.subarray(nl + 1) : tail);
-    }
-  } catch {
-    // 写盘失败（如 logs 目录被删/被占用）不影响主流程：日志留在队列等下次落盘重试。
-    // 目录标记复位让下次重建目录；截断队列防持续失败时内存无限涨；
-    // 刷新 firstAt 让连续日志期间的强制落盘至少隔 2 秒再试（稀疏日志仍走 250ms 防抖重试）。
-    epaperLogDirReady = false;
-    if (epaperLogQueue.length > 1000) epaperLogQueue.splice(0, epaperLogQueue.length - 1000);
-    epaperLogFirstAt = Date.now();
-  }
-}
-
-ipcMain.on('epd:log-append', (_event, line) => {
-  if (typeof line !== 'string' || !line) return;
-  if (!epaperLogQueue.length) epaperLogFirstAt = Date.now();
-  epaperLogQueue.push(line);
-  // 队首等太久（发图时日志间隔常小于 250ms，纯防抖会被一直重置）：不再重置定时器，直接落盘
-  if (Date.now() - epaperLogFirstAt >= EPAPER_LOG_MAX_WAIT_MS) {
-    flushEpaperLog();
-    return;
-  }
-  if (epaperLogTimer) clearTimeout(epaperLogTimer);
-  epaperLogTimer = setTimeout(flushEpaperLog, 250);
-});
-
 function isVisibleOnSomeDisplay(bounds) {
   if (
     !bounds ||
@@ -563,16 +533,18 @@ async function createWindow() {
     minHeight: 700,
     title: 'AAS',
     backgroundColor: '#2a2926',
-    // 自绘标题栏（设计稿本身是 Win 11 风格的 chrome）
-    frame: false,
-    titleBarStyle: 'hidden',
+    // 自绘标题栏：Windows 整条 chrome 自绘（Win11 风格）；macOS 保留系统红绿灯
+    // （hiddenInset 隐藏系统标题栏但留红绿灯），自绘的三个窗口键由渲染层按平台隐藏
+    ...(process.platform === 'darwin'
+      ? { titleBarStyle: 'hiddenInset', trafficLightPosition: { x: 12, y: 12 } }
+      : { frame: false, titleBarStyle: 'hidden' }),
     show: false,
     webPreferences: {
       preload: path.join(__dirname, 'preload.cjs'),
       contextIsolation: true,
       nodeIntegration: false,
       sandbox: true,
-      // 缩托盘/最小化/被遮挡后仍要后台定时推送与「一键重连」全速运行，故关闭隐藏窗口的定时器节流
+      // 缩托盘/最小化/被遮挡后仍要保持定时刷新与 WS 推送处理，故关闭隐藏窗口的定时器节流
       backgroundThrottling: false,
       // token 不再随窗口创建注入（窗口先于后端就绪），仅保留 http/ws 默认值；
       // token 由 backend:status('token') 异步推送
@@ -593,7 +565,6 @@ async function createWindow() {
   const win = new BrowserWindow(winOpts);
 
   mainWindow = win;
-  installBluetoothHandlers(win);
 
   win.once('ready-to-show', () => {
     win.show();
@@ -645,27 +616,16 @@ async function createWindow() {
 
   win.on('close', e => {
     if (!appQuitting) {
-      // 缩托盘：保留挂起的 native 蓝牙请求，让后台「一键重连」/扫描在托盘里继续跑
-      //（只有用户点「取消重连」才停）。真正退出/窗口销毁/重载才释放，见下方 closed /
-      // did-start-navigation 与 before-quit。
+      // 缩托盘：关窗只是隐藏，进程与后端继续运行；真正退出走托盘菜单。
       e.preventDefault();
       win.hide();
       return;
     }
-    resolvePendingBleRequests(); // 真正退出：释放挂起的 native 蓝牙请求，避免扫描状态泄漏
-  });
-  // 窗口真正销毁时再兜底一次（直接退出/异常销毁路径）
-  win.on('closed', resolvePendingBleRequests);
-  // 重载（dev HMR / webContents.reload）：旧页面随导航销毁，其 pending requestDevice 的 callback
-  // 不会被渲染层调用，须在主帧开始导航时兜底解析，释放扫描状态。
-  win.webContents.on('did-start-navigation', (_e, _url, isInPlace, isMainFrame) => {
-    if (isMainFrame && !isInPlace) resolvePendingBleRequests();
   });
 
   // 外链用系统浏览器打开，不在 Electron 内部跳转。
-  // 协议白名单：AI 资讯专区把外部 RSS/接口返回的 item.url 直接渲染为 <a target="_blank">，
-  // 数据源不受本机控制。若上游 feed 被投毒/中间人篡改，url 可能是 file:///、UNC 路径 \\evil\share\x.exe
-  // 或已注册的自定义协议（ms-msdt: 类）——一旦 openExternal 这类 url，点击资讯条目即在本机触发程序执行。
+  // 协议白名单：页面上可能渲染来自外部数据源的链接，url 可能是 file:///、UNC 路径
+  // 或已注册的自定义协议（ms-msdt: 类）——一旦 openExternal 这类 url 即在本机触发程序执行。
   // 故仅放行 http/https，其余一律丢弃（不打开、不报错）。
   win.webContents.setWindowOpenHandler(({ url }) => {
     try {
@@ -707,110 +667,24 @@ function createTray() {
     // 占位 16x16 透明 PNG
     image = nativeImage.createEmpty();
   }
+  if (process.platform === 'darwin' && !image.isEmpty()) {
+    // mac 菜单栏图标要用 template 模式（按透明形状渲染，系统自动适配深浅色菜单栏）。
+    // 彩色图会退化成剪影，能用；正式发布前建议补一张黑白 tray-iconTemplate.png
+    image = image.resize({ width: 16, height: 16 });
+    image.setTemplateImage(true);
+  }
   tray = new Tray(image);
   tray.setToolTip('AAS');
   const menu = Menu.buildFromTemplate([
     { label: '显示主窗口', click: () => { if (mainWindow) { mainWindow.show(); mainWindow.focus(); } } },
     { type: 'separator' },
     { label: '打开日志目录', click: () => shell.openPath(path.join(DATA_DIR, 'logs')) },
-    { label: '打开 punch_records', click: () => shell.openPath(path.join(DATA_DIR, 'punch_records')) },
     { type: 'separator' },
-    { label: '退出（停止 Bot + GUI）', click: () => { appQuitting = true; app.quit(); } },
+    { label: '退出（停止后端 + GUI）', click: () => { appQuitting = true; app.quit(); } },
   ]);
   tray.setContextMenu(menu);
   tray.on('double-click', () => { if (mainWindow) { mainWindow.show(); mainWindow.focus(); } });
 }
-
-// 兜底解析挂起的原生蓝牙请求（修复 E17）：
-//  Chromium 的 select-bluetooth-device / setBluetoothPairingHandler 在拿到 callback 后，
-//  必须调用一次该 callback 原生请求才会结束；否则 native 蓝牙扫描状态泄漏（持续耗电/占用适配器），
-//  且渲染层 store.scanning 卡在 true（下次 openScan 被 `if (scanning) return` 吞掉，再也打不开扫描）。
-//  窗口关闭(缩托盘)/销毁/重载时，渲染页的 modal 可能未选/未取消就消失，须在此统一兜底：
-//  设备选择回空串(=取消)、配对确认回 { confirmed:false }，确保挂起的 native 请求被解析、扫描状态释放。
-function resolvePendingBleRequests() {
-  if (bluetoothRequest) {
-    const cb = bluetoothRequest.callback;
-    bluetoothRequest = null;
-    try { cb(''); } catch { /* 请求可能已失效，忽略 */ }
-  }
-  if (pairingRequest) {
-    const cb = pairingRequest.callback;
-    pairingRequest = null;
-    try { cb({ confirmed: false }); } catch { /* 请求可能已失效，忽略 */ }
-  }
-}
-
-// 设备列表去重 + 原样透传名称（空串=无名设备，由渲染端决定过滤/隐藏）
-function mapBleDevices(deviceList) {
-  const map = new Map();
-  for (const device of deviceList || []) {
-    if (!device || !device.deviceId) continue;
-    map.set(device.deviceId, { deviceId: device.deviceId, deviceName: device.deviceName || '' });
-  }
-  return Array.from(map.values());
-}
-
-function installBluetoothHandlers(win) {
-  // 拦截系统原生蓝牙选择器：把扫到的设备实时推给渲染进程，由页面自定义 modal 展示并回选。
-  // 该事件会随新设备被发现而多次触发，每次携带累积的 deviceList 与一个新的 callback —— 始终保留最新的。
-  win.webContents.on('select-bluetooth-device', (event, deviceList, callback) => {
-    event.preventDefault();
-    bluetoothRequest = { callback };
-    if (!win.isDestroyed()) {
-      win.webContents.send('epd:ble-devices', mapBleDevices(deviceList));
-    }
-  });
-
-  // 蓝牙配对确认：不再弹系统 messageBox，推给渲染进程用应用内对话框确认后回传。
-  win.webContents.session.setBluetoothPairingHandler((details, callback) => {
-    if (details.pairingKind === 'confirmPin' || details.pairingKind === 'confirm') {
-      pairingRequest = { callback };
-      if (!win.isDestroyed()) {
-        win.webContents.send('epd:ble-pairing', {
-          kind: details.pairingKind,
-          deviceId: details.deviceId || '蓝牙设备',
-          pin: String(details.pin || ''),
-        });
-      }
-      return;
-    }
-    callback({ confirmed: false });
-  });
-}
-
-// 渲染端应用内对话框的配对确认结果
-ipcMain.on('epd:ble-pairing-response', (_event, confirmed) => {
-  if (!pairingRequest) return;
-  const cb = pairingRequest.callback;
-  pairingRequest = null;
-  try { cb({ confirmed: !!confirmed }); } catch { /* 请求可能已失效，忽略 */ }
-});
-
-// 渲染端从自定义 modal 回选设备（空串=取消）。callback 只能调用一次，调用后请求即解析/取消。
-ipcMain.on('epd:ble-select', (_event, deviceId) => {
-  if (!bluetoothRequest) return;
-  const cb = bluetoothRequest.callback;
-  bluetoothRequest = null;
-  try { cb(deviceId || ''); } catch { /* 请求可能已失效，忽略 */ }
-});
-
-// 方案2：定时推送(无用户手势)时，主进程向渲染层注入一次可信键盘输入(F24，isTrusted=true)，
-// 使渲染层得以在 user activation 上下文中调用 navigator.bluetooth.requestDevice 自动重连。
-// 选 F24(几乎无默认绑定/无人使用)避免误触；渲染层仅在"已武装"的短窗口内响应。
-// 注：窗口缩托盘/隐藏时 sendInputEvent 可能无效，故渲染层有 2s 兜底降级为"提示手动"，
-// 本调用只负责尽力注入、绝不抛错(失败 resolve false 即可)。
-ipcMain.handle('epd:gesture-reconnect', () => {
-  try {
-    if (!mainWindow || mainWindow.isDestroyed()) return false;
-    const wc = mainWindow.webContents;
-    wc.sendInputEvent({ type: 'keyDown', keyCode: 'F24' });
-    wc.sendInputEvent({ type: 'keyUp', keyCode: 'F24' });
-    return true;
-  } catch (e) {
-    console.warn('[aas-electron] epd:gesture-reconnect 注入失败:', e && e.message);
-    return false;
-  }
-});
 
 // ============================================================================
 // 窗口控制 IPC（自绘标题栏的三个按钮）
@@ -861,20 +735,34 @@ ipcMain.handle('system:open-logs', () => {
   return shell.openPath(dir); // 返回空串=成功，非空=错误信息
 });
 
-// 用系统默认图片查看器打开本地截图原图（入参为后端返回的相对路径，如 screenshots\user\punch_in\xxx.png）
-// 返回空串=成功，非空=错误信息（resolve 给渲染进程）
-ipcMain.handle('screenshot:open', (_e, relPath) => {
-  try {
-    if (typeof relPath !== 'string' || !relPath) return 'invalid path';
-    const root = path.resolve(DATA_DIR, 'screenshots');
-    const abs = path.resolve(DATA_DIR, relPath);
-    // 防目录穿越：必须落在 DATA_DIR/screenshots 之内
-    if (abs !== root && !abs.startsWith(root + path.sep)) return 'forbidden path';
-    if (!fs.existsSync(abs) || !fs.statSync(abs).isFile()) return 'file not found';
-    return shell.openPath(abs); // 调系统默认图片查看器
-  } catch (e) {
-    return String((e && e.message) || e);
+// ============================================================================
+// 微信 Bark 转发 IPC（页面上的三个系统级操作；监听仅 macOS 生效，故都带平台守卫）
+// ============================================================================
+// 后端 spawn 时 cwd=DATA_DIR，配置文件按相对路径写出，就落在数据根下
+const WECHAT_BARK_CONFIG_PATH = path.join(DATA_DIR, 'wechat_bark_config.json');
+
+ipcMain.handle('wechat-bark:open-privacy', () => {
+  // 打开 macOS「完全磁盘访问」设置页（监听要读通知中心数据库需要该权限）；其它系统没有这个设置页
+  if (process.platform !== 'darwin') return { ok: false, reason: '仅 macOS 支持' };
+  void shell.openExternal('x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles');
+  return { ok: true };
+});
+
+ipcMain.handle('wechat-bark:show-config', async () => {
+  // 在文件管理器中定位配置文件；还没保存过（文件不存在）时降级为直接打开数据目录
+  if (fs.existsSync(WECHAT_BARK_CONFIG_PATH)) {
+    shell.showItemInFolder(WECHAT_BARK_CONFIG_PATH);
+    return { ok: true };
   }
+  const err = await shell.openPath(DATA_DIR); // 空串=成功，非空=错误信息
+  return err ? { ok: false, reason: err } : { ok: true };
+});
+
+ipcMain.handle('wechat-bark:sync-login-item', (_event, enabled) => {
+  // 登录自启只在 macOS 打包版有意义（dev 下注册的是 electron.exe，纯属捣乱），其余环境 no-op
+  if (process.platform !== 'darwin' || !app.isPackaged) return { ok: true, skipped: true };
+  app.setLoginItemSettings({ openAtLogin: !!enabled, openAsHidden: true });
+  return { ok: true };
 });
 
 // ============================================================================
@@ -935,7 +823,7 @@ function migrateLegacyDataIfNeeded() {
   const marker = path.join(DATA_DIR, '.migrated');
   if (fs.existsSync(marker)) return;                                    // 只迁一次
   try { fs.mkdirSync(DATA_DIR, { recursive: true }); } catch { /* ignore */ }
-  for (const name of ['punch_records', 'screenshots', '.env', 'dynamic_config.json', 'scheduled_tasks.json']) {
+  for (const name of ['.env', 'dynamic_config.json']) {
     const src = path.join(LEGACY_DATA_DIR, name);
     const dst = path.join(DATA_DIR, name);
     if (fs.existsSync(src) && !fs.existsSync(dst)) {                     // 目标已存在则跳过，绝不覆盖
@@ -954,8 +842,7 @@ function migrateLegacyDataIfNeeded() {
 // 单实例锁（修复 M28）
 //  托盘化设计下关窗只是 hide 到托盘（见 win.on('close')），用户极易误以为已退出而再次
 //  双击快捷方式 → 第二个 Electron 实例正常启动并再 spawn 一个 python main.py --gui：
-//  两个后端抢 8765/8766 端口、第二实例 unlink 掉第一实例正在用的 .gui_token、
-//  Telegram bot 双 polling 触发 409、punch_records JSON 被两进程并发写。
+//  两个后端抢 8765/8766 端口、第二实例 unlink 掉第一实例正在用的 .gui_token。
 //  这里抢单实例锁：抢不到说明已有实例在运行，本进程直接退出；已有实例收到
 //  second-instance 事件时把窗口显示并聚焦，等价于「二次启动只唤起已有窗口」。
 // ============================================================================
@@ -972,6 +859,15 @@ if (!gotInstanceLock) {
       mainWindow.focus();
     }
   });
+
+  // macOS：点 Dock 图标 / Finder 再次打开会触发 activate（而不是 second-instance），
+  // 没有这个监听的话，隐藏到菜单栏后的窗口就唤不回来了
+  app.on('activate', () => {
+    if (mainWindow) {
+      mainWindow.show();
+      mainWindow.focus();
+    }
+  });
 }
 
 // ============================================================================
@@ -984,7 +880,7 @@ app.on('ready', async () => {
       title: '检测到 watchdog 运行中',
       message: '检测到 watchdog.py 进程正在运行',
       detail:
-        'watchdog 会自动启动一个 main.py，与 GUI 模式启动的 Python 进程冲突（Telegram bot polling 重复、共享文件竞争）。\n\n' +
+        'watchdog 会自动启动一个 main.py，与 GUI 模式启动的 Python 进程冲突（端口占用、共享文件竞争）。\n\n' +
         '建议：先停止 watchdog（任务管理器结束 python.exe 或对应终端 Ctrl+C），再启动 GUI。',
       buttons: ['仍然继续启动', '退出'],
       defaultId: 1,
@@ -1006,17 +902,13 @@ app.on('ready', async () => {
 });
 
 app.on('window-all-closed', () => {
-  // 我们把关窗变成隐藏到托盘，所以这里只在 macOS 之外才退出
-  // 因为 close 已经 preventDefault，这个事件不会触发，留作保险
-  if (process.platform !== 'darwin') {
-    // do nothing — let user explicitly quit from tray
-  }
+  // 关窗已被拦截为"隐藏到托盘"，此事件正常不会触发；
+  // 所有平台都不在这里退出，退出统一走托盘菜单的显式退出
 });
 
 app.on('before-quit', () => {
   appQuitting = true;
   clearPendingRestart(); // 退出前取消挂起的重启定时器，防止其到点后又把后端拉起
   flushGuiSettings();
-  flushEpaperLog();
   killPython();
 });

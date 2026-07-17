@@ -1,22 +1,6 @@
 // 类型化 REST 客户端 — 自动注入 Bearer token + 统一错误处理
 import { getBackend } from './backend';
 
-export interface ScreenshotItem {
-  path: string;
-  filename: string;
-  time: number;
-  time_str: string;
-  type: string;
-}
-
-export interface RecordsResponse {
-  username: string;
-  year: number;
-  month: number;
-  records: Record<string, { punch_in_time: string | null; punch_out_time: string | null } | { in?: string | null; out?: string | null }>;
-  path?: string;
-}
-
 export interface ErrorGroup {
   timestamp: string;
   content: string[];
@@ -31,36 +15,12 @@ export interface StatusSnapshot {
   current_time: string;
   is_workday?: boolean | null;
   is_holiday?: boolean | null;
-  is_work_time?: boolean | null;
-  current_operation: 'punch_in' | 'punch_out' | null;
-  operation_started_at: string | null;
-  today_records: Record<string, { punch_in_time: string | null; punch_out_time: string | null }>;
-  config: {
-    work_start_time?: string;
-    work_end_time?: string;
-    late_threshold?: number;
-    early_leave_threshold?: number;
-    use_selenium_login?: boolean;
-    selenium_headless?: boolean;
-    daily_status_time?: string;
-  };
-  scheduled_tasks: Array<{
-    id: number;
-    type: string;
-    scheduled_time: string;
-    username?: string;
-    created_at?: string;
-  }>;
-  heartbeat?: {
-    last: string | null;
-    miss_count: number;
-  };
-  /** Telegram bot 是否已连接（旧后端为 undefined） */
-  bot_available?: boolean;
-  /** Telegram bot 连接错误信息（无错误为 null；旧后端为 undefined） */
-  bot_error?: string | null;
-  active_controllers?: number;
-  users?: string[];
+  /** 后端进程已运行秒数（后端字段名就叫 uptime_seconds，不能写成 uptime） */
+  uptime_seconds?: number | null;
+  /** 后端进程启动时刻（ISO 字符串） */
+  started_at?: string | null;
+  /** 保留的配置项（当前只剩天气相关），键值由后端决定 */
+  config?: Record<string, string | number | boolean | null>;
   resources?: {
     cpu_percent?: number;
     memory_percent?: number;
@@ -157,42 +117,7 @@ export interface WeatherResponse {
   cached: boolean;
 }
 
-// ===== AI 资讯（AI HOT，后端聚合中文 AI 资讯并按版块归类）=====
-export interface AiNewsItem {
-  id: string;
-  title: string;
-  title_en?: string | null;
-  url: string;
-  source: string;
-  publishedAt?: string | null; // 内容发布时间（ISO 字符串）
-  summary?: string | null;
-  category?: string | null; // 版块 slug，对应 AI_NEWS_CATEGORIES
-  selected?: boolean; // 是否上游主编精选（true 时前端打「精选」标）
-}
-
-export interface AiNewsResponse {
-  updated_at: number | null; // 缓存最后刷新时刻（unix 秒）
-  count: number;
-  items: AiNewsItem[];
-  next_cursor?: string | null; // 游标分页：下一页游标（null/缺省表示无更多）
-  has_next?: boolean;          // 是否还有更多可加载
-}
-
-// ===== Claude Code 额度（墨水屏信息站，后端读本机凭据拉官方 usage 接口）=====
-export interface ClaudeUsageWindow {
-  used_pct: number;          // 已用百分比 0-100
-  resets_at: string | null;  // 重置时刻（ISO 字符串）
-}
-
-export interface ClaudeUsageResponse {
-  available: boolean;
-  updated_at: number | null; // 缓存最后刷新时刻（unix 秒）
-  five_hour: ClaudeUsageWindow | null;
-  seven_day: ClaudeUsageWindow | null;
-  error?: string | null;
-}
-
-// ===== 日历信息（墨水屏信息站，chinese_calendar 休班标记）=====
+// ===== 日历信息（chinese_calendar 休班标记，后端保留作参考）=====
 export interface CalendarDayMark {
   d: number;        // 几号
   off: boolean;     // 休息日（双休/节假日）
@@ -206,7 +131,7 @@ export interface CalendarInfoResponse {
   year: number;
   month: number;
   days: CalendarDayMark[];
-  /** 本周（周一起 7 天，可跨月）：信息站「本周日历条」 */
+  /** 本周（周一起 7 天，可跨月） */
   week: Array<{ date: string; d: number; off: boolean }>;
   nearest_rest: {
     days: number;          // 距今天数（0 = 今天在休）
@@ -224,8 +149,76 @@ export interface CalendarInfoResponse {
     days_until: number;
   }>; // 近期法定假期（最多 2 个）
   next_makeup: string[]; // 后续调休补班日（最多 2 个）
-  /** 传入 after 时返回：该日之后的首个工作日（请假销假日） */
+  /** 传入 after 时返回：该日之后的首个工作日 */
   workday_after: string | null;
+}
+
+// ===== 微信 Bark 转发（macOS 微信通知 → iPhone Bark；Windows 上仅能改配置/测推送）=====
+export interface WechatBarkConfig {
+  bark: {
+    server: string;
+    device_key: string;
+    group: string;
+    sound: string;
+    level: string;
+    url: string;
+    icon: string;
+    use_post: boolean;
+  };
+  wechat: {
+    bundle_ids: string[];
+    title_prefix: string;
+    show_sender_in_body: boolean;
+    sender_label: string;
+    ignore_title_patterns: string[];
+    ignore_body_patterns: string[];
+  };
+  listener: {
+    poll_interval_seconds: number;
+    send_existing_on_start: boolean;
+    state_file: string;
+    db_path: string;
+    max_body_chars: number;
+  };
+  desktop: {
+    auto_start_listener: boolean;
+    launch_at_login: boolean;
+  };
+  schedule: {
+    enabled: boolean;
+    timezone: string;
+    start_time: string; // "HH:MM"
+    end_time: string;   // "HH:MM"（后端允许 24:00 表示到当天结束）
+    weekends_are_holidays: boolean;
+    holiday_source_urls: string[];
+    holiday_cache_dir: string;
+    holiday_cache_ttl_hours: number;
+    allow_on_holiday_fetch_error: boolean;
+  };
+}
+
+export interface WechatBarkStatus {
+  running: boolean;
+  stopping: boolean;
+  /** 监听是否受当前平台支持（仅 macOS 为 true） */
+  platform_supported: boolean;
+  config_path: string;
+  /** 带 HH:MM:SS 时间戳的最近 600 行运行日志 */
+  logs: string[];
+}
+
+export interface WechatBarkSchedule {
+  allowed: boolean;
+  reason: string;
+  now: string; // ISO 时间串（带时区偏移）
+  timezone: string;
+  start_time: string;
+  end_time: string;
+}
+
+export interface WechatBarkApp {
+  identifier: string;
+  count: number;
 }
 
 export interface ApiOptions {
@@ -300,121 +293,6 @@ export const api = {
   getLogsTail: (lines = 200) =>
     request<{ lines: string[]; file: string }>(`/api/v1/logs/tail?lines=${lines}`),
 
-  punchIn: (username?: string) =>
-    request<{ success: boolean; message: string }>('/api/v1/punch/in', {
-      method: 'POST',
-      body: username ? { username } : {},
-    }),
-
-  punchOut: (username?: string) =>
-    request<{ success: boolean; message: string }>('/api/v1/punch/out', {
-      method: 'POST',
-      body: username ? { username } : {},
-    }),
-
-  operationStop: () =>
-    request<{ success: boolean; message: string }>('/api/v1/operation/stop', {
-      method: 'POST',
-    }),
-
-  getConfigMode: () =>
-    request<{ use_selenium_login: boolean; selenium_headless: boolean }>(
-      '/api/v1/config/mode',
-    ),
-
-  setConfigMode: (patch: { use_selenium_login?: boolean; selenium_headless?: boolean }) =>
-    request<{ success: boolean; config: Record<string, boolean> }>('/api/v1/config/mode', {
-      method: 'PUT',
-      body: patch,
-    }),
-
-  listTasks: () =>
-    request<{ tasks: StatusSnapshot['scheduled_tasks'] }>('/api/v1/tasks'),
-
-  deleteTask: (id: number) =>
-    request<{ success: boolean; task_id: number }>(`/api/v1/tasks/${id}`, {
-      method: 'DELETE',
-    }),
-
-  listUsers: () =>
-    request<{ users: Array<{ username: string; env_key?: string }> }>('/api/v1/users'),
-
-  autoByebyeCalc: (username?: string) =>
-    request<{
-      success: boolean;
-      username?: string | null;
-      punch_in_time?: string | null;
-      punch_out_time?: string | null;
-      message?: string;
-      fallback_used?: boolean;
-    }>('/api/v1/punch/auto_byebye/calc', {
-      method: 'POST',
-      body: username ? { username } : {},
-    }),
-
-  autoByebyeConfirm: (hour: number, minute: number) =>
-    request<{ success: boolean; time?: string; error?: string }>(
-      '/api/v1/punch/auto_byebye/confirm',
-      { method: 'POST', body: { hour, minute } },
-    ),
-
-  parallelLoginTest: () =>
-    request<{
-      success: boolean;
-      count?: number;
-      success_count?: number;
-      results?: Record<string, { success: boolean; message: string }>;
-      error?: string;
-    }>('/api/v1/test/parallel_login', { method: 'POST' }),
-
-  // 登录系统读取所有用户今日上/下班时间（不触发打卡），结果回写今日记录
-  fetchPunchStatus: () =>
-    request<{
-      success: boolean;
-      count?: number;
-      results?: Record<
-        string,
-        { success: boolean; punch_in_time: string | null; punch_out_time: string | null; message: string }
-      >;
-      error?: string;
-    }>('/api/v1/punch/fetch_status', { method: 'POST' }),
-
-  createTask: (body: {
-    type: 'punch_in' | 'punch_out';
-    mode: 'absolute' | 'delay';
-    hour?: number;
-    minute?: number;
-    delay_minutes?: number;
-    username?: string;
-  }) =>
-    request<{ success: boolean; message: string; task_id: number | null }>('/api/v1/tasks', {
-      method: 'POST',
-      body,
-    }),
-
-  listScreenshots: (params: { username?: string; type?: 'punch_in' | 'punch_out'; limit?: number } = {}) => {
-    const qs = new URLSearchParams();
-    if (params.username) qs.set('username', params.username);
-    qs.set('type', params.type ?? 'punch_in');
-    if (params.limit) qs.set('limit', String(params.limit));
-    return request<
-      | { username: string; type: string; items: ScreenshotItem[] }
-      | { type: string; users: string[]; grouped: Record<string, ScreenshotItem[]> }
-    >(`/api/v1/screenshots?${qs.toString()}`);
-  },
-
-  /** 构造截图二进制 URL（src 直接用） */
-  screenshotFileUrl: (path: string) => {
-    const { httpUrl, token } = getBackend();
-    const qs = new URLSearchParams({ path, token });
-    return `${httpUrl}/api/v1/screenshots/file?${qs.toString()}`;
-  },
-
-  getRecords: (username: string, year: number, month: number) => {
-    const qs = new URLSearchParams({ username, year: String(year), month: String(month) });
-    return request<RecordsResponse>(`/api/v1/records?${qs.toString()}`);
-  },
-
   // 汇率走势（base=CNY quote=JPY）；force=true 跳过缓存强制刷新
   getExchangeRate: (range: string, force?: boolean) => {
     const qs = new URLSearchParams({ range });
@@ -430,26 +308,8 @@ export const api = {
       timeoutMs: 25_000,
     }),
 
-  // AI 资讯（AI HOT 聚合）；force 跳过后端缓存强制刷新（首屏），cursor 游标续拉"加载更多"，
-  // category 按版块服务端过滤（缺省即"全部"），mode='selected' 只取主编精选（"只看精选"）；
-  // mode+category 可组合，各视图各自独立一份列表/游标
-  getAiNews: (opts?: { force?: boolean; cursor?: string; take?: number; category?: string; mode?: 'all' | 'selected' }) => {
-    const qs = new URLSearchParams();
-    if (opts?.force) qs.set('force', '1');
-    if (opts?.cursor) qs.set('cursor', opts.cursor);
-    if (opts?.take) qs.set('take', String(opts.take));
-    if (opts?.category) qs.set('category', opts.category);
-    if (opts?.mode) qs.set('mode', opts.mode);
-    const q = qs.toString();
-    return request<AiNewsResponse>(`/api/v1/ai-news${q ? `?${q}` : ''}`);
-  },
-
-  // Claude Code 额度（墨水屏信息站）；force=true 跳过后端缓存
-  getClaudeUsage: (force?: boolean) =>
-    request<ClaudeUsageResponse>(`/api/v1/claude-usage${force ? '?force=1' : ''}`),
-
-  // 日历信息（墨水屏信息站：当月休班标记/本周条/最近休息日/近期假期/调休补班）
-  // after：可选 ISO 日期，请求该日之后的首个工作日（请假销假日）
+  // 日历信息（当月休班标记/本周条/最近休息日/近期假期/调休补班；后端保留，当前无页面调用）
+  // after：可选 ISO 日期，请求该日之后的首个工作日
   getCalendarInfo: (after?: string) =>
     request<CalendarInfoResponse>(`/api/v1/calendar-info${after ? `?after=${after}` : ''}`),
 
@@ -466,24 +326,8 @@ export const api = {
       { method: 'PATCH', body: { patch } },
     ),
 
-  testEmail: () =>
-    request<{ success: boolean; message?: string; error?: string }>('/api/v1/email/test', {
-      method: 'POST',
-    }),
-
   systemRestart: () =>
     request<{ success: boolean; note?: string }>('/api/v1/system/restart', { method: 'POST' }),
-
-  // 重连 Telegram bot（不重启进程）
-  botReconnect: () =>
-    request<{ success: boolean; message?: string; error?: string }>('/api/v1/bot/reconnect', {
-      method: 'POST',
-    }),
-
-  testReminder: () =>
-    request<{ success: boolean; message?: string; error?: string }>('/api/v1/test/reminder', {
-      method: 'POST',
-    }),
 
   // ===== 内置网络加速（mihomo）=====
   getProxyConfig: () => request<ProxyStatus>('/api/v1/proxy/config'),
@@ -588,6 +432,47 @@ export const api = {
       `/api/v1/proxy/profiles/${id}`,
       { method: 'PUT', body },
     ),
+
+  // ===== 微信 Bark 转发 =====
+  getWechatBarkStatus: () => request<WechatBarkStatus>('/api/v1/wechat-bark/status'),
+
+  getWechatBarkConfig: () =>
+    request<{ config: WechatBarkConfig; config_path: string }>('/api/v1/wechat-bark/config'),
+
+  // 保存配置：字段校验失败时后端回 HTTP 400 {success:false, error:中文文案}，
+  // request() 会抛 ApiError，调用方从 payload.error 取文案展示
+  saveWechatBarkConfig: (config: WechatBarkConfig) =>
+    request<{ success: boolean; config?: WechatBarkConfig; config_path?: string; note?: string; error?: string }>(
+      '/api/v1/wechat-bark/config',
+      { method: 'PUT', body: { config } },
+    ),
+
+  // 启动监听（Windows 上后端会返回明确的平台错误文案）
+  startWechatBark: () =>
+    request<{ success: boolean; message?: string; error?: string }>('/api/v1/wechat-bark/start', {
+      method: 'POST',
+    }),
+
+  stopWechatBark: () =>
+    request<{ success: boolean; message?: string; error?: string }>('/api/v1/wechat-bark/stop', {
+      method: 'POST',
+    }),
+
+  // 发一条测试推送验证 Bark 配置（任意平台可用）
+  testWechatBark: () =>
+    request<{ success: boolean; message?: string; error?: string }>('/api/v1/wechat-bark/test', {
+      method: 'POST',
+    }),
+
+  // 当前时刻的转发时段判定（允许/阻止 + 原因），与监听是否运行无关
+  getWechatBarkSchedule: () =>
+    request<{ success: boolean; schedule?: WechatBarkSchedule; error?: string }>(
+      '/api/v1/wechat-bark/schedule',
+    ),
+
+  // 通知中心里的应用来源列表（仅 macOS 且有完全磁盘访问权限时成功）
+  getWechatBarkApps: () =>
+    request<{ success: boolean; apps?: WechatBarkApp[]; error?: string }>('/api/v1/wechat-bark/apps'),
 };
 
 export interface ProxyNode {

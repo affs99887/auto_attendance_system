@@ -5,7 +5,7 @@
 - 网络请求统一带 User-Agent，避免 Yahoo 返回 429。
 - 若内置网络加速（mihomo）已启用则优先走本地代理；代理连接失败时立即回退默认网络。
 - 所有网络/解析异常 try/except 捕获，绝不外抛；失败时回退旧缓存。
-- 缓存文件 exchange_rate_cache.json，定位方式与 scheduled_tasks.json 一致（程序运行根目录）。
+- 缓存文件 exchange_rate_cache.json，落在程序运行根目录（cwd，与 dynamic_config.json 同根）。
 - 方向固定产出 CNY->JPY；JPY->CNY 由前端对 value/price 取 1/x。
 
 对外暴露：
@@ -38,7 +38,7 @@ _USER_AGENT = (
 # 缓存惰性刷新 TTL（秒）
 _TTL_SECONDS = 600
 
-# 缓存文件名（与 scheduled_tasks.json 一致，落在程序运行根目录）
+# 缓存文件名（落在程序运行根目录）
 _CACHE_FILE = 'exchange_rate_cache.json'
 
 # range -> (回溯天数, Yahoo interval)
@@ -51,7 +51,7 @@ _RANGE_MAP = {
 }
 _DEFAULT_RANGE = '30d'
 
-# 缓存读写互斥（参考 record_manager 的 _lock）
+# 缓存读写互斥
 _lock = threading.Lock()
 
 
@@ -63,7 +63,7 @@ def _normalize_range(range_):
 
 
 def _cache_path():
-    """缓存文件绝对/相对路径，与 scheduled_tasks.json 同样落在运行根目录。"""
+    """缓存文件绝对/相对路径，落在运行根目录。"""
     return _CACHE_FILE
 
 

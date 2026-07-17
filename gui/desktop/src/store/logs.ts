@@ -4,7 +4,7 @@ import { api, ApiError } from '../lib/api';
 import type { LogEntry } from '../lib/types';
 
 const MAX_LINES = 5000;
-// 后端写的格式: "2026-05-19 08:29:47,418 - INFO - 邓蕴哲 上班打卡 - 登录成功"
+// 后端写的格式: "2026-05-19 08:29:47,418 - INFO - 消息正文"
 const LOG_REGEX = /^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}(?:[.,]\d+)?)\s*-\s*(INFO|WARN(?:ING)?|ERROR|CRITICAL|DEBUG)\s*-\s*(.*)$/;
 
 function parseLine(raw: string): LogEntry {

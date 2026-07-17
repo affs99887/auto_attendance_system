@@ -20,7 +20,7 @@ class ServiceProxyFallbackTests(unittest.TestCase):
         with patch.object(proxy_manager.config, 'get_local_proxy', return_value=None), \
                 patch.object(proxy_manager.requests, 'get', return_value=response) as request_get:
             result = proxy_manager.request_get_with_local_proxy_fallback(
-                'ai_news', 'https://example.test/data', timeout=10)
+                'demo_service', 'https://example.test/data', timeout=10)
 
         self.assertIs(result, response)
         request_get.assert_called_once_with('https://example.test/data', timeout=10)
@@ -40,9 +40,9 @@ class ServiceProxyFallbackTests(unittest.TestCase):
                     ],
                 ) as request_get:
             first = proxy_manager.request_get_with_local_proxy_fallback(
-                'ai_news', 'https://example.test/first')
+                'demo_service', 'https://example.test/first')
             second = proxy_manager.request_get_with_local_proxy_fallback(
-                'ai_news', 'https://example.test/second')
+                'demo_service', 'https://example.test/second')
             other = proxy_manager.request_get_with_local_proxy_fallback(
                 'exchange_rate', 'https://example.test/rate')
 
@@ -80,10 +80,10 @@ class ServiceProxyFallbackTests(unittest.TestCase):
                     ],
                 ) as request_get:
             proxy_manager.request_get_with_local_proxy_fallback(
-                'claude_usage', 'https://example.test/usage')
+                'demo_service_b', 'https://example.test/usage')
             proxy_manager.reset_proxy_request_circuits()
             result = proxy_manager.request_get_with_local_proxy_fallback(
-                'claude_usage', 'https://example.test/usage')
+                'demo_service_b', 'https://example.test/usage')
 
         self.assertIs(result, recovered_response)
         self.assertNotIn('proxies', request_get.call_args_list[1].kwargs)
@@ -117,13 +117,13 @@ class ServiceProxyFallbackTests(unittest.TestCase):
         self.assertEqual(request_get.call_args_list[2].kwargs['proxies'], self.local_proxy)
 
     def test_half_open_allows_only_one_proxy_probe(self):
-        _, _, generation = proxy_manager._claim_local_proxy_attempt('ai_news', 0)
-        proxy_manager._open_proxy_request_circuit('ai_news', generation)
+        _, _, generation = proxy_manager._claim_local_proxy_attempt('demo_service', 0)
+        proxy_manager._open_proxy_request_circuit('demo_service', generation)
         with proxy_manager._proxy_request_circuit_lock:
-            proxy_manager._proxy_request_circuits['ai_news']['open_until'] = 0
+            proxy_manager._proxy_request_circuits['demo_service']['open_until'] = 0
 
-        first = proxy_manager._claim_local_proxy_attempt('ai_news', 1)
-        second = proxy_manager._claim_local_proxy_attempt('ai_news', 1)
+        first = proxy_manager._claim_local_proxy_attempt('demo_service', 1)
+        second = proxy_manager._claim_local_proxy_attempt('demo_service', 1)
 
         self.assertEqual(first[:2], (True, True))
         self.assertEqual(second[:2], (False, False))

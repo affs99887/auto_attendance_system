@@ -15,7 +15,8 @@
     "predist:exe": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/kill-running-client.ps1",
     "dist:exe": "npm run build && electron-builder --win --x64",
     "predist:dir": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/kill-running-client.ps1",
-    "dist:dir": "npm run build && electron-builder --dir"
+    "dist:dir": "npm run build && electron-builder --dir",
+    "dist:mac": "bash ../../scripts/build-mac.sh"
   },
   "dependencies": {
     "@types/react-window": "^1.8.8",

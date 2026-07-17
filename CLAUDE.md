@@ -4,177 +4,69 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-This is an automated attendance system (自动打卡系统) that supports dual automation modes: traditional computer vision/OCR and modern Selenium WebDriver automation for logging into timecard systems and punch in/out. The system integrates with Telegram for remote control and monitoring.
+这是一个 GUI 定制开发底座：Electron + React 前端、Python(Flask + WebSocket) 后端，用于给客户做定制开发。自带天气、汇率、日历三个业务模块作为参考实现，以及内置网络加速（mihomo）、日志、设置等基础设施。
 
 ## Architecture
 
-The system consists of several key components:
+### 顶层脚本
+- **main.py** — 主入口；`--gui` 启动 GUI 后端（HTTP 8765 / WS 8766）；带单实例锁
+- **start.py** — 统一启动器（直接 / 看门狗 / GUI 模式）
+- **watchdog.py** — 进程监控自动重启（仅控制台模式；GUI 模式崩溃重启由 Electron 接管，两者互斥）
 
-### Core Python Components
-- **main.py** - Main application entry point
-- **start.py** - Unified launcher with mode selection and status monitoring
-- **watchdog.py** - Process monitor that restarts main.py if it crashes
+### 后端模块（modules/）
+- **app_core.py** — `AppCore`：日志初始化、定时任务注册（`init_schedule_tasks`）、状态快照（`get_status_snapshot`，供 `/api/v1/status`）、退出时停 mihomo
+- **web_server.py** — Flask REST + WebSocket；Bearer token 鉴权（logs/.gui_token）；EventBus 推送；仅监听 127.0.0.1
+- **config.py** — `.env`（load_dotenv）+ `dynamic_config.json`（含代理 PROXY 子对象，线程安全读写）
+- **schedule_manager.py** — `run_schedule()`：全局 schedule 单例的驱动循环，所有周期任务靠它触发
+- **proxy_manager.py** — 内置网络加速：mihomo 子进程管理、订阅/粘贴配置、节点切换、健康巡检 watchdog、`request_get_with_local_proxy_fallback`（本地代理失败即回退直连 + 熔断）
+- **exchange_rate_service.py** / **calendar_info_service.py** — 业务参考实现（缓存 + TTL + 代理回退的标准写法）
+- **safe_calendar.py** — chinese_calendar 包装，数据超期降级为周末判断
+- **services/log_service.py** — 错误日志解析分页
+- **wechat_bark_listener.py** — 微信通知 Bark 转发监听核心（仅 macOS 生效；轮询通知中心数据库 + 时段/节假日过滤 + Bark 推送；可命令行独立运行）
+- **wechat_bark_service.py** — 上者的服务包装：配置读写（wechat_bark_config.json）、监听线程生命周期、600 行日志环、测试推送/时段判定/通知来源
 
-### Modular Architecture (modules/)
-- **attendance_system.py** - Core AttendanceSystem class orchestrating all operations
-- **telegram_bot.py** - TelegramBot class for remote control interface
-- **selenium_login.py** - SeleniumLoginController for WebDriver-based automation
-- **browser_controller.py** - Traditional browser automation using PyAutoGUI
-- **image_recognizer.py** - OCR and template matching for UI recognition
-- **email_service.py** - EmailService class for notifications with retry logic
-- **record_manager.py** - PunchRecordManager for attendance data persistence
-- **task_manager.py** - TaskManager for scheduling operations
-- **schedule_manager.py** - Schedule management and workday detection
-- **config.py** - Centralized configuration management
+### 前端（gui/desktop/）
+- **electron/main.cjs** — 壳：窗口/托盘/spawn Python 后端/崩溃重启；preload.cjs 暴露 AAS_* 桥
+- **src/screens/** — Dashboard（天气+汇率+微信转发卡）、Weather、WechatBark、Proxy、Logs、Settings、About
+- **src/lib/api.ts** — REST 封装；**src/lib/ws.ts** — WebSocket 客户端；**src/store/** — 各功能状态
 
-### Key Technologies
-- **Browser Automation**: Selenium WebDriver with Edge/Chrome support, automatic driver management
-- **Computer Vision**: OpenCV, PyAutoGUI, Tesseract OCR for traditional screen automation
-- **Telegram Bot**: python-telegram-bot for remote control and monitoring
-- **Scheduling**: schedule library with chinese-calendar for workday detection
-- **Data Persistence**: JSON-based storage with user isolation
+### 关键机制
+- **REST↔asyncio**：Flask 跑在 waitress 线程，需要进主循环的调用走 `AsyncioBridge.call`（超时会 `fut.cancel()` 防幽灵操作）
+- **实时推送**：后端 `event_bus.publish_threadsafe(channel, data)` → 前端 `wsClient.subscribe(channel, cb)`；现有频道：`log:stream`、`proxy:status`、`exchange_rate:update`、`wechat_bark:status`、`wechat_bark:log`、`system:restart_requested`
+- **周期任务**：在 `app_core.init_schedule_tasks` 用 `schedule.every(...).do(...).tag('任务名')` 注册；阻塞请求放 `run_in_executor`
+- **.env 写入**：PATCH `/api/v1/config` 只接受 `web_server.ENV_WRITE_WHITELIST` 里的字段；新业务的环境变量要先登记白名单
 
 ## Common Development Commands
 
-### Environment Setup
 ```bash
-# Create and activate virtual environment
-python3 -m venv venv
-source venv/bin/activate  # Linux/WSL
-# or
-venv\Scripts\activate     # Windows
-
-# Install dependencies
+# 后端
+python -m venv venv && venv\Scripts\activate
 pip install -r requirements.txt
-```
+python main.py --gui          # GUI 后端
+python start.py               # 控制台（watchdog）
 
-### Running the System
-```bash
-# Activate virtual environment first
-source venv/bin/activate
+# 前端（gui/desktop/）
+npm install
+npm run electron:dev          # 开发
+npm run build                 # tsc + vite 构建
+npm run dist:dir              # electron-builder 打包 Windows → release/
+npm run dist:mac              # macOS 打包（mac 上执行，见 scripts/build-mac.sh）
 
-# Run with unified launcher (recommended)
-python start.py                    # Default watchdog mode
-python start.py --interactive       # Interactive mode selection
-python start.py --mode main         # Direct main.py execution
-python start.py --mode watchdog     # Watchdog mode
-python start.py --mode status       # Check running status
-
-# Direct execution (alternative)
-python main.py                      # CLI mode with Telegram integration
-python watchdog.py                  # Watchdog mode with process monitoring
-```
-
-### Development
-```bash
-# Activate virtual environment first
-source venv/bin/activate
+# 后端打包
+build_python.bat              # PyInstaller → dist/main/
 ```
 
 ## Configuration
 
-### Environment Variables (.env)
-- LOGIN_USERNAME, LOGIN_PASSWORD, LOGIN_URL - Login credentials
-- LOGIN_USERNAME2, LOGIN_PASSWORD2 - Second user credentials (multi-user support)
-- TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID - Telegram bot configuration
-- TESSERACT_PATH - Path to Tesseract OCR executable
-- WORK_START_TIME, WORK_END_TIME - Punch in/out times
-- LATE_THRESHOLD, EARLY_LEAVE_THRESHOLD - Threshold settings for alerts
-- DAILY_STATUS_TIME - Time for daily status reports
-- EMAIL_SENDER, EMAIL_PASSWORD - Email notification credentials
-- EMAIL_SMTP_SERVER, EMAIL_SMTP_PORT - SMTP server configuration
-
-### Dynamic Configuration (dynamic_config.json)
-- USE_SELENIUM_LOGIN - Enable/disable Selenium automation mode
-- SELENIUM_HEADLESS - Run Selenium in headless mode
-- Current automation mode settings (excluded from version control)
-
-### Template Images
-The system uses template matching with images in `templates/` directory:
-- username_field.png, password_field.png - Login form elements
-- login_button.png, punch_button.png - Action buttons
-- alert.png, continue.png - System dialogs
-
-## Multi-User Support
-
-The system supports multiple users with separate:
-- Punch records stored in `punch_records/{username}/`
-- Screenshots stored in `screenshots/{username}/`
-- User-specific settings in settings.json
-
-## Data Storage
-
-- **punch_records/** - JSON files with monthly attendance data
-- **scheduled_tasks.json** - Pending scheduled tasks
-- **settings.json** - User preferences and configuration
-- **logs/** - Rotating log files for system monitoring
-
-## Key Features
-
-- **Dual Automation Modes**: Selenium WebDriver and traditional computer vision
-- **Multi-User Support**: Parallel login and data isolation for multiple users
-- **Parallel Multi-Account Punch**: 当 `USE_SELENIUM_LOGIN=true` 且配置多用户时，`/punch_in` / `/punch_out` 自动以 `asyncio.Semaphore + gather` 并行执行（上限 3 并发）；下班失败的用户会按"最长剩余时间"统一调度一次定时重试。`today_punch_records` / `notification_sent_today` 按用户分桶隔离，`PunchRecordManager.update_record` 加 `threading.Lock` 防 JSON 损坏；`send_daily_status` 有 5 秒去重；schedule 任务用 tag 隔离（`punch_out_retry` / `punch_out_scheduled` / `punch_in_scheduled` / `daily_status`）避免互相误清。PyAutoGUI 模式仍走串行（单焦点限制）。
-- **Intelligent Time Management**: Automatic punch-out scheduling with work time calculation
-- **Telegram Integration**: Comprehensive remote control (/punch_in, /punch_out, /status, /log)
-- **Robust Error Handling**: Automatic retry mechanisms and fallback strategies
-- **Email Notifications**: Screenshots and status reports with SMTP integration
-- **Smart Scheduling**: Workday detection using Chinese calendar integration
-- **Process Monitoring**: Watchdog system with resource monitoring and auto-restart
-
-## System Operation Modes
-
-### Unified Launcher Mode (start.py)
-- **Interactive Mode**: Menu-driven mode selection
-- **Direct Mode**: Specify execution mode via command line arguments
-- **Status Mode**: Monitor running processes and system health
-
-### Automation Modes
-- **Selenium Mode**: WebDriver-based automation (more reliable)
-- **Traditional Mode**: Computer vision + PyAutoGUI (fallback option)
-- **Hybrid Mode**: Automatic fallback between modes
-
-### Process Modes
-- **Main Process**: Full system with Telegram integration
-- **Watchdog Mode**: Process monitoring with automatic restart and resource alerts
-
-## Key Integration Points
-
-### Data Flow Architecture
-1. **Selenium Mode**: SeleniumLoginController → SeleniumRecordManager → EmailService → TelegramBot
-2. **Traditional Mode**: BrowserController → ImageRecognizer → RecordManager → EmailService → TelegramBot
-3. **Task Scheduling**: TaskManager → AttendanceSystem → (automation flow selection)
-
-### Module Dependencies
-- **AttendanceSystem**: Core orchestrator with mode-aware automation routing
-- **TelegramBot**: Remote control with Selenium and traditional command support
-- **Automation Modules**: SeleniumLoginController, BrowserController (mode-specific)
-- **Service Modules**: EmailService, RecordManager, ConfigManager (shared infrastructure)
-
-### Error Handling Strategy
-- **Network Issues**: Automatic retry with exponential backoff in EmailService and TelegramBot
-- **Process Crashes**: Watchdog monitoring with automatic restart and rate limiting  
-- **UI Recognition Failures**: Template matching fallbacks with threshold adjustments
-- **Connection Monitoring**: Health checks and reconnection logic for external services
-
-## Development Environment Notes
-
-### WSL/Linux Considerations
-- Virtual environment activation required: `source venv/bin/activate`
-- Some Windows-specific packages (pywin32) will not install but system works without them
-
-### Multi-User Development
-- User-specific data stored in `punch_records/{username}/` and `screenshots/{username}/`
-- Environment variables support multiple user credentials (LOGIN_USERNAME2, etc.)
-- Settings and configurations isolated per user
+- `.env`：`CAIYUN_WEATHER_APP_KEY` / `CAIYUN_WEATHER_APP_SECRET` / `CAIYUN_WEATHER_TOKEN`（彩云天气）
+- `dynamic_config.json`：运行期配置（代理 PROXY 子对象等），自动生成不入库
+- `wechat_bark_config.json`：微信 Bark 转发配置（含 Device Key），自动生成不入库
+- 日志：`logs/app.log`（后端，5MB 滚动×3）、`watchdog.log`
 
 ## Important Coding Guidelines
+
 - 当我提和重构相关的需求的时候，需要严格基于原本的代码以及功能进行重构，避免节外生枝
 
 ## Memory Notes
-- 始终使用中文回复
 
-# important-instruction-reminders
-Do what has been asked; nothing more, nothing less.
-NEVER create files unless they're absolutely necessary for achieving your goal.
-ALWAYS prefer editing an existing file to creating a new one.
-NEVER proactively create documentation files (*.md) or README files. Only create documentation files if explicitly requested by the User.
+- 始终使用中文回复

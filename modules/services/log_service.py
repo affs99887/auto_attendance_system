@@ -1,8 +1,7 @@
 """
-日志服务 — 抽自 modules/telegram_bot.py:546 `get_recent_errors`。
+日志服务 — 供 GUI 错误日志分页接口使用。
 
-零 Telegram 依赖：编码尝试 + 错误分组 + 分页。Telegram bot 内的 InlineKeyboard 渲染
-保留在 bot 文件中；这里只做解析。
+纯文本解析：多编码尝试读取 + 按 ERROR/CRITICAL 分组 + 分页。
 """
 import os
 import logging

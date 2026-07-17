@@ -2,29 +2,16 @@ import schedule
 import asyncio
 import logging
 import traceback
-import sys
 from datetime import datetime
 
 # 定义全局变量
-attendance_system_global = None
 last_job_check = None
 last_job_count = 0
 job_log_interval = 60  # 至少间隔60秒输出一次任务日志
 
 
-def _resolve_attendance_system():
-    """获取当前可用的 AttendanceSystem 实例。
-
-    main() 在初始化完成后把实例赋给了入口脚本（__main__）模块的
-    attendance_system_global，而非本模块命名空间，导致此前直接引用本模块的
-    attendance_system_global 恒为 None，心跳检查/跨日重置整条链路成为死代码。
-    这里优先从 __main__ 模块取实例，取不到再回退本模块全局，确保兼容。"""
-    main_module = sys.modules.get('__main__')
-    inst = getattr(main_module, 'attendance_system_global', None) if main_module else None
-    return inst if inst is not None else attendance_system_global
-
 async def run_schedule():
-    global attendance_system_global, last_job_check, last_job_count
+    global last_job_check, last_job_count
     startup_delay = True  # 启动时延迟输出详细日志
 
     while True:
@@ -81,14 +68,6 @@ async def run_schedule():
                         print(error_msg)
                         logging.error(error_msg)
                         logging.error(traceback.format_exc())
-
-            # 执行心跳检测
-            attendance_system = _resolve_attendance_system()
-            if attendance_system:
-                # 每2小时检查一次打卡状态，避免过于频繁的检查
-                current_hour = datetime.now().hour
-                if datetime.now().minute == 0 and current_hour % 2 == 0:
-                    await attendance_system.check_punch_status()
 
             await asyncio.sleep(1)
         except Exception as e:

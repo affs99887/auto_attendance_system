@@ -49,9 +49,6 @@ def python_subprocess_env():
     encoding = getattr(sys.stdout, "encoding", None)
     if encoding:
         env['PYTHONIOENCODING'] = f'{encoding}:replace'
-    # [M37 修复] 标记子进程运行在看门狗监管之下：main.py 内 restart_program 据此改用 sys.exit
-    # 让看门狗拉起新实例，而非进程内 os.execl 自重启（后者会与看门狗的重启逻辑撞车产生双实例）。
-    env['AAS_SUPERVISED'] = '1'
     return env
 
 
@@ -92,7 +89,7 @@ def is_process_running():
     watchdog 与 GUI 互斥（GUI 模式下崩溃重启由 Electron 接管，见 start.py）。
     打包态 GUI 的 main.py 位于 resources\\backend\\main.py，与源码树 watchdog 锚定的
     MAIN_SCRIPT_PATH 是不同绝对路径，仅按路径相等判断会漏检 → watchdog 误判"未运行"
-    再拉起一份无 GUI 后端的 headless main.py，造成双 Telegram bot polling 冲突 +
+    再拉起一份无 GUI 后端的 headless main.py，造成双实例定时任务重复执行 +
     共享文件竞争。故对带 '--gui' 的 main.py 放宽为仅按 basename 命中即认定在运行，
     避免看门狗与已运行的 GUI 后端撞车产生双实例。
     """
@@ -141,7 +138,7 @@ def start_main_program():
     """
     try:
         # 双重保险：若此刻已有 GUI 后端在运行，绝不再拉起 headless 实例，
-        # 避免双 Telegram bot polling 冲突 + 共享文件竞争（打包态路径不同时尤为关键）。
+        # 避免双实例定时任务重复执行 + 共享文件竞争（打包态路径不同时尤为关键）。
         if is_process_running():
             logging.info("检测到主程序(含 GUI 后端)已在运行，跳过本次启动以避免双实例")
             return True
@@ -158,46 +155,19 @@ def start_main_program():
         return False
 
 
-def send_watchdog_alert(message):
-    """看门狗自身告警：直接调用 Telegram sendMessage 通知用户。
-
-    凭据从 .env 读取（与 config 一致），不引入额外依赖。
-    任何失败都仅记日志，避免影响看门狗主流程。
-    """
-    try:
-        from dotenv import load_dotenv
-        load_dotenv(os.path.join(PROJECT_ROOT, '.env'))
-    except Exception:
-        pass
-
-    token = os.getenv('TELEGRAM_BOT_TOKEN')
-    chat_id = os.getenv('TELEGRAM_CHAT_ID')
-    if not token or not chat_id:
-        logging.error("未配置 TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID，无法发送看门狗告警")
-        return False
-    try:
-        import requests
-        resp = requests.post(
-            f"https://api.telegram.org/bot{token}/sendMessage",
-            data={'chat_id': chat_id, 'text': message},
-            timeout=10
-        )
-        if resp.status_code == 200:
-            logging.info("看门狗告警已通过 Telegram 发送")
-            return True
-        logging.error(f"看门狗告警发送失败，HTTP {resp.status_code}: {resp.text}")
-        return False
-    except Exception as e:
-        logging.error(f"看门狗告警发送异常: {str(e)}")
-        return False
-
 def main():
     setup_logging()
     logging.info("看门狗进程已启动")
     
     restart_count = 0
-    max_restarts = 5
-    restart_interval = 3600  # 1小时
+    # 重启上限/计数窗口从 config 读取，与其它配置同源；config 不可用时回退默认值
+    try:
+        from modules.config import config as _cfg
+        max_restarts = _cfg.WATCHDOG_MAX_RESTARTS
+        restart_interval = _cfg.WATCHDOG_RESTART_INTERVAL
+    except Exception:
+        max_restarts = 5
+        restart_interval = 3600  # 1小时
     last_restart = datetime.now()
     
     while True:
@@ -221,12 +191,7 @@ def main():
                     else:
                         logging.error("主程序重启失败")
                 else:
-                    logging.critical(f"重启次数过多 ({restart_count}/{max_restarts})，停止重试")
-                    # 监控链即将退出，发出 Telegram 告警避免静默死亡导致漏打卡
-                    send_watchdog_alert(
-                        f"[看门狗告警] 主程序 1 小时内重启已达 {restart_count}/{max_restarts} 次，"
-                        f"看门狗停止重试并退出，请尽快人工检查（存在漏打卡风险）。"
-                    )
+                    logging.critical(f"重启次数过多 ({restart_count}/{max_restarts})，停止重试并退出，请人工检查")
                     break
             
             # 检查系统资源使用情况

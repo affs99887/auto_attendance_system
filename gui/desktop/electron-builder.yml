@@ -1,7 +1,9 @@
-# electron-builder 配置 — 打包 Windows NSIS 安装包
+# electron-builder 配置 — 打包 Windows NSIS 安装包 + macOS dmg/zip
 #
-# 输出：<项目根>/release/AutoAttendance-Setup-<version>.exe
-#       （output 相对于本配置文件所在的 gui/desktop/，用 ../../ 指向项目根）
+# 输出（output 相对于本配置文件所在的 gui/desktop/，用 ../../ 指向项目根）：
+#   Windows: <项目根>/release/AutoAttendance-Setup-<version>-<arch>.exe
+#   macOS:   <项目根>/release/AutoAttendance-<version>-<arch>.dmg / .zip
+#            （mac 构建入口：项目根 scripts/build-mac.sh，或 gui/desktop 下 npm run dist:mac）
 # 安装后目录结构：
 #   <Install>\AutoAttendance.exe
 #   <Install>\resources\app\                     # Electron 应用（asar 已关闭，见下方 asar: false）
@@ -40,16 +42,12 @@ extraResources:
       - requirements.txt
       - .env.example
       - modules/**/*
-      - templates/**/*
       - bin/**/*            # 内置网络加速：mihomo 内核 + geo 数据（由 scripts/fetch-mihomo.ps1 准备）
-      - msedgedriver.exe    # 离线场景下 Selenium 回退用的本地 Edge 驱动（对应 selenium_login.py 的回退路径）
       - "!**/__pycache__/**"
       - "!**/*.pyc"
       - "!**/venv/**"
       - "!**/gui/**"
       - "!**/.git/**"
-      - "!**/punch_records/**"
-      - "!**/screenshots/**"
       - "!**/logs/**"
       - "!**/release/**"
 
@@ -70,6 +68,34 @@ win:
       arch: [x64]
   icon: electron/app-icon.png
   artifactName: AutoAttendance-Setup-${version}-${arch}.${ext}
+
+# ---------------------------------------------------------------------------
+# macOS 目标（dmg 装机包 + zip 免装包）
+# - 不固定 arch：默认按构建机自身架构出包；scripts/build-mac.sh 会显式传 --x64/--arm64。
+#   不用 universal（双架构合一包）：extraResources 里的 bin/mihomo 是单架构二进制，
+#   x64 与 arm64 两次构建的 resources 内容不同，universal 合并会因文件不一致而失败，
+#   分架构各出一个包最稳。
+# - extraResources 与 win 共用上面的 filter：bin/**/* 会把 bin/mihomo（mac 版内核，
+#   由 scripts/fetch-mihomo.sh 在构建前下载并 chmod +x）一并打进 resources/backend/bin/。
+# ---------------------------------------------------------------------------
+mac:
+  target:
+    - target: dmg
+    - target: zip
+  # electron-builder 能自动把 png 转成 icns，但要求源图至少 512x512。
+  # electron/app-icon.png 只有 256x256（win 沿用不动），这里指向单独准备的 512 版本；
+  # 当前 512 版本是 256 原图的放大占位，正式发布前建议换成高清源图或手工制作的 .icns。
+  icon: electron/app-icon-mac.png
+  category: public.app-category.utilities
+  artifactName: AutoAttendance-${version}-${arch}.${ext}
+  # 本地构建默认不签名：签名身份不在此写死，由 scripts/build-mac.sh 控制——
+  #   设了环境变量 AAS_MAC_CODESIGN_IDENTITY → 经 CSC_NAME 交给 electron-builder 签名；
+  #   没设 → CSC_IDENTITY_AUTO_DISCOVERY=false 跳过签名（arm64 会被自动补 ad-hoc 签名，
+  #   即"无身份的本机签名"，本机可运行，发给别人仍需右键打开或正式签名+公证）。
+  # hardened runtime（苹果的运行时加固）与公证只有正式发布才需要，本地自签证书开着反而会失败。
+  hardenedRuntime: false
+  gatekeeperAssess: false
+  notarize: false
 
 nsis:
   oneClick: false

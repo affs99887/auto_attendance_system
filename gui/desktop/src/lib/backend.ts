@@ -29,6 +29,8 @@ declare global {
       httpUrl: string;
       wsUrl: string;
     };
+    /** 运行平台标识（'darwin'/'win32'/...；纯浏览器下为 undefined） */
+    AAS_PLATFORM?: string;
     /** Electron preload 注入的窗口控制（纯浏览器下为 undefined） */
     AAS_WINDOW?: {
       minimize: () => void;
@@ -53,8 +55,6 @@ declare global {
     /** 系统能力桥（纯浏览器下为 undefined） */
     AAS_SYSTEM?: {
       openLogs: () => Promise<string>;
-      /** 用系统默认图片查看器打开本地截图原图。入参为后端返回的相对路径；resolve 空串=成功，非空=错误信息 */
-      openScreenshot: (path: string) => Promise<string>;
     };
     /** 文件选择桥（纯浏览器下为 undefined）：选本地 Clash 配置文件并读内容 */
     AAS_FILES?: {
@@ -71,23 +71,20 @@ declare global {
       getAll: () => Promise<Record<string, unknown>>;
       set: (key: string, value: unknown) => void;
     };
-    /** 墨水屏蓝牙选择桥（纯浏览器下为 undefined）：
-     *  主进程拦截 select-bluetooth-device 后把设备流实时推给渲染进程，
-     *  由页面自定义 modal 展示并回选 deviceId（空串=取消）。 */
-    AAS_EPD?: {
-      /** 订阅扫描到的设备流（name 可能为空串=无名设备），返回取消订阅函数 */
-      onDevices: (cb: (devices: Array<{ deviceId: string; deviceName: string }>) => void) => () => void;
-      /** 回选设备（deviceId 空串=取消本次请求） */
-      select: (deviceId: string) => void;
-      /** 蓝牙配对确认请求（渲染端用应用内对话框确认），返回取消订阅函数 */
-      onPairing: (cb: (req: { kind: 'confirmPin' | 'confirm'; deviceId: string; pin: string }) => void) => () => void;
-      /** 配对确认结果回传 */
-      pairingResponse: (confirmed: boolean) => void;
-      /** 方案2：请求主进程注入一次可信键盘输入(F24)产生 user activation，供渲染层在手势上下文里
-       *  调 requestDevice 自动重连(定时推送无手势场景)。resolve true=已注入 / false=不可用或失败。 */
-      tryGestureReconnect: () => Promise<boolean>;
-      /** 追加一条墨水屏日志到主进程 logs/epaper.log（防抖落盘，保留长历史；旧 preload / 纯浏览器下为 undefined） */
-      appendLog?: (line: string) => void;
+    /** 系统电源事件桥（纯浏览器下为 undefined）：订阅系统睡眠唤醒，返回取消订阅函数 */
+    AAS_POWER?: {
+      onResume: (cb: () => void) => () => void;
+    };
+    /** 微信 Bark 转发的系统级操作桥（纯浏览器下为 undefined）。
+     *  三个操作在主进程都带平台守卫：非 macOS 时打开隐私设置返回 ok:false，
+     *  登录项同步 no-op 返回 skipped:true；定位配置文件任意平台可用。 */
+    AAS_WECHAT_BARK?: {
+      /** 打开 macOS「完全磁盘访问」设置页（监听要读通知中心数据库需要该权限） */
+      openPrivacySettings: () => Promise<{ ok: boolean; reason?: string }>;
+      /** 在文件管理器中定位 wechat_bark_config.json（文件不存在时降级为打开数据目录） */
+      showConfig: () => Promise<{ ok: boolean; reason?: string }>;
+      /** 把「登录后自动启动」同步到系统登录项（仅 macOS 打包版真正生效） */
+      syncLoginItem: (enabled: boolean) => Promise<{ ok: boolean; skipped?: boolean }>;
     };
   }
 }

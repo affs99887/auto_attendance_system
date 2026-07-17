@@ -34,7 +34,7 @@ function StreamTab() {
   const [wsStatus, setWsStatus] = React.useState(wsClient.getStatus());
   React.useEffect(() => wsClient.onStatus(setWsStatus), []);
 
-  // 仅使用 store 中的真实日志（loadTail 拉取的 logs/attendance_system.log + WS log:stream 增量），不回退假数据
+  // 仅使用 store 中的真实日志（loadTail 拉取的 logs/app.log + WS log:stream 增量），不回退假数据
   const sourceLines = storeLines;
 
   const filtered = React.useMemo(() => {
@@ -133,9 +133,9 @@ function StreamTab() {
       >
         <div className="card-header">
           <div>
-            <div className="card-title">attendance_system.log</div>
+            <div className="card-title">app.log</div>
             <div className="card-sub mono">
-              logs/attendance_system.log · 虚拟滚动 (react-window)
+              logs/app.log · 虚拟滚动 (react-window)
             </div>
           </div>
           <div className="row gap-2" style={{ fontSize: 11, color: 'var(--text-muted)' }}>
@@ -178,7 +178,7 @@ function StreamTab() {
             display: 'flex', justifyContent: 'space-between',
           }}
         >
-          <span className="mono">tail -f logs/attendance_system.log · row={ROW_HEIGHT}px</span>
+          <span className="mono">tail -f logs/app.log · row={ROW_HEIGHT}px</span>
           <span>{sourceLines.length} 行 · 虚拟化已启用</span>
         </div>
       </div>

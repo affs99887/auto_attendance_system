@@ -15,7 +15,7 @@ import sys
 
 block_cipher = None
 
-# 项目根（spec 文件所在目录）
+# 执行 pyinstaller 命令时的工作目录（build_python.bat 已先 cd 到项目根）
 ROOT = os.getcwd()
 
 # 动态/隐藏依赖：很多库 PyInstaller 静态分析抓不到
@@ -27,34 +27,16 @@ hiddenimports = [
     'websockets.legacy.server',
     'flask',
     'waitress',
-    'selenium',
-    'selenium.webdriver',
-    'selenium.webdriver.edge',
-    'selenium.webdriver.edge.service',
-    'selenium.webdriver.edge.options',
-    'webdriver_manager',
-    'webdriver_manager.microsoft',
     'colorama',
     'psutil',
-    'win32api',
-    'win32con',
-    'win32gui',
-    'pyautogui',
-    'pytesseract',
-    'cv2',
-    'PIL',
-    'PIL.Image',
-    'numpy',
     'dotenv',
-    'telegram',
-    'telegram.ext',
-    'pyperclip',
     'requests',
+    'yaml',
+    'zoneinfo',
+    'tzdata',
 ]
 
-# 资源文件：templates 目录的 PNG 模板，运行时图像匹配用
 datas = [
-    ('templates', 'templates'),  # 整个 templates/ 目录复制进去
     ('.env.example', '.') if os.path.exists('.env.example') else None,
 ]
 datas = [d for d in datas if d is not None]

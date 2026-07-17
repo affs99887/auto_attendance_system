@@ -128,21 +128,11 @@ def request_get_with_local_proxy_fallback(service_key, url, **kwargs):
         _close_proxy_request_circuit(service_key, generation)
         return response
 
-# Telegram 走代理的规则（订阅模式自生成；仅域名/IP，不依赖 geo 数据库）
-_TELEGRAM_RULES = [
-    'DOMAIN-SUFFIX,telegram.org,{group}',
-    'DOMAIN-SUFFIX,t.me,{group}',
-    'DOMAIN-SUFFIX,telegram.me,{group}',
-    'DOMAIN-SUFFIX,telegram.dog,{group}',
-    'DOMAIN-SUFFIX,tdesktop.com,{group}',
-    'IP-CIDR,149.154.160.0/20,{group},no-resolve',
-    'IP-CIDR,91.108.4.0/22,{group},no-resolve',
-    'IP-CIDR,91.108.8.0/22,{group},no-resolve',
-    'IP-CIDR,91.108.12.0/22,{group},no-resolve',
-    'IP-CIDR,91.108.16.0/22,{group},no-resolve',
-    'IP-CIDR,91.108.56.0/22,{group},no-resolve',
-    'IP-CIDR,95.161.64.0/20,{group},no-resolve',
-    'MATCH,DIRECT',
+# 订阅模式自生成配置的分流规则：全部流量走所选节点。
+# 这个本地端口只有本程序自己的请求会进来（allow-lan:false + 各服务显式指定代理），
+# 不会影响系统其他程序；粘贴模式则完全尊重用户配置里自带的规则。
+_DEFAULT_RULES = [
+    'MATCH,{group}',
 ]
 
 _HEALTH_URL = 'https://www.gstatic.com/generate_204'
@@ -261,7 +251,7 @@ class ProxyManager:
         # 二进制 + geo 源库）在此，跟代码走，故用 __file__ 推导。
         self.code_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
         # 数据根：proxy_runtime（config.yaml / profiles 用户粘贴的配置 / mihomo.log / pid / 缓存）
-        # 属"可写用户数据"，必须与 config.py 读 dynamic_config.json、punch_records/logs 等同根 → 用 cwd。
+        # 属"可写用户数据"，必须与 config.py 读 dynamic_config.json、logs 等同根 → 用 cwd。
         # 打包后 main.cjs 以 cwd=DATA_DIR(真实数据树) 拉起后端；若这里仍用 __file__ 落到只读的
         # resources/backend/proxy_runtime（其 profiles/ 为空），打包版会读不到用户的本地代理配置而抛
         # "尚未提供 Clash 配置文本"，导致 mihomo 永远起不来、本地代理端口无人监听 → 全程"断网"。
@@ -494,7 +484,7 @@ class ProxyManager:
             "      - AAS",
             "rules:",
         ]
-        for r in _TELEGRAM_RULES:
+        for r in _DEFAULT_RULES:
             lines.append(f"  - {r.format(group=group)}")
         return "\n".join(lines) + "\n"
 
@@ -573,8 +563,17 @@ class ProxyManager:
                 )
                 text = (out.stdout or b'').decode('utf-8', errors='replace').lower()
                 return exe.lower() in text
+            elif platform.system() == 'Darwin':
+                # macOS 没有 /proc 文件系统，改用 ps 查该 PID 的可执行路径；
+                # 不存在的 PID 时 ps 输出为空，startswith 自然返回 False
+                out = subprocess.run(
+                    ['ps', '-p', str(pid), '-o', 'comm='],
+                    capture_output=True, timeout=8,
+                )
+                text = (out.stdout or b'').decode('utf-8', errors='replace').strip()
+                return os.path.basename(text).startswith(exe)
             else:
-                # 用 /proc/<pid>/comm 读进程名（comm 可能被截断，故用 startswith 容错）
+                # Linux：用 /proc/<pid>/comm 读进程名（comm 可能被截断，故用 startswith 容错）
                 with open(f'/proc/{pid}/comm', 'r') as f:
                     return f.read().strip().startswith(exe)
         except Exception:
@@ -776,10 +775,8 @@ class ProxyManager:
 
     # ------------------------------------------------------------------ 健康巡检 / 自动重启
     # [M41] mihomo 子进程无健康监控时，进程一旦退出（崩溃/被安全软件杀/唤醒后异常），
-    # config.get_telegram_proxy() 仍"绝不回退"地返回死端口 URL，telegram_bot.monitor_connection
-    # 探测失败→restart_polling→重新 build 仍指向死端口的 app→指数退避永久失败循环，
-    # 打卡通知/远程控制/截图推送全部瘫痪。这里加一个周期性巡检协程，启用代理时主动发现进程
-    # 死亡并限频自动重启 mihomo，使 Telegram 全链路能随之恢复。
+    # 本地代理端口就无人监听：走代理的后台请求全部回退直连，GUI 里的加速形同关闭且不会自愈。
+    # 这里加一个周期性巡检协程，启用代理时主动发现进程死亡并限频自动重启 mihomo。
     async def watchdog(self, interval=30):
         """周期性巡检 mihomo 进程，启用代理且进程已死时限频自动重启。
 

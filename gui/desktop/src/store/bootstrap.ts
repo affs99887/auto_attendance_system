@@ -11,20 +11,18 @@ import { wsClient } from '../lib/ws';
 import { api } from '../lib/api';
 import { useSystemStore } from './system';
 import { useLogsStore } from './logs';
-import { usePunchStore } from './punch';
 import { useStartupStore } from './startup';
 import { useToastStore } from './toast';
 import { useProxyStore } from './proxy';
 import { useExchangeRateStore } from './exchangeRate';
-import { useAiNewsStore } from './aiNews';
 import { useWeatherStore } from './weather';
 import { DEFAULT_WEATHER_LOCATION } from '../lib/weatherLocations';
 import { useStartupLogStore } from './startupLog';
 import { useServiceStore } from './service';
+import { useWechatBarkStore } from './wechatBark';
 
 const REFRESH_INTERVAL_MS = 15_000;
 const FX_REFRESH_INTERVAL_MS = 5 * 60_000; // 汇率轮询：5 分钟
-const AI_NEWS_REFRESH_INTERVAL_MS = 15 * 60_000; // AI 资讯轮询：15 分钟
 const WEATHER_REFRESH_INTERVAL_MS = 15 * 60_000; // 天气轮询：15 分钟
 const PING_INTERVAL_MS = 400;
 const READY_TIMEOUT_MS = 35_000;
@@ -197,10 +195,7 @@ export function useBackendBootstrap() {
     // 汇率首屏拉取（FxSection 自身不触发首拉；WS exchange_rate:update 仅增量更新 resp.latest，
     // resp 为 null 时 applyWsUpdate 会 no-op，故这里负责拉到首份序列）
     void useExchangeRateStore.getState().refresh();
-    // AI 资讯首屏拉取（NewsScreen 自身不触发首拉；WS ai_news:update 仅触发重拉，
-    // 首份缓存由这里负责拉到）
-    void useAiNewsStore.getState().refresh();
-    // 天气首屏拉取；与 AI 资讯一样由统一 bootstrap 管理轮询和窗口恢复补刷。
+    // 天气首屏拉取；由统一 bootstrap 管理轮询和窗口恢复补刷。
     refreshWeatherTargets();
 
     const refreshTimer = window.setInterval(() => {
@@ -212,34 +207,6 @@ export function useBackendBootstrap() {
       void useExchangeRateStore.getState().refresh();
     }, FX_REFRESH_INTERVAL_MS);
 
-    // AI 资讯自动补刷：遍历"尝试过至少一次"的视图——拉成功过（lastFetched 非空）或
-    // 失败留有 error 的都算；失败视图不纳入的话，冷启动首拉失败后 WS 推送/轮询都救不回它。
-    // 从未碰过的视图跳过；用户已"加载更多"的跳过（避免缩回首屏丢滚动位置）。
-    // 串行逐个刷：除缺省视图外多数会过后端 600 秒 TTL 真回源一次，并发发出去会
-    // 同时占满后端工作线程；串行一次只占一个，上游故障时不拖慢打卡等其他接口。
-    let aiNewsSweeping = false;
-    const refreshAiNewsViews = () => {
-      if (aiNewsSweeping) return;
-      aiNewsSweeping = true;
-      void (async () => {
-        try {
-          const keys = Object.entries(useAiNewsStore.getState().cats)
-            .filter(([, st]) => (st.lastFetched !== null || st.error !== null) && !st.loadedMore)
-            .map(([key]) => key);
-          for (const key of keys) {
-            const st = useAiNewsStore.getState().cats[key];
-            if (!st || st.loading || st.loadedMore) continue;
-            await useAiNewsStore.getState().refresh(key);
-          }
-        } finally {
-          aiNewsSweeping = false;
-        }
-      })();
-    };
-
-    // AI 资讯 15 分钟轮询（与上述轮询同期生命周期，cleanup 一并清理）；
-    // 用户已"加载更多"的视图跳过，避免把列表缩回首屏 / 丢失滚动位置
-    const aiNewsTimer = window.setInterval(refreshAiNewsViews, AI_NEWS_REFRESH_INTERVAL_MS);
     const weatherRefreshTimer = window.setInterval(() => {
       refreshWeatherTargets();
     }, WEATHER_REFRESH_INTERVAL_MS);
@@ -253,7 +220,6 @@ export function useBackendBootstrap() {
       resumeRefreshTimer = window.setTimeout(() => {
         resumeRefreshTimer = null;
         void useExchangeRateStore.getState().refresh();
-        refreshAiNewsViews();
         refreshWeatherTargets();
       }, 200);
     };
@@ -269,8 +235,8 @@ export function useBackendBootstrap() {
     const unsubs: Array<() => void> = [];
 
     // 断线重连补偿：onStatus 在每次状态变化时回调（订阅时也会先回放当前状态）。
-    // 断线期间错过的 status:update / log:stream 推送只能靠这里追回——
-    //   refresh() 立即校正 current_operation（避免 LegacyModeOverlay 滞后至多 15s 才出现/消失）；
+    // 断线期间错过的 log:stream 推送与系统状态变化只能靠这里追回——
+    //   refresh() 立即拉回最新系统快照；
     //   loadTail(500) 重拉日志尾部填补断流期的空洞（在途流式行由 loadTail 内部合并保留）。
     // 仅在"已建立过一次 open 之后又重新 open"时补刷，首连不触发（首连已由上方 refresh/loadTail 覆盖）。
     let everOpened = false;
@@ -292,23 +258,6 @@ export function useBackendBootstrap() {
       }
     }));
 
-    unsubs.push(wsClient.subscribe('punch:progress', data => {
-      const d = data as { title?: string; content?: string; message?: string };
-      usePunchStore.getState().push({
-        title: d?.title ?? '',
-        content: d?.content ?? '',
-        message: d?.message,
-      });
-    }));
-
-    unsubs.push(wsClient.subscribe('status:update', () => {
-      void useSystemStore.getState().refresh();
-    }));
-
-    unsubs.push(wsClient.subscribe('task:changed', () => {
-      void useSystemStore.getState().refresh();
-    }));
-
     unsubs.push(wsClient.subscribe('proxy:status', () => {
       void useProxyStore.getState().refreshConfig();
       void useProxyStore.getState().refreshProfiles();
@@ -322,20 +271,35 @@ export function useBackendBootstrap() {
       }
     }));
 
-    // AI 资讯更新推送：重拉所有尝试过的视图。后端定时任务只刷新缺省桶，
-    // 缺省视图能命中新缓存，其余视图过了 TTL 会各自回源一次（refreshAiNewsViews 已做串行限流）
-    unsubs.push(wsClient.subscribe('ai_news:update', () => {
-      refreshAiNewsViews();
+    // 微信 Bark 转发：状态推送（不含日志）驱动仪表盘卡片与独立页；日志走单独频道增量追加
+    unsubs.push(wsClient.subscribe('wechat_bark:status', data => {
+      useWechatBarkStore.getState().applyWsStatus(
+        data as { running?: boolean; stopping?: boolean; platform_supported?: boolean; config_path?: string },
+      );
     }));
+
+    unsubs.push(wsClient.subscribe('wechat_bark:log', data => {
+      const d = data as { lines?: string[] };
+      if (Array.isArray(d?.lines)) useWechatBarkStore.getState().appendLogs(d.lines);
+    }));
+
+    // 系统唤醒补刷（Electron powerMonitor resume 经 preload AAS_POWER 转发）：
+    // 睡眠期间上面的轮询定时器全部停摆，唤醒后立即补一轮系统快照 + 汇率 + 天气，
+    // 不用等各自的下个轮询周期
+    const offResume = window.AAS_POWER?.onResume(() => {
+      void useSystemStore.getState().refresh();
+      void useExchangeRateStore.getState().refresh();
+      refreshWeatherTargets();
+    });
 
     return () => {
       window.clearInterval(refreshTimer);
       window.clearInterval(fxRefreshTimer);
-      window.clearInterval(aiNewsTimer);
       window.clearInterval(weatherRefreshTimer);
       if (resumeRefreshTimer !== null) window.clearTimeout(resumeRefreshTimer);
       document.removeEventListener('visibilitychange', onVisible);
       window.removeEventListener('focus', onFocus);
+      offResume?.();
       unsubs.forEach(fn => fn());
       wsClient.stop();
     };

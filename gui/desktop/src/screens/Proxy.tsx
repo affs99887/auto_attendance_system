@@ -322,7 +322,7 @@ export function ProxyScreen() {
         <div className="card-header">
           <div className="col">
             <div className="card-title">网络加速（仅本程序）</div>
-            <div className="card-sub">内置 mihomo · 仅代理本程序的 Telegram、AI 资讯、汇率、天气等联网功能，不影响系统其它网络</div>
+            <div className="card-sub">内置 mihomo · 仅代理本程序的汇率、天气等联网功能，不影响系统其它网络</div>
           </div>
           <div
             className={`toggle ${enabled ? 'on' : ''}`}

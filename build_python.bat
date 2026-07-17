@@ -33,7 +33,7 @@ echo Output: %CD%\dist\main\main.exe
 echo Size:
 dir dist\main | findstr "File(s)"
 echo.
-echo Next: 双击 dist\main\main.exe 验证能跑起来 (会走 watchdog 模式)
+echo Next: 双击 dist\main\main.exe 验证能跑起来 (直接控制台模式)
 echo 或者运行: dist\main\main.exe --gui  ^(GUI 模式^)
 
 endlocal

@@ -35,30 +35,11 @@ export const Icon = {
       <rect x="9" y="7" width="5.5" height="7.5" rx="1" />
     </>,
   ),
-  Punch: makeIcon(
-    <>
-      <circle cx="8" cy="8" r="6" />
-      <path d="M8 4.5V8l2.2 2.2" />
-    </>,
-  ),
   Records: makeIcon(
     <>
       <rect x="2" y="3" width="12" height="11" rx="1.5" />
       <path d="M5 1.5v3M11 1.5v3M2 6.5h12" />
       <path d="M5 9h2M9 9h2M5 11.5h2" />
-    </>,
-  ),
-  Camera: makeIcon(
-    <>
-      <rect x="1.5" y="4" width="13" height="9" rx="1.5" />
-      <path d="M5.5 4l1-1.5h3l1 1.5" />
-      <circle cx="8" cy="8.5" r="2.5" />
-    </>,
-  ),
-  Tasks: makeIcon(
-    <>
-      <rect x="1.5" y="2.5" width="13" height="11" rx="1.5" />
-      <path d="M4 6h8M4 9h8M4 12h5" />
     </>,
   ),
   Logs: makeIcon(
@@ -81,34 +62,6 @@ export const Icon = {
     </>,
   ),
   Play: makeIcon(<path d="M4 3l8 5-8 5V3z" fill="currentColor" stroke="none" />),
-  Stop: makeIcon(<rect x="3.5" y="3.5" width="9" height="9" rx="1" fill="currentColor" stroke="none" />),
-  Bot: makeIcon(
-    <>
-      <rect x="2.5" y="4" width="11" height="9" rx="2" />
-      <circle cx="6" cy="8" r="0.8" fill="currentColor" />
-      <circle cx="10" cy="8" r="0.8" fill="currentColor" />
-      <path d="M6.5 11h3M8 1.5v2.5" />
-    </>,
-  ),
-  Mail: makeIcon(
-    <>
-      <rect x="1.5" y="3" width="13" height="10" rx="1.5" />
-      <path d="M2 4.5l6 5 6-5" />
-    </>,
-  ),
-  User: makeIcon(
-    <>
-      <circle cx="8" cy="5.5" r="2.5" />
-      <path d="M3 14c0-2.5 2.2-4.5 5-4.5s5 2 5 4.5" />
-    </>,
-  ),
-  Users: makeIcon(
-    <>
-      <circle cx="6" cy="5.5" r="2.2" />
-      <circle cx="11.5" cy="6" r="1.8" />
-      <path d="M2 13.5c0-2 1.8-3.7 4-3.7s4 1.7 4 3.7M10 13.5c0-1.6 1.3-2.9 2.5-2.9" />
-    </>,
-  ),
   Clock: makeIcon(
     <>
       <circle cx="8" cy="8" r="6.5" />
@@ -184,58 +137,16 @@ export const Icon = {
   Cloud: makeIcon(
     <path d="M4.5 12.5a3 3 0 0 1-.5-6 4 4 0 0 1 7.7.5 2.8 2.8 0 0 1 .3 5.5z" />,
   ),
-  Epaper: makeIcon(
-    <>
-      <rect x="2" y="2" width="12" height="12" rx="1.5" />
-      <path d="M4.5 5h7M4.5 8h5M4.5 11h7" />
-    </>,
-  ),
-  Bluetooth: makeIcon(<path d="M4.5 5L11.5 11L8 14L8 2L11.5 5L4.5 11" />),
-  Brush: makeIcon(
-    <>
-      <path d="M11 2.5l2.5 2.5L6 12.5L3 13l.5-3z" />
-      <path d="M9.5 4l2.5 2.5" />
-    </>,
-  ),
-  Eraser: makeIcon(
-    <>
-      <path d="M3.5 10.5l5-5 4 4-3.5 3.5H6z" />
-      <path d="M5.5 13.5H13" />
-    </>,
-  ),
-  TextTool: makeIcon(<path d="M3.5 4V3h9v1M8 3v10M6.5 13h3" />),
-  Archive: makeIcon(
-    <>
-      <rect x="1.5" y="2.5" width="13" height="3.5" rx="1" />
-      <path d="M2.5 6v6.5a1 1 0 0 0 1 1h9a1 1 0 0 0 1-1V6" />
-      <path d="M6.5 9h3" />
-    </>,
-  ),
-  Undo: makeIcon(
-    <>
-      <path d="M5 6H9.8a3.2 3.2 0 1 1 0 6.4H6" />
-      <path d="M5 6l2.5-2.3M5 6l2.5 2.3" />
-    </>,
-  ),
-  Redo: makeIcon(
-    <>
-      <path d="M11 6H6.2a3.2 3.2 0 1 0 0 6.4H10" />
-      <path d="M11 6L8.5 3.7M11 6L8.5 8.3" />
-    </>,
-  ),
-  Send: makeIcon(<path d="M14 2L7 9M14 2l-4.5 12-2.5-5-5-2.5L14 2z" />),
   AlertTriangle: makeIcon(
     <>
       <path d="M8 1.5l6.5 11.5H1.5z" />
       <path d="M8 6.5v3M8 11.2h.01" />
     </>,
   ),
-  Sparkle: makeIcon(<path d="M8 2l1.4 4.2L13.5 8l-4.1 1.4L8 14l-1.4-4.6L2.5 8l4.1-1.8L8 2z" />),
-  External: makeIcon(
+  Bell: makeIcon(
     <>
-      <path d="M6.5 3.5H3.5v9h9v-3" />
-      <path d="M9.5 3.5h3v3" />
-      <path d="M12.5 3.5l-5.5 5.5" />
+      <path d="M8 2a4.2 4.2 0 0 1 4.2 4.2v2.6l1.3 2.4H2.5l1.3-2.4V6.2A4.2 4.2 0 0 1 8 2z" />
+      <path d="M6.6 13.2a1.5 1.5 0 0 0 2.8 0" />
     </>,
   ),
   Minus: makeIcon(<path d="M3 8h10" />),

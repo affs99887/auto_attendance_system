@@ -4,7 +4,7 @@ Web 服务模块 — 为 GUI（Electron）提供 REST + WebSocket 接口
 设计要点：
 - Flask + waitress 在 daemon 线程运行（同步），处理 REST 请求
 - websockets server 在主 asyncio 事件循环（异步），处理实时推送
-- 共用 AttendanceSystem 单例（线程↔loop 通信走 run_coroutine_threadsafe）
+- 共用 AppCore 单例（线程↔loop 通信走 run_coroutine_threadsafe）
 - event_bus 是 pub/sub，每个 WS 连接订阅一个独立 asyncio.Queue
 - Bearer token 鉴权（启动时生成、写入 logs/.gui_token）
 - 仅监听 127.0.0.1
@@ -32,7 +32,7 @@ from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeou
 from typing import Any, Optional, Set
 from urllib.parse import quote, urlencode
 
-from flask import Flask, request, jsonify, send_file
+from flask import Flask, request, jsonify
 import waitress
 
 try:
@@ -45,23 +45,16 @@ else:
 
 
 TOKEN_FILE = os.path.join('logs', '.gui_token')
-LOG_FILE = os.path.join('logs', 'attendance_system.log')
+LOG_FILE = os.path.join('logs', 'app.log')
 
 # 允许通过 PATCH /api/v1/config 写入 .env 的字段白名单
-# （登录账号/Telegram token 等敏感字段也允许，但客户端需有 token 才能写）
+# （敏感字段也允许写，但客户端需有 token 才能写；新业务的环境变量在这里登记后前端才可写）
 ENV_WRITE_WHITELIST = {
-    'LOGIN_USERNAME', 'LOGIN_PASSWORD', 'LOGIN_USERNAME2', 'LOGIN_PASSWORD2', 'LOGIN_URL',
-    'TELEGRAM_BOT_TOKEN', 'TELEGRAM_CHAT_ID',
-    'EMAIL_SENDER', 'EMAIL_PASSWORD', 'EMAIL_SMTP_SERVER', 'EMAIL_SMTP_PORT', 'EMAIL_RECIPIENTS',
-    'TESSERACT_PATH',
-    'WORK_START_TIME', 'WORK_END_TIME', 'LATE_THRESHOLD', 'EARLY_LEAVE_THRESHOLD',
-    'DAILY_STATUS_TIME',
     'CAIYUN_WEATHER_APP_KEY', 'CAIYUN_WEATHER_APP_SECRET', 'CAIYUN_WEATHER_TOKEN',
 }
 
 # 返回给前端 GET /api/v1/config/all 时遮罩的敏感字段
 ENV_SENSITIVE_FIELDS = {
-    'LOGIN_PASSWORD', 'LOGIN_PASSWORD2', 'TELEGRAM_BOT_TOKEN', 'EMAIL_PASSWORD',
     'CAIYUN_WEATHER_APP_KEY', 'CAIYUN_WEATHER_APP_SECRET', 'CAIYUN_WEATHER_TOKEN',
 }
 
@@ -112,6 +105,10 @@ class EventBus:
 # ----------------------------------------------------------------------------
 
 class AsyncioBridge:
+    """底座预留脚手架：同步 Flask 路由需要调主 loop 协程时用 bridge.call 投递。
+    当前保留的路由都是纯同步实现，暂无调用方；定制新功能需要跨线程进事件循环时直接用它。
+    """
+
     def __init__(self, loop: asyncio.AbstractEventLoop):
         self._loop = loop
 
@@ -120,9 +117,9 @@ class AsyncioBridge:
         try:
             return fut.result(timeout=timeout)
         except FuturesTimeoutError:
-            # 超时后必须取消 future，否则协程仍排在（可能被同步 Selenium 阻塞的）事件
-            # 循环里等待执行：HTTP 已报错返回，几分钟后循环解锁却仍会真正打卡，
-            # 形成用户不知情的"幽灵打卡"。打卡类不可幂等操作尤其需要在此切断。
+            # 超时后必须取消 future，否则协程仍排在事件循环里等待执行：
+            # HTTP 已报错返回，循环空闲后却仍会真正执行，形成调用方不知情的"幽灵操作"。
+            # 不可幂等的写操作尤其需要在此切断。
             fut.cancel()
             raise
 
@@ -134,8 +131,8 @@ class AsyncioBridge:
 def _restrict_token_acl(path: str) -> None:
     """[M72 修复] 收紧 token 文件 ACL，使同机其它账户无法读取。
 
-    os.chmod(path, 0o600) 在 Windows 上只切换只读位、完全不影响 ACL —— 项目位于
-    C:\\auto_attendance_system（非用户 profile），logs\\.gui_token 继承的默认 ACL 通常允许
+    os.chmod(path, 0o600) 在 Windows 上只切换只读位、完全不影响 ACL —— 项目目录若不在
+    用户 profile 之下，logs\\.gui_token 继承的默认 ACL 通常允许
     本机所有用户读取，拿到 token 即可调 PATCH /api/v1/config 改写 .env 凭据。故在 Windows 下
     用内置 icacls 断继承并仅授予当前用户完全控制（icacls 始终随系统存在，不依赖 pywin32，
     与项目"无 pywin32 也能跑"的约束一致）。非 Windows 维持 chmod 0600 即可。
@@ -778,7 +775,7 @@ async def _log_follower(event_bus: EventBus, stop_event: asyncio.Event):
 # Flask app
 # ----------------------------------------------------------------------------
 
-def _build_flask_app(attendance_system, bridge: AsyncioBridge,
+def _build_flask_app(app_core, bridge: AsyncioBridge,
                      event_bus: EventBus, token: str) -> Flask:
     app = Flask(__name__)
     require_token = _make_require_token(token)
@@ -788,7 +785,7 @@ def _build_flask_app(attendance_system, bridge: AsyncioBridge,
     # 任意外部网页 JS 都能跨源读取本机服务响应、探测服务存在。改为按 Origin 白名单回显：
     # 仅放行 Electron 渲染进程的来源——生产 file://（fetch 时 Origin 为字面量 'null'）、
     # 开发 Vite http://localhost:* / http://127.0.0.1:*。非白名单 Origin 不回显 ACAO，浏览器即拦下
-    # 跨源读取。无 Origin 头的请求（同源资源加载、非浏览器调用，如截图 <img>）不受影响。
+    # 跨源读取。无 Origin 头的请求（同源资源加载、非浏览器调用）不受影响。
     def _origin_allowed(origin: str) -> bool:
         if not origin:
             return False
@@ -826,7 +823,7 @@ def _build_flask_app(attendance_system, bridge: AsyncioBridge,
     @require_token
     def get_status():
         try:
-            snap = attendance_system.get_status_snapshot()
+            snap = app_core.get_status_snapshot()
             return jsonify(snap)
         except Exception as e:
             logging.exception("get_status failed")
@@ -847,176 +844,6 @@ def _build_flask_app(attendance_system, bridge: AsyncioBridge,
         except Exception as e:
             logging.exception("logs tail failed")
             return jsonify({'error': str(e)}), 500
-
-    def _abort_launched_punch(reason: str):
-        """[M23 修复] 打卡接口 bridge.call 超时后，强行中断"可能已被派出"的打卡子任务。
-
-        bridge.call 超时只会 fut.cancel() 父 future，但 start_punch_operation 在锁空闲时
-        其 prologue 会跑完并 create_task 出一个 detached 的 punch_in/out_internal 子任务——
-        该子任务不受父 future 取消影响，会在循环解锁后照常完成打卡，形成用户已见 500、
-        实际仍打卡的"幽灵打卡"。这里复用 operation_stop 的强停路径切断真实执行：
-        (1) force_stop_operation 同步置 _cancel_flag 并 quit 活跃 driver（内部各打卡分支在
-            checkpoint 检查 _is_cancelled→_cancel_flag 即会中止）；
-        (2) call_soon_threadsafe 置 operation_cancel_event 覆盖 driver 尚未创建的窗口；
-        (3) 排清理状态到主循环，不 .result() 干等。
-        """
-        try:
-            attendance_system.force_stop_operation()
-        except Exception:
-            logging.exception("_abort_launched_punch force_stop 失败")
-        ev = getattr(attendance_system, 'operation_cancel_event', None)
-        if ev is not None:
-            try:
-                bridge._loop.call_soon_threadsafe(ev.set)
-            except Exception:
-                logging.exception("_abort_launched_punch call_soon_threadsafe(ev.set) 失败")
-        try:
-            asyncio.run_coroutine_threadsafe(
-                attendance_system._cleanup_operation_state(), bridge._loop
-            )
-        except Exception:
-            logging.exception("_abort_launched_punch schedule _cleanup_operation_state 失败")
-        logging.warning("打卡接口超时已中断可能派出的打卡子任务：%s", reason)
-
-    @app.post('/api/v1/punch/in')
-    @require_token
-    def punch_in():
-        body = request.get_json(silent=True) or {}
-        username = body.get('username')
-        try:
-            ok, msg = bridge.call(
-                attendance_system.start_punch_operation('punch_in', username),
-                timeout=15,
-            )
-            return jsonify({'success': bool(ok), 'message': msg})
-        except FuturesTimeoutError:
-            # [M23 修复] 超时不仅 fut.cancel()（bridge 内已做），还要切断已 detach 的打卡子任务，
-            # 否则循环解锁后仍会真正打卡（不可幂等）。
-            _abort_launched_punch('punch_in 15s 超时')
-            return jsonify({'success': False, 'error': '打卡请求超时，已尝试中断本次打卡'}), 500
-        except Exception as e:
-            logging.exception("punch_in failed")
-            return jsonify({'success': False, 'error': str(e)}), 500
-
-    @app.post('/api/v1/punch/out')
-    @require_token
-    def punch_out():
-        body = request.get_json(silent=True) or {}
-        username = body.get('username')
-        try:
-            ok, msg = bridge.call(
-                attendance_system.start_punch_operation('punch_out', username),
-                timeout=15,
-            )
-            return jsonify({'success': bool(ok), 'message': msg})
-        except FuturesTimeoutError:
-            # [M23 修复] 同 punch_in：超时切断已 detach 的下班打卡子任务，避免幽灵下班卡/迟到生效。
-            _abort_launched_punch('punch_out 15s 超时')
-            return jsonify({'success': False, 'error': '打卡请求超时，已尝试中断本次打卡'}), 500
-        except Exception as e:
-            logging.exception("punch_out failed")
-            return jsonify({'success': False, 'error': str(e)}), 500
-
-    @app.post('/api/v1/operation/stop')
-    @require_token
-    def operation_stop():
-        try:
-            # (1) Flask 线程内同步强停：立即 quit 活跃 driver，打断主循环里阻塞的 selenium 调用。
-            #     不再 bridge.call(cancel_current_operation(),15s) —— 那会把协程排进已被阻塞的循环，干等超时。
-            had_op, closed = attendance_system.force_stop_operation()
-            # (2) 兜底：用线程安全方式设 asyncio 取消事件，覆盖 driver 尚未创建的窗口。
-            ev = getattr(attendance_system, 'operation_cancel_event', None)
-            if ev is not None:
-                try:
-                    bridge._loop.call_soon_threadsafe(ev.set)
-                except Exception:
-                    logging.exception("call_soon_threadsafe(ev.set) 失败")
-            # (3) 排状态清理到主循环（driver quit 后循环很快解锁），不 .result() 干等。
-            try:
-                asyncio.run_coroutine_threadsafe(
-                    attendance_system._cleanup_operation_state(), bridge._loop
-                )
-            except Exception:
-                logging.exception("schedule _cleanup_operation_state 失败")
-            msg = (f"已强制停止（关闭 {closed} 个 driver）" if had_op else "当前没有进行中的操作")
-            return jsonify({'success': True, 'message': msg, 'closed': closed})
-        except Exception as e:
-            logging.exception("operation_stop failed")
-            return jsonify({'success': False, 'error': str(e)}), 500
-
-    @app.get('/api/v1/config/mode')
-    @require_token
-    def get_mode():
-        from modules.config import config as cfg
-        return jsonify({
-            'use_selenium_login': cfg.get_use_selenium_login(),
-            'selenium_headless': cfg.get_selenium_headless(),
-        })
-
-    @app.put('/api/v1/config/mode')
-    @require_token
-    def put_mode():
-        body = request.get_json(silent=True) or {}
-        patch = {}
-        if 'use_selenium_login' in body:
-            patch['USE_SELENIUM_LOGIN'] = bool(body['use_selenium_login'])
-        if 'selenium_headless' in body:
-            patch['SELENIUM_HEADLESS'] = bool(body['selenium_headless'])
-        try:
-            updated = attendance_system.update_dynamic_config(patch)
-            return jsonify({'success': True, 'config': updated})
-        except Exception as e:
-            logging.exception("put_mode failed")
-            return jsonify({'success': False, 'error': str(e)}), 500
-
-    @app.get('/api/v1/tasks')
-    @require_token
-    def list_tasks():
-        return jsonify({'tasks': attendance_system.task_manager.get_tasks()})
-
-    @app.delete('/api/v1/tasks/<int:task_id>')
-    @require_token
-    def del_task(task_id):
-        # 删除前先取类型，用于同步取消对应 schedule job（仅删 JSON 记录的话，
-        # 已注册的 job 仍会到点触发一次才靠存在性校验自删，期间可能在错误时间打卡）。
-        task = attendance_system.task_manager.get_task_by_id(task_id)
-        ptype = (task or {}).get('type')
-        ok = attendance_system.task_manager.remove_task_by_id(task_id)
-        # [M24/M35 修复] 按类型清除对应 tag 的 schedule job。注意：同一 type='punch_out' 的任务
-        # 可能由两条路径注册，tag 不同——schedule_punch_out 用 'punch_out_scheduled'，而
-        # schedule_retry_punch_out（下班重试）用 'punch_out_retry'。若只清 'punch_out_scheduled'，
-        # 重试 job（其内部 punch_out_job 无任务存在性校验，直接 await punch_out）在用户删除任务后
-        # 仍会到点打下班卡。故删除 punch_out 任务时两 tag 一并清。
-        type_tags = {
-            'punch_in': ('punch_in_scheduled',),
-            'punch_out': ('punch_out_scheduled', 'punch_out_retry'),
-        }.get(ptype, ())
-        # [M35 修复] Telegram _schedule_punch 创建的 job 除类型 tag 外还带 per-task tag
-        # 'task_{id}'。这里按本任务 id 精准清掉对应 job，既覆盖 Telegram 任务，又避免仅按
-        # 类型 tag 清除时误伤同类型但用户未删除的其它 job（schedule.clear 对不存在的 tag 是 no-op）。
-        all_tags = type_tags + (f'task_{task_id}',)
-        if ok and all_tags:
-            import schedule
-            # schedule 作业运行在主 loop，用 call_soon_threadsafe 投递清除，避免与 loop 迭代 jobs 竞态。
-            try:
-                bridge._loop.call_soon_threadsafe(
-                    lambda ts=all_tags: [schedule.clear(t) for t in ts]
-                )
-            except Exception:
-                logging.exception("del_task 取消 schedule job 失败")
-        event_bus.publish_threadsafe('task:changed', {'op': 'delete', 'id': task_id})
-        return jsonify({'success': bool(ok), 'task_id': task_id})
-
-    @app.get('/api/v1/users')
-    @require_token
-    def list_users():
-        users = []
-        for u in attendance_system.users:
-            users.append({
-                'username': u.get('username'),
-                'env_key': u.get('env_key'),
-            })
-        return jsonify({'users': users})
 
     # ----- 彩云天气（固定地址可直接传入，避免额外调用逆地理编码）-----
     @app.post('/api/v1/weather')
@@ -1081,75 +908,7 @@ def _build_flask_app(attendance_system, bridge: AsyncioBridge,
                 'updated_at': None, 'latest': None, 'points': [],
             })
 
-    # ----- AI 资讯（AI HOT 精选）-----
-    @app.get('/api/v1/ai-news')
-    @require_token
-    def get_ai_news():
-        """返回 AI HOT 精选资讯契约（updated_at + count + items + next_cursor + has_next）。
-
-        query:
-          - force=0|1（1 跳过 TTL 立即拉，仅首屏有效）；
-          - cursor=<base64>（"加载更多"游标续拉，实时拉不走缓存）；
-          - take=N（每页条数，1..100；仅对带 cursor 的续拉生效，首屏固定 30 条、传了也会被忽略）；
-          - category=ai-models|ai-products|industry|paper|tip（按版块服务端过滤，
-            缺省 / all / 非法值均按"全部"处理）；
-          - mode=all|selected（selected 只取主编精选"只看精选"，缺省全量；可与 category 组合，
-            各视图独立一份列表/游标/缓存）。
-        首屏失败返回 200 + 旧缓存；加载更多(带 cursor)失败返回 502，便于前端重试而非误判到底。
-        """
-        force = request.args.get('force', '0') in ('1', 'true', 'True')
-        cursor = request.args.get('cursor') or None
-        category = request.args.get('category') or None
-        if category == 'all':
-            category = None
-        if category is not None:
-            # 白名单校验（与服务层清单同源）：非法版块当"全部"处理，
-            # 避免任意字符串透传上游、并在缓存文件里为每个非法值堆出一个新 bucket
-            from modules.ai_news_service import _VALID_CATEGORIES
-            if category not in _VALID_CATEGORIES:
-                category = None
-        mode = request.args.get('mode') or None
-        if mode not in ('all', 'selected'):
-            mode = None  # 非法/缺省 → 交由服务层用默认口径(all)
-        take = None
-        take_raw = request.args.get('take')
-        if take_raw:
-            try:
-                take = max(1, min(100, int(take_raw)))
-            except (TypeError, ValueError):
-                take = None
-        try:
-            from modules.ai_news_service import get_ai_news as _gan
-            return jsonify(_gan(force=force, cursor=cursor, take=take, category=category, mode=mode))
-        except Exception:
-            logging.exception("get_ai_news failed")
-            if cursor:
-                # 加载更多失败：返回 502，前端走错误分支可重试（不伪装成"到底"）
-                return jsonify({'error': 'load_more_failed'}), 502
-            # 首屏即便彻底异常也返回 200 + 空结构，避免前端报错
-            return jsonify({'updated_at': None, 'count': 0, 'items': [], 'next_cursor': None, 'has_next': False})
-
-    # ----- Claude Code 额度（墨水屏信息站）-----
-    @app.get('/api/v1/claude-usage')
-    @require_token
-    def get_claude_usage():
-        """返回本机 Claude Code 的 5h/周限额用量契约。
-
-        query: force=0|1（1 跳过 TTL 立即拉）。
-        失败也返回 200 + available:false（或旧缓存），绝不 500。
-        """
-        force = request.args.get('force', '0') in ('1', 'true', 'True')
-        try:
-            from modules.claude_usage_service import get_claude_usage as _gcu
-            return jsonify(_gcu(force=force))
-        except Exception:
-            logging.exception("get_claude_usage failed")
-            return jsonify({
-                'available': False, 'updated_at': None,
-                'five_hour': None, 'seven_day': None, 'error': '服务异常',
-            })
-
-    # ----- 日历信息（墨水屏信息站：休班标记/最近休息日/下一假期/调休补班）-----
+    # ----- 日历信息（休班标记/最近休息日/下一假期/调休补班）-----
     @app.get('/api/v1/calendar-info')
     @require_token
     def get_calendar_info():
@@ -1171,260 +930,6 @@ def _build_flask_app(attendance_system, bridge: AsyncioBridge,
                 'nearest_rest': None, 'next_holidays': [], 'next_makeup': [],
                 'workday_after': None, 'coverage_end': None,
             })
-
-    # ----- Auto byebye -----
-    @app.post('/api/v1/punch/auto_byebye/calc')
-    @require_token
-    def auto_byebye_calc():
-        """根据上班打卡时间计算下班时间。
-
-        body: ``{"username": "<可选>"}``
-        - username 缺省时遍历所有 `today_punch_records`，按上班时间排序取最早的
-        """
-        body = request.get_json(silent=True) or {}
-        username = body.get('username')
-        # [M56 修复] 浅拷贝后再遍历：本接口在 Flask 线程读 today_punch_records，与主循环
-        # _set_user_punch_time 的写入并发，直接遍历活字典可能抛 RuntimeError: dictionary changed
-        # size during iteration（500）。dict(...) 拿到一份稳定快照即可。
-        recs = dict(attendance_system.today_punch_records or {})
-        # [M56 修复] 跨日重置只由 check_punch_status 在工作日的偶数整点触发，周末/假日全天及工作日
-        # 清晨首个偶数整点前，记录里仍是昨天的数据。复用 get_status_snapshot 同款过滤：仅当归属日期
-        # rec['date'] == 今天 时才采用 punch_in_time，否则视为"今日无上班记录"转登录识别/兜底，
-        # 避免用昨天的上班时间算出错误下班时间并误走"内存已有记录"分支跳过识别。
-        from datetime import datetime as _dt
-        _today = _dt.now().date()
-
-        def _today_punch_in(rec: dict):
-            rec = rec or {}
-            if rec.get('date') != _today:
-                return None
-            return rec.get('punch_in_time')
-
-        target_user = None
-        target_in = None
-        if username:
-            target_in = _today_punch_in(recs.get(username))
-            target_user = username
-        else:
-            for u, r in recs.items():
-                t = _today_punch_in(r)
-                if t and (target_in is None or t < target_in):
-                    target_in = t
-                    target_user = u
-
-        from modules.config import config as cfg
-        fallback_used = False
-        if target_in:
-            # 内存(today_punch_records)已有今日上班时间，直接用
-            in_str = target_in.strftime('%H:%M:%S') if hasattr(target_in, 'strftime') else str(target_in)
-        else:
-            # [M57 修复] 仅在需要登录识别（内存无今日记录）时才检查互斥：打卡进行中再对同一账号发起
-            # 第二次登录，考勤系统可能互踢会话导致打卡失败；且此期间用户点"停止"会 quit 全部活跃
-            # driver，把本识别任务连带杀死。与 fetch_punch_status 同款保护——有进行中操作直接 409 拒绝。
-            # （注：此线程侧检查与主循环操作启动间仍存在 TOCTOU 窗口，彻底消除需主循环内的统一互斥锁，
-            #  见 cross_file_notes 中对 attendance_system 的依赖说明。）
-            if attendance_system.current_operation is not None:
-                return jsonify({
-                    'success': False,
-                    'error': f'当前有 {attendance_system.current_operation} 操作进行中，请等待完成后再计算下班时间',
-                }), 409
-            # 内存无记录 → 登录系统识别真实上班时间（对齐 Telegram /auto_byebye：Selenium 模式走
-            # get_today_punch_in_time_via_selenium 的 DOM 解析、仅识别首个用户 users[0]；传统模式走 OCR）。
-            # 登录识别耗时较长（与「获取打卡情况」量级一致），给足超时；超时/异常都不阻断，转兜底。
-            ok_id, pin = False, None
-            try:
-                ok_id, pin, _id_msg = bridge.call(
-                    attendance_system.get_today_punch_in_time_auto(),
-                    timeout=240,
-                )
-            except Exception:
-                logging.exception("auto_byebye_calc 登录识别上班时间失败")
-            if ok_id and pin:
-                in_str = pin
-                if not target_user and attendance_system.users:
-                    target_user = attendance_system.users[0].get('username')
-            else:
-                # 仍识别不到 → 用配置上班时间 WORK_START_TIME 兜底，保证「无上班记录也能自动下班」
-                in_str = cfg.WORK_START_TIME
-                fallback_used = True
-        try:
-            ok, out_str, msg = attendance_system.calculate_punch_out_time(in_str)
-        except Exception as e:
-            logging.exception("auto_byebye_calc failed")
-            return jsonify({'success': False, 'error': str(e)}), 500
-        if fallback_used:
-            msg = f"今日无上班打卡记录、且登录识别未取到上班时间，已使用配置上班时间 {in_str} 兜底计算。{msg}"
-        return jsonify({
-            'success': bool(ok),
-            'username': target_user,
-            'punch_in_time': in_str,
-            'punch_out_time': out_str,
-            'message': msg,
-            'fallback_used': fallback_used,
-        })
-
-    @app.post('/api/v1/punch/auto_byebye/confirm')
-    @require_token
-    def auto_byebye_confirm():
-        """安排定时下班打卡任务。body: ``{hour, minute}``"""
-        body = request.get_json(silent=True) or {}
-        try:
-            hour = int(body['hour'])
-            minute = int(body['minute'])
-        except (KeyError, ValueError, TypeError):
-            return jsonify({'success': False, 'error': 'hour 和 minute 必填且为整数'}), 400
-        if not (0 <= hour <= 23) or not (0 <= minute <= 59):
-            return jsonify({'success': False, 'error': '时间超出范围'}), 400
-        try:
-            ok = bridge.call(
-                attendance_system.schedule_punch_out(hour, minute), timeout=15
-            )
-            event_bus.publish_threadsafe('task:changed', {'op': 'add', 'type': 'punch_out'})
-            return jsonify({'success': bool(ok), 'time': f'{hour:02d}:{minute:02d}'})
-        except Exception as e:
-            logging.exception("auto_byebye_confirm failed")
-            return jsonify({'success': False, 'error': str(e)}), 500
-
-    # ----- 登录系统获取今日打卡情况 -----
-    @app.post('/api/v1/punch/fetch_status')
-    @require_token
-    def fetch_punch_status():
-        """登录考勤系统，读取所有已配置用户的今日上/下班时间（不触发打卡）。
-
-        识别结果会回写今日记录，因此读取后推送一次 status:update 让概览/自动下班同步刷新。
-        """
-        try:
-            if attendance_system.current_operation is not None:
-                return jsonify({
-                    'success': False,
-                    'error': f'当前有 {attendance_system.current_operation} 操作进行中，请等待完成后再读取',
-                }), 409
-            results = bridge.call(attendance_system.fetch_today_punch_status(), timeout=180)
-            try:
-                event_bus.publish_threadsafe('status:update', {'reason': 'fetch_punch_status'})
-            except Exception:
-                logging.exception("publish status:update after fetch_punch_status failed")
-            normalized = {}
-            for uid, val in (results or {}).items():
-                v = val if isinstance(val, dict) else {}
-                normalized[uid] = {
-                    'success': bool(v.get('success')),
-                    'punch_in_time': v.get('punch_in_time'),
-                    'punch_out_time': v.get('punch_out_time'),
-                    'message': str(v.get('message', '')),
-                }
-            return jsonify({'success': True, 'count': len(normalized), 'results': normalized})
-        except FuturesTimeoutError:
-            # [M88 修复] bridge.call 超时已 fut.cancel()，会把 CancelledError 投递进读取协程，
-            # 在其下一个 await 检查点切断登录流程、释放占用的 driver（read 类无 detach 子任务，
-            # 无需 force_stop）。明确返回 504 让前端区分"超时"而非泛化 500。
-            return jsonify({'success': False, 'error': '读取打卡情况超时，已尝试取消本次读取'}), 504
-        except Exception as e:
-            logging.exception("fetch_punch_status failed")
-            return jsonify({'success': False, 'error': str(e)}), 500
-
-    # ----- Tasks (create) -----
-    @app.post('/api/v1/tasks')
-    @require_token
-    def create_task():
-        from modules.services.task_service import create_scheduled_punch_task
-        body = request.get_json(silent=True) or {}
-        punch_type = body.get('type')
-        mode = body.get('mode')
-        hour = body.get('hour')
-        minute = body.get('minute')
-        delay_minutes = body.get('delay_minutes')
-        username = body.get('username')
-        try:
-            ok, msg, task_id = bridge.call(
-                create_scheduled_punch_task(
-                    attendance_system,
-                    punch_type=punch_type,
-                    mode=mode,
-                    hour=hour,
-                    minute=minute,
-                    delay_minutes=delay_minutes,
-                    username=username,
-                ),
-                timeout=15,
-            )
-            if ok:
-                event_bus.publish_threadsafe('task:changed', {'op': 'add', 'id': task_id})
-            return jsonify({'success': bool(ok), 'message': msg, 'task_id': task_id})
-        except Exception as e:
-            logging.exception("create_task failed")
-            return jsonify({'success': False, 'error': str(e)}), 500
-
-    # ----- Screenshots -----
-    @app.get('/api/v1/screenshots')
-    @require_token
-    def list_screenshots_api():
-        from modules.services.screenshot_service import list_screenshots, list_users_with_screenshots
-        username = request.args.get('username')
-        ptype = request.args.get('type', 'punch_in')
-        try:
-            limit = max(1, min(int(request.args.get('limit', 5)), 20))
-        except ValueError:
-            limit = 5
-        try:
-            if username:
-                items = list_screenshots(username, ptype, limit=limit)
-                return jsonify({'username': username, 'type': ptype, 'items': items})
-            else:
-                users = list_users_with_screenshots()
-                grouped = {u: list_screenshots(u, ptype, limit=limit) for u in users}
-                return jsonify({'type': ptype, 'users': users, 'grouped': grouped})
-        except Exception as e:
-            logging.exception("list_screenshots failed")
-            return jsonify({'error': str(e)}), 500
-
-    @app.get('/api/v1/screenshots/file')
-    @require_token
-    def screenshot_file():
-        from modules.services.screenshot_service import safe_screenshot_path
-        path = request.args.get('path', '')
-        safe = safe_screenshot_path(path)
-        if not safe:
-            return jsonify({'error': 'forbidden or not found'}), 404
-        try:
-            return send_file(safe, mimetype='image/png')
-        except Exception as e:
-            logging.exception("send_file failed")
-            return jsonify({'error': str(e)}), 500
-
-    # ----- Records -----
-    @app.get('/api/v1/records')
-    @require_token
-    def get_records():
-        """读取 punch_records/{username}/YYYY_MM.json。"""
-        username = request.args.get('username')
-        year = request.args.get('year')
-        month = request.args.get('month')
-        if not username or not year or not month:
-            return jsonify({'error': 'username/year/month 必填'}), 400
-        try:
-            year_i = int(year); month_i = int(month)
-            if not (1 <= month_i <= 12):
-                raise ValueError('month range')
-        except ValueError:
-            return jsonify({'error': 'year/month 非法'}), 400
-        # 防目录穿越：username 只允许包含合法字符
-        if '/' in username or '\\' in username or '..' in username:
-            return jsonify({'error': 'username 非法'}), 400
-        ym = f'{year_i}_{month_i:02d}'
-        path = os.path.join('punch_records', username, f'{ym}.json')
-        if not os.path.exists(path):
-            return jsonify({'username': username, 'year': year_i, 'month': month_i, 'records': {}})
-        try:
-            with open(path, 'r', encoding='utf-8') as f:
-                data = json.load(f)
-            return jsonify({
-                'username': username, 'year': year_i, 'month': month_i,
-                'records': data, 'path': path,
-            })
-        except Exception as e:
-            logging.exception("get_records failed")
-            return jsonify({'error': str(e)}), 500
 
     # ----- Error logs (分页) -----
     @app.get('/api/v1/logs/errors')
@@ -1455,12 +960,6 @@ def _build_flask_app(attendance_system, bridge: AsyncioBridge,
                 masked[f'{k}__has'] = bool(v)
             else:
                 masked[k] = v
-        # 附加 dynamic_config + 当前内存值方便前端展示
-        from modules.config import config as cfg
-        masked['_dynamic'] = {
-            'USE_SELENIUM_LOGIN': cfg.get_use_selenium_login(),
-            'SELENIUM_HEADLESS': cfg.get_selenium_headless(),
-        }
         return jsonify({'env': masked, 'whitelist': sorted(ENV_WRITE_WHITELIST)})
 
     @app.patch('/api/v1/config')
@@ -1486,99 +985,106 @@ def _build_flask_app(attendance_system, bridge: AsyncioBridge,
             logging.exception("patch_config failed")
             return jsonify({'success': False, 'error': str(e)}), 500
 
-    # ----- Email test -----
-    @app.post('/api/v1/email/test')
-    @require_token
-    def test_email():
-        try:
-            from modules.email_service import email_service
-            ok = bool(email_service.check_email_connection())
-            return jsonify({'success': ok, 'message': '邮件服务器连接 OK' if ok else 'SMTP 连接失败'})
-        except Exception as e:
-            logging.exception("test_email failed")
-            return jsonify({'success': False, 'error': str(e)}), 500
-
     # ----- System control -----
     @app.post('/api/v1/system/restart')
     @require_token
     def system_restart():
-        """请求重启 main.py — 当前仅记录意图并响应；真正重启由 Electron 主进程负责。"""
+        """记录重启请求并广播事件（扩展点）。当前桌面壳的实际重启走 Electron 的服务控制（AAS_SERVICE.restart），不消费此事件。"""
         event_bus.publish_threadsafe('system:restart_requested', {'ts': time.time()})
-        return jsonify({'success': True, 'note': '已发出重启信号；Electron 主进程将在收到 system:restart_requested 时执行'})
+        return jsonify({'success': True, 'note': '已记录重启请求；桌面端实际重启由窗口内的服务控制按钮执行'})
 
-    # ----- Bot reconnect -----
-    @app.post('/api/v1/bot/reconnect')
+    # ----- 微信 Bark 转发 -----
+    def _wb():
+        return getattr(app_core, 'wechat_bark', None)
+
+    @app.get('/api/v1/wechat-bark/status')
     @require_token
-    def bot_reconnect():
-        """主动重连 Telegram Bot，并据结果回写 bot_available/bot_error、广播状态更新。"""
+    def wechat_bark_status():
+        svc = _wb()
+        if svc is None:
+            return jsonify({'error': '微信 Bark 服务未初始化'}), 500
+        return jsonify(svc.status())
+
+    @app.get('/api/v1/wechat-bark/config')
+    @require_token
+    def wechat_bark_get_config():
+        svc = _wb()
+        if svc is None:
+            return jsonify({'error': '微信 Bark 服务未初始化'}), 500
         try:
-            ok, msg = bridge.call(attendance_system.bot.reconnect(), timeout=90)
-            attendance_system.bot_available = bool(ok)
-            attendance_system.bot_error = None if ok else msg
-            event_bus.publish_threadsafe('status:update', {'reason': 'bot_reconnect', 'bot_available': bool(ok)})
-            if ok:
-                return jsonify({'success': True, 'message': msg})
-            return jsonify({'success': False, 'error': msg}), 503
-        except FuturesTimeoutError:
-            attendance_system.bot_available = False
-            attendance_system.bot_error = '重连超时'
-            event_bus.publish_threadsafe('status:update', {'reason': 'bot_reconnect', 'bot_available': False})
-            return jsonify({'success': False, 'error': '重连超时'}), 504
+            return jsonify({'config': svc.load_config(), 'config_path': svc.config_path()})
         except Exception as e:
-            logging.exception("bot_reconnect failed")
-            attendance_system.bot_available = False
-            attendance_system.bot_error = str(e)
-            event_bus.publish_threadsafe('status:update', {'reason': 'bot_reconnect', 'bot_available': False})
-            return jsonify({'success': False, 'error': str(e)}), 500
+            logging.exception("wechat_bark_get_config failed")
+            return jsonify({'error': str(e)}), 500
 
-    # ----- Daily reminder test -----
-    @app.post('/api/v1/test/reminder')
+    @app.put('/api/v1/wechat-bark/config')
     @require_token
-    def test_reminder():
+    def wechat_bark_save_config():
+        svc = _wb()
+        if svc is None:
+            return jsonify({'success': False, 'error': '微信 Bark 服务未初始化'}), 500
+        body = request.get_json(silent=True) or {}
+        config = body.get('config') if isinstance(body.get('config'), dict) else body
+        if not isinstance(config, dict):
+            return jsonify({'success': False, 'error': '请求体应为配置字典或 {config: {...}}'}), 400
         try:
-            ok = bool(attendance_system.bot.verify_daily_reminder_setup())
-            return jsonify({'success': ok, 'message': '提醒任务已验证' if ok else '验证失败'})
-        except Exception as e:
-            logging.exception("test_reminder failed")
-            return jsonify({'success': False, 'error': str(e)}), 500
-
-    # ----- Parallel login test -----
-    @app.post('/api/v1/test/parallel_login')
-    @require_token
-    def parallel_login_test():
-        try:
-            # [M57 修复] 该接口会对全部用户发起 120s 全量登录；打卡进行中再对同账号登录会与正在进行的
-            # 打卡争抢会话（考勤系统可能互踢），且用户点"停止"会 quit 全部 driver 把本测试连带杀死。
-            # 与 fetch_punch_status / auto_byebye_calc 同款保护——有进行中操作直接 409 拒绝。
-            # （线程侧检查仍有 TOCTOU 窗口，彻底消除需主循环统一互斥锁，见 cross_file_notes。）
-            if attendance_system.current_operation is not None:
-                return jsonify({
-                    'success': False,
-                    'error': f'当前有 {attendance_system.current_operation} 操作进行中，请等待完成后再测试并行登录',
-                }), 409
-            users_config = attendance_system.prepare_users_config_from_env()
-            if not users_config:
-                return jsonify({'success': False, 'error': '未配置任何用户'}), 400
-            results = bridge.call(
-                attendance_system.parallel_punch_login(users_config), timeout=120
-            )
-            normalized = {}
-            for uid, val in (results or {}).items():
-                ok, msg = (val if isinstance(val, (list, tuple)) and len(val) >= 2 else (False, str(val)))
-                normalized[uid] = {'success': bool(ok), 'message': str(msg)}
+            saved = svc.save_config(config)
             return jsonify({
                 'success': True,
-                'count': len(normalized),
-                'success_count': sum(1 for v in normalized.values() if v['success']),
-                'results': normalized,
+                'config': saved,
+                'config_path': svc.config_path(),
+                'note': '配置已保存；正在运行的监听会在下次启动时使用新配置',
             })
+        except ValueError as e:
+            # 字段校验失败（如开始时间晚于结束时间），文案直接回给用户
+            return jsonify({'success': False, 'error': str(e)}), 400
         except Exception as e:
-            logging.exception("parallel_login_test failed")
+            logging.exception("wechat_bark_save_config failed")
             return jsonify({'success': False, 'error': str(e)}), 500
+
+    @app.post('/api/v1/wechat-bark/start')
+    @require_token
+    def wechat_bark_start():
+        svc = _wb()
+        if svc is None:
+            return jsonify({'success': False, 'error': '微信 Bark 服务未初始化'}), 500
+        return jsonify(svc.start())
+
+    @app.post('/api/v1/wechat-bark/stop')
+    @require_token
+    def wechat_bark_stop():
+        svc = _wb()
+        if svc is None:
+            return jsonify({'success': False, 'error': '微信 Bark 服务未初始化'}), 500
+        return jsonify(svc.stop())
+
+    @app.post('/api/v1/wechat-bark/test')
+    @require_token
+    def wechat_bark_test():
+        svc = _wb()
+        if svc is None:
+            return jsonify({'success': False, 'error': '微信 Bark 服务未初始化'}), 500
+        return jsonify(svc.test_bark())
+
+    @app.get('/api/v1/wechat-bark/schedule')
+    @require_token
+    def wechat_bark_schedule():
+        svc = _wb()
+        if svc is None:
+            return jsonify({'success': False, 'error': '微信 Bark 服务未初始化'}), 500
+        return jsonify(svc.check_schedule())
+
+    @app.get('/api/v1/wechat-bark/apps')
+    @require_token
+    def wechat_bark_apps():
+        svc = _wb()
+        if svc is None:
+            return jsonify({'success': False, 'error': '微信 Bark 服务未初始化'}), 500
+        return jsonify(svc.list_apps())
 
     # ----- 内置网络加速（mihomo）-----
     def _pm():
-        return getattr(attendance_system, 'proxy_manager', None)
+        return getattr(app_core, 'proxy_manager', None)
 
     @app.get('/api/v1/proxy/config')
     @require_token
@@ -1615,11 +1121,10 @@ def _build_flask_app(attendance_system, bridge: AsyncioBridge,
             cfg.set_proxy_config(patch)
             if toggling and patch['enabled']:
                 ok, msg = pm.start()
-                note = ('内置加速已启动；重启程序后 Telegram 才会切到内置加速。'
-                        if ok else f'启动失败：{msg}')
+                note = ('内置加速已启动。' if ok else f'启动失败：{msg}')
             elif toggling and not patch['enabled']:
                 pm.stop()
-                note = '内置加速已停止；重启程序后 Telegram 会回到系统代理/直连。'
+                note = '内置加速已停止，后台请求回到直连。'
             elif pm.is_running():
                 pm.reload()
             event_bus.publish_threadsafe('proxy:status', pm.status())
@@ -1946,7 +1451,7 @@ async def _ws_handler(event_bus: EventBus, token: str, websocket):
 # Entry point
 # ----------------------------------------------------------------------------
 
-async def start(attendance_system,
+async def start(app_core,
                 loop: Optional[asyncio.AbstractEventLoop] = None,
                 http_port: int = 8765,
                 ws_port: int = 8766):
@@ -1967,18 +1472,20 @@ async def start(attendance_system,
     event_bus = EventBus(loop)
     bridge = AsyncioBridge(loop)
 
-    # 注入 event_bus 到 attendance_system，供 send_notification 头部 publish
-    attendance_system._event_bus = event_bus
+    # 注入 event_bus 到 app_core，供后台定时任务向 GUI 推送更新
+    app_core._event_bus = event_bus
+    wb = getattr(app_core, 'wechat_bark', None)
+    if wb is not None:
+        wb.attach_event_bus(event_bus)
 
-    app = _build_flask_app(attendance_system, bridge, event_bus, token)
+    app = _build_flask_app(app_core, bridge, event_bus, token)
 
     def _serve_http():
         try:
             logging.info("GUI HTTP server listening on 127.0.0.1:%s", http_port)
-            # threads 默认仅 4：auto_byebye_calc(240s)/fetch_punch_status(180s)/
-            # parallel_login_test(120s)/bot_reconnect(90s) 这类长接口经 bridge.call 同步
-            # 等待主 loop 时会长时间占住工作线程，4 个被占满后连无鉴权的 /ping 都排队无响应，
-            # GUI 端表现为后端整体失联。提到 16 以缓解长接口对短接口（含打卡/状态/ping）的饥饿。
+            # threads 默认仅 4：耗时较长的接口（如上游网络请求慢）会占住工作线程，
+            # 4 个被占满后连无鉴权的 /ping 都排队无响应，GUI 端表现为后端整体失联。
+            # 提到 16 以缓解长接口对短接口（状态/ping）的饥饿。
             waitress.serve(app, host='127.0.0.1', port=http_port, ident='aas-gui', threads=16)
         except Exception:
             logging.exception("waitress server crashed")

@@ -3,7 +3,7 @@ chinese_calendar 的安全包装。
 
 chinese_calendar 的法定节假日数据只覆盖有限年份（1.11.0 截至 2026）。一旦系统
 日期跨过库数据上限，``is_workday`` / ``is_holiday`` 会抛 ``NotImplementedError``
-（报错形如 "no available data for year XXXX"），进而中断打卡调度、状态查询等核心流程。
+（报错形如 "no available data for year XXXX"），进而中断日历信息、状态查询等依赖工作日判断的流程。
 
 本模块对两个函数做兜底：库能算就用库的精确结果；库报错就降级为"周一~周五=工作日、
 周六日=休息日"的简单判断，保证系统不因日历库过期而瘫痪。
@@ -49,7 +49,7 @@ def is_workday(d) -> bool:
         try:
             return dd.weekday() < 5
         except Exception:
-            return True  # 最终兜底：当作工作日，宁可多打卡也不漏
+            return True  # 最终兜底：当作工作日，让调用方按工作日逻辑走
 
 
 def is_holiday(d) -> bool:

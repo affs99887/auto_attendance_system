@@ -45,23 +45,18 @@ watchdog.log
 *.tmp
 temp_*
 *.temp
-temp_screenshot.png
 
 # 系统文件
 .DS_Store
 Thumbs.db
 
 # 项目特定文件
-punch_records/
-screenshots/
-scheduled_tasks.json
 dynamic_config.json
-settime_history.json
 exchange_rate_cache.json
-ai_news_cache.json
 window-state.json
 gui-settings.json
-.main.lock
+# 微信 Bark 转发配置（含 Bark Device Key，属敏感信息）
+wechat_bark_config.json
 
 # 桌面端打包产物（electron-builder 输出到项目根 release/）
 /release/
@@ -87,11 +82,3 @@ proxy_runtime/
 
 # 审计报告（含真实姓名/内网地址等敏感描述，仅本地参考，勿入库）
 AUDIT_REPORT.md
-
-# Edge 驱动大二进制不入库（由 webdriver-manager 自动下载 / 本地放置）
-/msedgedriver.exe
-/msedgedriver.exe.bak-*
-
-# 静态原型示例数据含真实考勤记录/员工姓名，禁止入库（已从历史 filter-repo 清除）
-gui/static-prototype/data.jsx
-gui/static-prototype/data/records_*.json

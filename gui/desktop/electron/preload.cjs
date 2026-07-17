@@ -6,7 +6,13 @@
 //   window.AAS_SYSTEM  — 系统能力（打开日志目录）
 //   window.AAS_FILES   — 文件选择（选本地 Clash 配置文件）
 //   window.AAS_LOG     — 启动日志（python stdout/stderr 原始行，供启动覆盖层展示）
+//   window.AAS_SETTINGS — GUI 设置持久化（主进程 gui-settings.json）
+//   window.AAS_POWER   — 系统睡眠唤醒事件订阅
+//   window.AAS_WECHAT_BARK — 微信 Bark 转发的系统级操作（隐私设置 / 定位配置 / 登录项）
+//   window.AAS_PLATFORM — 运行平台标识（'darwin'/'win32'/...，渲染层按平台微调 UI）
 const { contextBridge, ipcRenderer } = require('electron');
+
+contextBridge.exposeInMainWorld('AAS_PLATFORM', process.platform);
 
 function readArg(key) {
   const prefix = `--${key}=`;
@@ -55,8 +61,6 @@ contextBridge.exposeInMainWorld('AAS_SERVICE', {
 
 contextBridge.exposeInMainWorld('AAS_SYSTEM', {
   openLogs: () => ipcRenderer.invoke('system:open-logs'), // resolve 空串=成功，非空=错误
-  // 用系统默认图片查看器打开本地截图（不弹浏览器）；resolve 空串=成功，非空=错误信息
-  openScreenshot: (relPath) => ipcRenderer.invoke('screenshot:open', relPath),
 });
 
 contextBridge.exposeInMainWorld('AAS_FILES', {
@@ -80,32 +84,21 @@ contextBridge.exposeInMainWorld('AAS_SETTINGS', {
   set: (key, value) => ipcRenderer.send('settings:set', key, value),
 });
 
-contextBridge.exposeInMainWorld('AAS_EPD', {
-  // 订阅主进程推送的蓝牙设备流（select-bluetooth-device 拦截后实时转发）
-  onDevices: (cb) => {
-    const handler = (_e, devices) => cb(devices);
-    ipcRenderer.on('epd:ble-devices', handler);
-    return () => ipcRenderer.removeListener('epd:ble-devices', handler);
+contextBridge.exposeInMainWorld('AAS_POWER', {
+  // 订阅系统休眠唤醒通知（主进程 powerMonitor resume 广播），供页面唤醒后立即补刷数据；
+  // 返回注销函数（与其它桥一致，供 React effect cleanup 用）
+  onResume: (cb) => {
+    const handler = () => cb();
+    ipcRenderer.on('power:resume', handler);
+    return () => ipcRenderer.removeListener('power:resume', handler);
   },
-  // 回选设备（空串=取消本次扫描请求）
-  select: (deviceId) => ipcRenderer.send('epd:ble-select', deviceId || ''),
-  // 蓝牙配对确认请求（渲染端用应用内对话框确认）
-  onPairing: (cb) => {
-    const handler = (_e, req) => cb(req);
-    ipcRenderer.on('epd:ble-pairing', handler);
-    return () => ipcRenderer.removeListener('epd:ble-pairing', handler);
-  },
-  // 配对确认结果回传
-  pairingResponse: (confirmed) => ipcRenderer.send('epd:ble-pairing-response', !!confirmed),
-  // 方案2：请求主进程注入一次可信键盘输入(F24)产生 user activation，供渲染层在手势上下文里
-  // 调 requestDevice 自动重连(定时推送无手势)。resolve true=已注入 / false=不可用。
-  tryGestureReconnect: () => ipcRenderer.invoke('epd:gesture-reconnect'),
-  // 追加一条墨水屏日志到主进程 logs/epaper.log（主进程防抖落盘，保留长历史可外部翻查）
-  appendLog: (line) => ipcRenderer.send('epd:log-append', line),
 });
 
-contextBridge.exposeInMainWorld('AAS_POWER', {
-  // 订阅系统休眠唤醒通知（主进程 powerMonitor resume 广播）；休眠中蓝牙必掉，
-  // 墨水屏侧收到后应立即校验连接状态/触发重连，而不是等下一次定时推送
-  onResume: (cb) => ipcRenderer.on('power:resume', () => cb()),
+contextBridge.exposeInMainWorld('AAS_WECHAT_BARK', {
+  // 打开 macOS「完全磁盘访问」设置页；非 mac 返回 {ok:false}
+  openPrivacySettings: () => ipcRenderer.invoke('wechat-bark:open-privacy'),
+  // 文件管理器中定位 wechat_bark_config.json（不存在时降级为打开数据目录）
+  showConfig: () => ipcRenderer.invoke('wechat-bark:show-config'),
+  // 把「登录后自动启动」同步到系统登录项（仅 macOS 打包版生效，其余 no-op 返 skipped）
+  syncLoginItem: (enabled) => ipcRenderer.invoke('wechat-bark:sync-login-item', !!enabled),
 });
