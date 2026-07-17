@@ -303,8 +303,11 @@ def _write_env_atomic(patch: dict, path: str = '.env') -> dict:
 
 _WEATHER_CACHE_TTL = 600
 _WEATHER_CACHE_MAX = 20
-_WEATHER_HOURLY_STEPS = 72
-_WEATHER_DAILY_STEPS = 7
+# 彩云 v2.6 支持最多 15 天 / 360 小时。覆盖完整长假，才能从放假前一日
+# 17:00 一直判断到假后首个工作日 08:00；前端仍只展示既有的 5 日摘要。
+_WEATHER_HOURLY_STEPS = 360
+_WEATHER_DAILY_STEPS = 15
+_WEATHER_DISPLAY_DAILY_STEPS = 7
 _weather_cache: dict = {}
 _weather_cache_lock = threading.Lock()
 
@@ -385,7 +388,7 @@ def _fetch_caiyun_weather_raw(latitude: float, longitude: float) -> dict:
     query = {
         'alert': 'true',
         'dailysteps': str(_WEATHER_DAILY_STEPS),
-        # 新套餐支持未来 3 天逐小时预报，完整保留给详情页与后续业务使用。
+        # 覆盖最长 15 天，供跨完整长假的头盔存放提醒使用。
         'hourlysteps': str(_WEATHER_HOURLY_STEPS),
         # metric:v2 让实况/逐时降水统一为 mm/h，距离保持 km。
         'unit': 'metric:v2',
@@ -596,6 +599,12 @@ def _normalize_caiyun_weather(data: dict, latitude: float, longitude: float,
     life_index = realtime.get('life_index') or {}
     ultraviolet = life_index.get('ultraviolet') or {}
     comfort = life_index.get('comfort') or {}
+    try:
+        from modules.calendar_info_service import get_weather_rest_periods
+        rest_periods = get_weather_rest_periods(lookahead_days=_WEATHER_DAILY_STEPS)
+    except Exception:
+        logging.exception('天气休息日区间计算失败，头盔提示将回退为普通夜间模式')
+        rest_periods = []
 
     return {
         'success': True,
@@ -629,7 +638,10 @@ def _normalize_caiyun_weather(data: dict, latitude: float, longitude: float,
         'hourly_description': hourly.get('description'),
         'minutely_description': minutely.get('description'),
         'hourly': hourly_rows,
-        'daily': daily_rows,
+        'daily': daily_rows[:_WEATHER_DISPLAY_DAILY_STEPS],
+        # 仅供头盔提醒在逐小时数据不完整时补判；天气页面继续保持原有 7 天展示。
+        'rest_daily': daily_rows,
+        'rest_periods': rest_periods,
         'alerts': alert_rows,
         'alerts_available': alerts_available,
         'alerts_total': len(alert_rows),

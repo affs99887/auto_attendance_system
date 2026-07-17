@@ -3,7 +3,7 @@ import { Icon } from '../lib/icons';
 import type { WeatherDailyItem, WeatherHourlyItem, WeatherResponse } from '../lib/api';
 import {
   aqiTone,
-  buildNightRainAdvice,
+  buildHelmetRainAdvice,
   roundWeather,
   skyInfo,
   weatherDayLabel,
@@ -117,20 +117,42 @@ function HelmetAdvice({
   data: WeatherResponse;
   size?: WeatherCardSize;
 }) {
+  const [now, setNow] = React.useState(() => new Date());
+  React.useEffect(() => {
+    const timer = window.setInterval(() => setNow(new Date()), 60_000);
+    return () => window.clearInterval(timer);
+  }, []);
   const advice = React.useMemo(
-    () => buildNightRainAdvice(data.hourly, new Date(), data.realtime),
-    [data.hourly, data.realtime],
+    () => buildHelmetRainAdvice(data, now),
+    [data, now],
   );
   const badgeIcon = advice.status === 'rain' ? 'thunder' : advice.status === 'dry' ? 'partly-night' : 'cloud';
   const compact = size !== 'l';
-  const firstSlot = advice.slots[0];
-  const compactStartLabel = firstSlot?.covered
-    ? firstSlot.wet
-      ? (size === 's' ? '17时 雨' : '17时 有雨')
-      : '17时 无雨'
-    : '17时';
+  const firstSlot = advice.mode === 'night' ? advice.slots[0] : null;
+  const compactStartLabel = advice.mode === 'rest'
+    ? '放假前17时'
+    : firstSlot?.covered
+      ? firstSlot.wet
+        ? (size === 's' ? '17时 雨' : '17时 有雨')
+        : '17时 无雨'
+      : '17时';
+  const compactEndLabel = advice.mode === 'rest' ? '上班日8时' : size === 's' ? '次日 8时' : '次日8时';
 
-  const timelineBars = (
+  const timelineBars = advice.mode === 'rest' ? (
+    <div
+      className="weather-night-bars weather-rest-bars"
+      style={{ gridTemplateColumns: `repeat(${Math.max(1, advice.days.length)}, minmax(0, 1fr))` }}
+    >
+      {advice.days.map(slot => (
+        <span
+          key={slot.date}
+          className={`${slot.wet ? 'wet' : ''} ${slot.covered ? '' : 'uncovered'}`}
+          title={`${slot.date} ${slot.label} · 降水概率 ${slot.probability === null ? '暂无' : `${Math.round(slot.probability)}%`}${slot.estimated ? ' · 日级预报' : ''}`}
+          style={{ opacity: slot.wet ? Math.max(0.34, (slot.probability ?? 35) / 100) : 0.16 }}
+        />
+      ))}
+    </div>
+  ) : (
     <div className="weather-night-bars">
       {advice.slots.map(slot => {
         const strength = slot.wet
@@ -147,6 +169,9 @@ function HelmetAdvice({
       })}
     </div>
   );
+  const timelineAria = advice.mode === 'rest'
+    ? `${advice.period.label}提醒时段，从放假前一日17点至假后首个工作日8点，共 ${advice.rainDays} 天有降水信号`
+    : `17点至次日8点逐小时降雨时间轴，共 ${advice.rainHours} 个时段有降水信号`;
 
   if (compact) {
     return (
@@ -160,10 +185,10 @@ function HelmetAdvice({
           <div
             className="weather-night-timeline weather-night-timeline-compact"
             role="img"
-            aria-label={`17点至次日8点逐小时降雨时间轴，共 ${advice.rainHours} 个时段有降水信号`}
+            aria-label={timelineAria}
           >
             {timelineBars}
-            <div className="weather-night-axis"><span>{compactStartLabel}</span><span>{size === 's' ? '次日 8时' : '次日8时'}</span></div>
+            <div className="weather-night-axis"><span>{compactStartLabel}</span><span>{compactEndLabel}</span></div>
           </div>
         </div>
       </div>
@@ -186,14 +211,24 @@ function HelmetAdvice({
       <div
         className="weather-night-timeline"
         role="img"
-        aria-label={`17点至次日8点逐小时降雨时间轴，共 ${advice.rainHours} 个时段有降水信号`}
+        aria-label={timelineAria}
       >
         <div className="weather-night-timeline-head">
-          <span>今夜降雨时段</span>
-          <strong>{advice.status === 'rain' ? `约 ${advice.rainHours} 小时有雨` : advice.badge}</strong>
+          <span>{advice.mode === 'rest' ? `${advice.period.label}雨情` : '今夜降雨时段'}</span>
+          <strong>
+            {advice.status === 'rain'
+              ? advice.mode === 'rest'
+                ? `${advice.rainDays} 天有雨`
+                : `约 ${advice.rainHours} 小时有雨`
+              : advice.badge}
+          </strong>
         </div>
         {timelineBars}
-        <div className="weather-night-axis"><span>17</span><span>20</span><span>23</span><span>02</span><span>05</span><span>08</span></div>
+        {advice.mode === 'rest' ? (
+          <div className="weather-night-axis"><span>放假前一日 17:00</span><span>首个工作日 08:00</span></div>
+        ) : (
+          <div className="weather-night-axis"><span>17</span><span>20</span><span>23</span><span>02</span><span>05</span><span>08</span></div>
+        )}
       </div>
     </div>
   );

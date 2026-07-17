@@ -17,6 +17,7 @@
 
 对外暴露：
 - get_calendar_info() -> 契约 dict（以服务器当天为基准，返回当月数据）
+- get_weather_rest_periods() -> 天气头盔提醒所需的近期连续休息区间
 """
 
 import datetime
@@ -103,14 +104,83 @@ def _workday_after(day):
 
 
 def _span_holiday_name(first, last):
-    """连续休息区间内若含法定假日，返回其中文名；否则 None。"""
+    """连续休息区间内若含法定假日，返回其中文名；否则 None。
+
+    同一连续休息区间若包含两个法定节日（如国庆、中秋相连），按出现顺序合并展示。
+    """
+    names = []
     d = first
     while d <= last:
         name = _holiday_name(d)
-        if name:
-            return name
+        if name and name not in names:
+            names.append(name)
         d += datetime.timedelta(days=1)
-    return None
+    if not names:
+        return None
+    return names[0] if len(names) == 1 else ''.join(name.replace('节', '') for name in names)
+
+
+def get_weather_rest_periods(reference_day=None, lookahead_days=15):
+    """返回天气提醒覆盖范围内的连续休息区间。
+
+    范围额外包含 reference_day 的前一天，确保休假结束后的首个工作日 08:00 前，
+    前端仍能识别刚结束的休息段。每段同时给出提醒窗口：
+    「休息首日前一天 17:00」至「休息结束后首个工作日 08:00」。
+    """
+    today = reference_day or datetime.date.today()
+    if isinstance(today, datetime.datetime):
+        today = today.date()
+    try:
+        days = max(1, int(lookahead_days))
+    except (TypeError, ValueError):
+        days = 15
+
+    scan_start = today - datetime.timedelta(days=1)
+    scan_end = today + datetime.timedelta(days=days - 1)
+    periods = []
+    seen = set()
+    current = scan_start
+
+    while current <= scan_end:
+        if not _is_off(current):
+            current += datetime.timedelta(days=1)
+            continue
+
+        first, last = _off_span(current)
+        key = (first, last)
+        if key not in seen:
+            seen.add(key)
+            name = _span_holiday_name(first, last)
+            next_workday = _workday_after(last)
+            window_start = datetime.datetime.combine(
+                first - datetime.timedelta(days=1),
+                datetime.time(hour=17),
+                tzinfo=datetime.timezone(datetime.timedelta(hours=8)),
+            )
+            window_end = datetime.datetime.combine(
+                next_workday,
+                datetime.time(hour=8),
+                tzinfo=datetime.timezone(datetime.timedelta(hours=8)),
+            )
+            rest_days = (last - first).days + 1
+            periods.append({
+                'start': first.isoformat(),
+                'end': last.isoformat(),
+                'name': name,
+                'label': (
+                    f'{name}假期'
+                    if name else
+                    '周末双休' if rest_days == 2 else '周末休息日'
+                ),
+                'kind': 'holiday' if name else 'weekend',
+                'next_workday': next_workday.isoformat(),
+                'window_start': window_start.isoformat(),
+                'window_end': window_end.isoformat(),
+            })
+
+        current = last + datetime.timedelta(days=1)
+
+    return periods
 
 
 def get_calendar_info(after=None):
