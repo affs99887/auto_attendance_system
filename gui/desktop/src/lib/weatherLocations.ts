@@ -8,14 +8,18 @@ export interface WeatherLocation {
   longitude: number;
 }
 
-export const DEFAULT_WEATHER_LOCATION: WeatherLocation = {
-  id: 'fixed:huashan-road-1076',
-  name: '华山路1076号',
-  address: '上海市长宁区华山路1076号',
-  // 公开地图坐标由 BD-09 转为 GCJ-02，供彩云天气查询使用。
-  latitude: 31.21126179,
-  longitude: 121.43584026,
+// "当前位置"虚拟地点：坐标不用这里的占位值，运行时由后端 IP 定位（/api/v1/geolocate）解析，
+// 天气请求不带固定地址，让后端做逆地理编码显示真实地名。
+export const LOCATED_WEATHER_LOCATION: WeatherLocation = {
+  id: 'located:auto',
+  name: '当前位置',
+  address: '自动定位（IP 归属地）',
+  latitude: 0,
+  longitude: 0,
 };
+
+// 默认地点 = 定位。它永远是收藏列表第一项且不可删除。
+export const DEFAULT_WEATHER_LOCATION: WeatherLocation = LOCATED_WEATHER_LOCATION;
 
 interface CatalogRow {
   adcode: string;

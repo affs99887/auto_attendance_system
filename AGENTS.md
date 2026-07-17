@@ -11,7 +11,7 @@
 
 ### 后端模块（modules/）
 - **app_core.py** — `AppCore`：日志初始化、定时任务注册（`init_schedule_tasks`）、状态快照（`get_status_snapshot`，供 `/api/v1/status`）、退出时停 mihomo
-- **web_server.py** — Flask REST + WebSocket；Bearer token 鉴权（logs/.gui_token）；EventBus 推送；仅监听 127.0.0.1
+- **web_server.py** — Flask REST + WebSocket；Bearer token 鉴权（logs/.gui_token）；EventBus 推送；仅监听 127.0.0.1；含彩云天气 helpers 与 IP 定位接口（/api/v1/geolocate，天气"当前位置"用，多提供商直连+缓存）
 - **config.py** — `.env`（load_dotenv）+ `dynamic_config.json`（含代理 PROXY 子对象，线程安全读写）
 - **schedule_manager.py** — `run_schedule()`：全局 schedule 单例的驱动循环，所有周期任务靠它触发
 - **proxy_manager.py** — 内置网络加速：mihomo 子进程管理、订阅/粘贴配置、节点切换、健康巡检 watchdog、`request_get_with_local_proxy_fallback`（本地代理失败即回退直连 + 熔断）

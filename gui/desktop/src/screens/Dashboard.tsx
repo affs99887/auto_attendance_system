@@ -73,7 +73,7 @@ function WeatherCard({
         <div className="card weather-empty" role="status" aria-live="polite" aria-busy="true">
           <span className="spinner" />
           <div>
-            <div className="weather-empty-title">正在获取华山路1076号天气</div>
+            <div className="weather-empty-title">正在获取{location.name}天气</div>
             <div className="muted">{location.address}</div>
           </div>
         </div>
@@ -288,10 +288,10 @@ export function DashboardScreen() {
         </div>
       </div>
 
-      {/* 首页固定地点 + 彩云天气 */}
+      {/* 首页当前位置（IP 定位）+ 彩云天气 */}
       <div className="col gap-2">
         <div className="row spread">
-          <div className="kicker">天气 · 华山路1076号</div>
+          <div className="kicker">天气 · 当前位置</div>
           <button className="btn btn-sm" onClick={() => setScreen('weather')}>
             天气详情 <Icon.ChevronRight size={10} />
           </button>

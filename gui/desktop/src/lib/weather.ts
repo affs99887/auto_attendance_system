@@ -6,6 +6,7 @@ import {
 } from './api';
 import {
   DEFAULT_WEATHER_LOCATION,
+  LOCATED_WEATHER_LOCATION,
   type WeatherLocation,
 } from './weatherLocations';
 
@@ -79,6 +80,24 @@ export async function loadWeatherData(location: WeatherLocation, force: boolean)
   if (!force && pending) return pending;
 
   const task = (async () => {
+    if (location.id === LOCATED_WEATHER_LOCATION.id) {
+      // "当前位置"：先经后端 IP 定位拿坐标，再不带固定地址请求天气，
+      // 让后端做逆地理编码显示真实地名（解析不到时后端自带坐标兜底文案）
+      const geo = await api.getGeolocate(force);
+      const response = await api.getWeather(geo.latitude, geo.longitude, force);
+      const data: WeatherResponse = {
+        ...response,
+        location: {
+          ...response.location,
+          name: response.location.resolved
+            ? `当前位置 · ${response.location.name}`
+            : (geo.city ? `当前位置 · ${geo.city}` : '当前位置'),
+        },
+      };
+      weatherSessions.set(location.id, { data, fetchedAt: Date.now() });
+      return data;
+    }
+
     const response = await api.getWeather(
       location.latitude,
       location.longitude,

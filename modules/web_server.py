@@ -685,6 +685,52 @@ def _get_caiyun_weather(latitude: float, longitude: float, force: bool = False,
     return contract
 
 
+# ----------------------------------------------------------------------------
+# IP 定位（天气"当前位置"用：城市级精度足够选天气坐标）
+# ----------------------------------------------------------------------------
+
+_GEO_CACHE_TTL = 1800  # 秒；IP 归属地短时间内不会变，半小时内直接复用
+_geo_cache = {'data': None, 'fetched_at': 0.0}
+_geo_lock = threading.Lock()
+
+
+def _fetch_ip_location() -> dict:
+    """依次尝试多个免费 IP 定位服务，返回 {latitude, longitude, city, source}；全失败抛 RuntimeError。
+
+    必须直连：走内置加速拿到的是代理出口节点的位置，不是本机位置，
+    所以这里刻意不用 request_get_with_local_proxy_fallback，并关掉环境变量代理。
+    """
+    import requests
+    providers = [
+        ('ipwho.is', 'https://ipwho.is/?lang=zh-CN',
+         lambda d: (d.get('success') is True, d.get('latitude'), d.get('longitude'), d.get('city'))),
+        ('ip-api.com', 'http://ip-api.com/json/?lang=zh-CN&fields=status,lat,lon,city',
+         lambda d: (d.get('status') == 'success', d.get('lat'), d.get('lon'), d.get('city'))),
+        ('ipapi.co', 'https://ipapi.co/json/',
+         lambda d: (True, d.get('latitude'), d.get('longitude'), d.get('city'))),
+    ]
+    session = requests.Session()
+    session.trust_env = False  # 忽略系统 HTTP(S)_PROXY，保证拿到本机出口的归属地
+    errors = []
+    for name, url, parse in providers:
+        try:
+            resp = session.get(url, timeout=6)
+            resp.raise_for_status()
+            ok, lat, lng, city = parse(resp.json())
+            lat, lng = float(lat), float(lng)
+            if ok and -90 <= lat <= 90 and -180 <= lng <= 180:
+                return {
+                    'latitude': lat,
+                    'longitude': lng,
+                    'city': str(city or '').strip(),
+                    'source': name,
+                }
+            errors.append(f'{name}: 返回数据无效')
+        except Exception as exc:
+            errors.append(f'{name}: {type(exc).__name__}')
+    raise RuntimeError('IP 定位失败（' + '；'.join(errors) + '）')
+
+
 def _tail_file(path: str, n: int):
     """读取文件最后 n 行（块读法，几 MB 日志够用）。"""
     n = max(1, n)
@@ -884,6 +930,34 @@ def _build_flask_app(app_core, bridge: AsyncioBridge,
                 'code': 'upstream_error',
                 'error': '彩云天气请求失败，请稍后重试',
             }), 502
+
+    # ----- IP 定位（天气"当前位置"解析坐标用）-----
+    @app.get('/api/v1/geolocate')
+    @require_token
+    def geolocate():
+        """返回本机出口 IP 的城市级坐标。query: force=0|1（1 跳过缓存重新探测）。
+
+        定位失败但有旧缓存时回退旧缓存（带 stale:true）；彻底无数据返回 502。
+        """
+        force = request.args.get('force', '0') in ('1', 'true', 'True')
+        now = time.time()
+        with _geo_lock:
+            cached = _geo_cache['data']
+            if not force and cached and now - _geo_cache['fetched_at'] < _GEO_CACHE_TTL:
+                return jsonify({'success': True, **cached, 'cached': True})
+        try:
+            data = _fetch_ip_location()
+        except Exception as e:
+            logging.warning("IP 定位失败: %s", e)
+            with _geo_lock:
+                cached = _geo_cache['data']
+            if cached:
+                return jsonify({'success': True, **cached, 'cached': True, 'stale': True})
+            return jsonify({'success': False, 'error': str(e)}), 502
+        with _geo_lock:
+            _geo_cache['data'] = data
+            _geo_cache['fetched_at'] = now
+        return jsonify({'success': True, **data, 'cached': False})
 
     # ----- 汇率（Yahoo CNY->JPY）-----
     @app.get('/api/v1/exchange-rate')

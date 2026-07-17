@@ -75,6 +75,19 @@ export interface WeatherAlertItem {
   published_at: number;
 }
 
+export interface GeolocateResponse {
+  success: true;
+  latitude: number;
+  longitude: number;
+  /** 城市名（定位服务给的，可能为空串） */
+  city: string;
+  /** 用的哪家 IP 定位服务 */
+  source: string;
+  cached: boolean;
+  /** true 表示本次探测失败、回退的是旧缓存 */
+  stale?: boolean;
+}
+
 export interface WeatherResponse {
   success: true;
   source: '彩云天气';
@@ -305,6 +318,12 @@ export const api = {
     request<WeatherResponse>('/api/v1/weather', {
       method: 'POST',
       body: { latitude, longitude, force, address },
+      timeoutMs: 25_000,
+    }),
+
+  // IP 定位（城市级），天气"当前位置"用它解析坐标；后端带 30 分钟缓存
+  getGeolocate: (force = false) =>
+    request<GeolocateResponse>(`/api/v1/geolocate${force ? '?force=1' : ''}`, {
       timeoutMs: 25_000,
     }),
 

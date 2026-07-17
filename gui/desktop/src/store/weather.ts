@@ -11,7 +11,7 @@ import {
 } from '../lib/weatherLocations';
 
 const WEATHER_SETTINGS_KEY = 'aas.weather.locations.v1';
-const WEATHER_SETTINGS_VERSION = 1;
+const WEATHER_SETTINGS_VERSION = 2;
 const MAX_WEATHER_LOCATIONS = 20;
 
 export interface WeatherEntry {
@@ -31,7 +31,7 @@ export const EMPTY_WEATHER_ENTRY: WeatherEntry = {
 };
 
 interface WeatherPreferences {
-  version: 1;
+  version: 2;
   activeLocationId: string;
   locations: WeatherLocation[];
 }
@@ -91,7 +91,8 @@ function addressKey(location: WeatherLocation): string {
 function normalizePreferences(value: unknown): WeatherPreferences | null {
   if (!value || typeof value !== 'object') return null;
   const raw = value as { version?: unknown; activeLocationId?: unknown; locations?: unknown };
-  if (raw.version !== WEATHER_SETTINGS_VERSION || !Array.isArray(raw.locations)) return null;
+  // 兼容 v1（默认地点还是固定地址的年代）：收藏原样保留，活动地点强制回到"当前位置"
+  if ((raw.version !== WEATHER_SETTINGS_VERSION && raw.version !== 1) || !Array.isArray(raw.locations)) return null;
 
   const locations: WeatherLocation[] = [{ ...DEFAULT_WEATHER_LOCATION }];
   const seenIds = new Set([DEFAULT_WEATHER_LOCATION.id]);
@@ -112,7 +113,7 @@ function normalizePreferences(value: unknown): WeatherPreferences | null {
     if (locations.length >= MAX_WEATHER_LOCATIONS) break;
   }
 
-  const requestedActiveId = cleanText(raw.activeLocationId, 80);
+  const requestedActiveId = raw.version === 1 ? '' : cleanText(raw.activeLocationId, 80);
   const activeLocationId = seenIds.has(requestedActiveId)
     ? requestedActiveId
     : DEFAULT_WEATHER_LOCATION.id;

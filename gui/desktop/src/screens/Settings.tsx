@@ -273,8 +273,8 @@ export function SettingsScreen() {
               color: 'var(--text-secondary)',
             }}
           >
-            默认地点为上海市长宁区华山路1076号。收藏地点与当前地点请在“天气预报”页面
-            管理和切换；城市搜索使用本地行政区划数据。认证凭据只由本机 Python 后端读取。
+            默认地点为“当前位置”（后端 IP 定位，城市级精度）。收藏地点与当前地点请在
+            “天气预报”页面管理和切换；城市搜索使用本地行政区划数据。认证凭据只由本机 Python 后端读取。
           </div>
           <div className="divider" />
           <div className="row gap-2" style={{ justifyContent: 'flex-end' }}>
