@@ -23,6 +23,8 @@ import { ModeQuickToggle } from './components/ModeQuickToggle';
 import { SystemBanners } from './components/SystemBanners';
 import { ServiceControls } from './components/ServiceControls';
 import { SidebarFxWidget } from './components/SidebarFxWidget';
+import { skyInfo } from './lib/weather';
+import { selectActiveWeatherEntry, useWeatherStore } from './store/weather';
 import { useSystemStore } from './store/system';
 
 type ScreenComponent = React.ComponentType;
@@ -112,6 +114,132 @@ const SCREEN_SUB: Record<ScreenId, string> = {
   about: 'Telegram 命令、系统组件与版本信息',
 };
 
+type WeatherThemeKind = 'sun' | 'rain' | 'night' | 'cloud' | 'thunder';
+type WeatherShellPhase = 'off' | 'entering' | 'on' | 'leaving';
+
+const WEATHER_THEME_CROSSFADE_MS = 720;
+const WEATHER_SHELL_TRANSITION_MS = 620;
+
+function resolveWeatherTheme(skycon: string | null | undefined, now: Date): WeatherThemeKind {
+  if (!skycon) return now.getHours() >= 19 || now.getHours() < 6 ? 'night' : 'sun';
+  const info = skyInfo(skycon);
+  if (info.icon === 'thunder') return 'thunder';
+  if (info.tone === 'rain' || info.tone === 'snow') return 'rain';
+  if (info.tone === 'night') return 'night';
+  if (info.tone === 'cloud' || info.tone === 'haze' || info.tone === 'wind') return 'cloud';
+  return 'sun';
+}
+
+function WeatherThemeLayer({
+  weather,
+  phase,
+}: {
+  weather: WeatherThemeKind;
+  phase: 'current' | 'previous';
+}) {
+  const rainy = weather === 'rain' || weather === 'thunder';
+  const cloudy = weather === 'cloud' || weather === 'thunder';
+  return (
+    <div className={`weather-theme-field is-${phase}`} data-weather={weather}>
+      <div className="weather-theme-vignette" />
+      {weather === 'sun' && (
+        <>
+          <span className="weather-theme-halo" />
+          {[0, 1, 2, 3, 4, 5, 6, 7, 8, 9].map(index => (
+            <span
+              key={`sun-mote-${index}`}
+              className="weather-theme-mote"
+              style={{
+                left: `${(index * 31 + 9) % 96}%`,
+                top: `${28 + ((index * 19) % 68)}%`,
+                animationDelay: `${-index * .9}s`,
+                animationDuration: `${10 + (index % 5) * 1.6}s`,
+              }}
+            />
+          ))}
+        </>
+      )}
+      {weather === 'night' && (
+        <>
+          <span className="weather-theme-moon" />
+          {Array.from({ length: 36 }, (_, index) => (
+            <span
+              key={`night-star-${index}`}
+              className="weather-theme-star"
+              style={{
+                left: `${(index * 37 + 5) % 97}%`,
+                top: `${(index * 23 + 7) % 78}%`,
+                width: `${1 + (index % 3) * .65}px`,
+                height: `${1 + (index % 3) * .65}px`,
+                animationDelay: `${-index * .17}s`,
+                animationDuration: `${2.2 + (index % 6) * .42}s`,
+              }}
+            />
+          ))}
+        </>
+      )}
+      {cloudy && [0, 1, 2, 3, 4, 5].map(index => (
+        <span
+          key={`theme-cloud-${index}`}
+          className="weather-theme-cloud"
+          style={{
+            left: `${[-7, 12, 31, 52, 69, 84][index]}%`,
+            top: `${[4, 32, 11, 48, 23, 58][index]}%`,
+            width: `${250 + (index % 3) * 92}px`,
+            height: `${120 + (index % 3) * 34}px`,
+            animationDelay: `${-index * 1.8}s`,
+            animationDuration: `${13 + index * 1.3}s`,
+          }}
+        />
+      ))}
+      {rainy && Array.from({ length: weather === 'thunder' ? 38 : 30 }, (_, index) => (
+        <span
+          key={`theme-rain-${index}`}
+          className="weather-theme-drop"
+          style={{
+            left: `${(index * 29 + 3) % 100}%`,
+            height: `${42 + (index % 7) * 8}px`,
+            opacity: .24 + (index % 5) * .07,
+            animationDelay: `${-(index % 13) * .08}s`,
+            animationDuration: `${weather === 'thunder' ? .42 + (index % 5) * .055 : .58 + (index % 6) * .06}s`,
+          }}
+        />
+      ))}
+      {weather === 'thunder' && <span className="weather-theme-flash" />}
+    </div>
+  );
+}
+
+const WeatherThemeBackdrop = React.memo(function WeatherThemeBackdrop({ weather }: { weather: WeatherThemeKind }) {
+  const [current, setCurrent] = React.useState(weather);
+  const [previous, setPrevious] = React.useState<WeatherThemeKind | null>(null);
+  const cleanupTimer = React.useRef<number | null>(null);
+
+  React.useLayoutEffect(() => {
+    if (weather === current) return;
+    if (cleanupTimer.current !== null) window.clearTimeout(cleanupTimer.current);
+    setPrevious(current);
+    setCurrent(weather);
+    cleanupTimer.current = window.setTimeout(() => {
+      setPrevious(null);
+      cleanupTimer.current = null;
+    }, WEATHER_THEME_CROSSFADE_MS);
+  }, [current, weather]);
+
+  React.useEffect(() => () => {
+    if (cleanupTimer.current !== null) window.clearTimeout(cleanupTimer.current);
+  }, []);
+
+  return (
+    <div className="weather-theme-stack" aria-hidden="true">
+      {previous && previous !== current && (
+        <WeatherThemeLayer key={previous} weather={previous} phase="previous" />
+      )}
+      <WeatherThemeLayer key={current} weather={current} phase="current" />
+    </div>
+  );
+});
+
 interface SidebarProps {
   screen: ScreenId;
   setScreen: (s: ScreenId) => void;
@@ -170,7 +298,7 @@ function TitleBar() {
       <div className="titlebar-app">
         <div className="app-mark">A</div>
         <span>AAS</span>
-        <span style={{ color: 'var(--text-muted)', fontWeight: 400, marginLeft: 4 }}>v2.0</span>
+        <span className="tb-ver">v2.0</span>
       </div>
       <div className="titlebar-title">Auto Attendance · 赖得鑫@localhost</div>
       <div className="window-controls">
@@ -198,7 +326,7 @@ interface ToolbarProps {
 function Toolbar({ title, sub, actions, clock }: ToolbarProps) {
   return (
     <div className="toolbar">
-      <div className="row gap-4">
+      <div className="row gap-4 toolbar-lead">
         <div className="toolbar-title">{title}</div>
         {sub && <div className="toolbar-sub">{sub}</div>}
       </div>
@@ -211,7 +339,9 @@ function Toolbar({ title, sub, actions, clock }: ToolbarProps) {
 }
 
 export function App() {
-  const [screen, setScreen] = React.useState<ScreenId>('dashboard');
+  const [screen, setRenderedScreen] = React.useState<ScreenId>('dashboard');
+  const [weatherShellPhase, setWeatherShellPhase] = React.useState<WeatherShellPhase>('off');
+  const weatherNavigationTimer = React.useRef<number | null>(null);
   const [currentUser, setCurrentUser] = React.useState<string>('赖得鑫');
   const clock = useClock();
   // 模式状态来自后端真实配置（单一事实源 = snapshot.config）；切换走 setMode（乐观更新+持久化+失败回滚）
@@ -222,6 +352,78 @@ export function App() {
   const setSeleniumOn = (v: boolean) => { void setMode({ use_selenium_login: v }); };
   const setHeadless = (v: boolean) => { void setMode({ selenium_headless: v }); };
   const [opState, setOpState] = React.useState<OpState>({ running: false, type: null, perUser: {} });
+  const weatherEntry = useWeatherStore(selectActiveWeatherEntry);
+  const weatherSkycon = weatherEntry.data?.realtime.skycon;
+  const [weatherTheme, setWeatherTheme] = React.useState<WeatherThemeKind>(() => (
+    resolveWeatherTheme(weatherSkycon, new Date())
+  ));
+
+  React.useEffect(() => {
+    if (!weatherSkycon) return;
+    const nextTheme = resolveWeatherTheme(weatherSkycon, new Date());
+    setWeatherTheme(current => current === nextTheme ? current : nextTheme);
+  }, [weatherSkycon]);
+
+  const clearWeatherNavigationTransition = React.useCallback(() => {
+    if (weatherNavigationTimer.current !== null) {
+      window.clearTimeout(weatherNavigationTimer.current);
+      weatherNavigationTimer.current = null;
+    }
+  }, []);
+
+  React.useEffect(() => clearWeatherNavigationTransition, [clearWeatherNavigationTransition]);
+
+  const setScreen = React.useCallback((nextScreen: ScreenId) => {
+    const reduceMotion = window.matchMedia?.('(prefers-reduced-motion: reduce)').matches ?? false;
+    const duration = reduceMotion ? 0 : WEATHER_SHELL_TRANSITION_MS;
+
+    if (nextScreen === screen) return;
+    clearWeatherNavigationTransition();
+
+    if (weatherShellPhase === 'leaving' && nextScreen !== 'weather') {
+      setRenderedScreen(nextScreen);
+      if (duration === 0) {
+        setWeatherShellPhase('off');
+        return;
+      }
+      setWeatherShellPhase('leaving');
+      weatherNavigationTimer.current = window.setTimeout(() => {
+        setWeatherShellPhase('off');
+        weatherNavigationTimer.current = null;
+      }, duration);
+      return;
+    }
+
+    if (screen === 'weather' && nextScreen !== 'weather') {
+      setRenderedScreen(nextScreen);
+      if (duration === 0) {
+        setWeatherShellPhase('off');
+        return;
+      }
+      setWeatherShellPhase('leaving');
+      weatherNavigationTimer.current = window.setTimeout(() => {
+        setWeatherShellPhase('off');
+        weatherNavigationTimer.current = null;
+      }, duration);
+      return;
+    }
+
+    setRenderedScreen(nextScreen);
+    if (nextScreen !== 'weather') {
+      setWeatherShellPhase('off');
+      return;
+    }
+    if (duration === 0) {
+      setWeatherShellPhase('on');
+      return;
+    }
+
+    setWeatherShellPhase('entering');
+    weatherNavigationTimer.current = window.setTimeout(() => {
+      setWeatherShellPhase('on');
+      weatherNavigationTimer.current = null;
+    }, duration);
+  }, [clearWeatherNavigationTransition, screen, weatherShellPhase]);
 
   const sysStatus: SysStatus = {
     serviceLabel: 'Telegram Bot · 在线',
@@ -241,11 +443,18 @@ export function App() {
   const ScreenCmp = SCREENS[screen];
   const screenTitle = NAV.find(n => n.id === screen)?.label ?? '仪表盘';
   const screenSub = SCREEN_SUB[screen];
+  const weatherShellVisible = weatherShellPhase === 'entering' || weatherShellPhase === 'on';
 
   return (
     <AppCtx.Provider value={ctxValue}>
-      <div className="desktop">
+      <div
+        className="desktop"
+        data-weather={weatherTheme}
+        data-immersive={weatherShellVisible ? 'on' : 'off'}
+        data-weather-transition={weatherShellPhase}
+      >
         <div className="win">
+          <WeatherThemeBackdrop weather={weatherTheme} />
           <TitleBar />
           <div className="shell">
             <Sidebar
