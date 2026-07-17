@@ -88,6 +88,17 @@ export interface GeolocateResponse {
   stale?: boolean;
 }
 
+export interface WeatherRestPeriod {
+  start: string;
+  end: string;
+  name: string | null;
+  label: string;
+  kind: 'weekend' | 'holiday';
+  next_workday: string;
+  window_start: string;
+  window_end: string;
+}
+
 export interface WeatherResponse {
   success: true;
   source: '彩云天气';
@@ -124,6 +135,10 @@ export interface WeatherResponse {
   minutely_description: string | null;
   hourly: WeatherHourlyItem[];
   daily: WeatherDailyItem[];
+  /** 头盔提醒的 15 天日级兜底；普通天气页面仍使用 daily。 */
+  rest_daily?: WeatherDailyItem[];
+  /** 头盔提醒窗口：休息首日前一天 17:00 至假后首个工作日 08:00。 */
+  rest_periods?: WeatherRestPeriod[];
   alerts: WeatherAlertItem[];
   alerts_available: boolean;
   alerts_total: number;

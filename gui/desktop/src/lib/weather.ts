@@ -1,7 +1,9 @@
 import {
   api,
   ApiError,
+  type WeatherDailyItem,
   type WeatherHourlyItem,
+  type WeatherRestPeriod,
   type WeatherResponse,
 } from './api';
 import {
@@ -176,7 +178,36 @@ export interface NightRainAdvice {
   slots: NightRainSlot[];
 }
 
+export interface RestRainDaySlot {
+  date: string;
+  label: string;
+  probability: number | null;
+  wet: boolean;
+  covered: boolean;
+  estimated: boolean;
+}
+
+export interface RestRainAdvice {
+  mode: 'rest';
+  status: 'rain' | 'dry' | 'unknown';
+  title: string;
+  badge: string;
+  detail: string;
+  rainDays: number;
+  rainHours: number;
+  complete: boolean;
+  days: RestRainDaySlot[];
+  period: WeatherRestPeriod;
+  windowStart: number;
+  windowEnd: number;
+}
+
+export type HelmetRainAdvice =
+  | ({ mode: 'night' } & NightRainAdvice)
+  | RestRainAdvice;
+
 const SHANGHAI_OFFSET_MS = 8 * 60 * 60 * 1000;
+const HOUR_MS = 60 * 60 * 1000;
 
 function shanghaiDate(base: Date): Date {
   return new Date(base.getTime() + SHANGHAI_OFFSET_MS);
@@ -202,6 +233,220 @@ function isWetHour(item: WeatherHourlyItem): boolean {
     || code.includes('SNOW')
     || (Number.isFinite(item.precipitation_probability) && (item.precipitation_probability ?? 0) >= 30)
     || (Number.isFinite(item.precipitation) && (item.precipitation ?? 0) >= 0.03);
+}
+
+function isCoveredHour(item: WeatherHourlyItem | undefined): boolean {
+  if (!item) return false;
+  return Number.isFinite(item.precipitation_probability)
+    || Number.isFinite(item.precipitation)
+    || Boolean(item.skycon);
+}
+
+function isWetDay(item: WeatherDailyItem): boolean {
+  const code = item.skycon || '';
+  return code.includes('RAIN')
+    || code.includes('SNOW')
+    || (Number.isFinite(item.precipitation_probability) && (item.precipitation_probability ?? 0) >= 30);
+}
+
+function isCoveredDay(item: WeatherDailyItem | undefined): boolean {
+  return Boolean(item && (item.skycon || Number.isFinite(item.precipitation_probability)));
+}
+
+function shanghaiDayIso(epoch: number): string {
+  const date = shanghaiDate(new Date(epoch));
+  return [
+    date.getUTCFullYear(),
+    String(date.getUTCMonth() + 1).padStart(2, '0'),
+    String(date.getUTCDate()).padStart(2, '0'),
+  ].join('-');
+}
+
+function restDayLabel(date: string, today: string): string {
+  const parsed = new Date(`${date}T00:00:00Z`);
+  const todayEpoch = new Date(`${today}T00:00:00Z`).getTime();
+  const delta = Math.round((parsed.getTime() - todayEpoch) / (24 * HOUR_MS));
+  if (delta === 0) return '今天';
+  if (delta === 1) return '明天';
+  if (delta === -1) return '昨天';
+  if (Number.isNaN(parsed.getTime())) return date.slice(5);
+  return ['周日', '周一', '周二', '周三', '周四', '周五', '周六'][parsed.getUTCDay()];
+}
+
+function windowTimeLabel(epoch: number): string {
+  const date = shanghaiDate(new Date(epoch));
+  return `${date.getUTCMonth() + 1}/${date.getUTCDate()} ${String(date.getUTCHours()).padStart(2, '0')}:00`;
+}
+
+function buildRestRainAdvice(
+  hourly: WeatherHourlyItem[],
+  daily: WeatherDailyItem[],
+  periods: WeatherRestPeriod[],
+  now: Date,
+  current?: Pick<WeatherResponse['realtime'], 'skycon' | 'precipitation_intensity'>,
+): RestRainAdvice | null {
+  const nowEpoch = now.getTime();
+  const active = periods
+    .map(period => ({
+      period,
+      start: new Date(period.window_start).getTime(),
+      end: new Date(period.window_end).getTime(),
+    }))
+    .find(({ start, end }) => (
+      Number.isFinite(start)
+      && Number.isFinite(end)
+      && nowEpoch >= start
+      && nowEpoch < end
+    ));
+  if (!active) return null;
+
+  const effectiveStart = Math.max(nowEpoch, active.start);
+  const firstFullHour = Math.ceil(effectiveStart / HOUR_MS) * HOUR_MS;
+  const byHour = new Map<number, WeatherHourlyItem>();
+  for (const item of hourly) {
+    const parsed = new Date(item.datetime);
+    if (Number.isNaN(parsed.getTime())) continue;
+    byHour.set(Math.floor(parsed.getTime() / HOUR_MS) * HOUR_MS, item);
+  }
+
+  const hourSlots: Array<{
+    datetime: number;
+    probability: number | null;
+    wet: boolean;
+    covered: boolean;
+  }> = [];
+  for (
+    let datetime = Math.floor(effectiveStart / HOUR_MS) * HOUR_MS;
+    datetime < active.end;
+    datetime += HOUR_MS
+  ) {
+    const item = byHour.get(datetime);
+    const rawProbability = item?.precipitation_probability;
+    const probability = Number.isFinite(rawProbability)
+      ? Math.max(0, Math.min(100, rawProbability as number))
+      : null;
+    let wet = item ? isWetHour(item) : false;
+    let covered = isCoveredHour(item);
+
+    // 当前残余小时用实况补齐，保证假后上班日 08:00 前仍能判断正在发生的降水。
+    if (datetime < firstFullHour && datetime + HOUR_MS > effectiveStart && current) {
+      const currentIntensity = Number.isFinite(current.precipitation_intensity)
+        ? Math.max(0, current.precipitation_intensity as number)
+        : null;
+      const currentSkyconWet = Boolean(current.skycon?.includes('RAIN') || current.skycon?.includes('SNOW'));
+      wet = wet || currentSkyconWet || (currentIntensity ?? 0) >= 0.03;
+      covered = covered || currentIntensity !== null || Boolean(current.skycon);
+    }
+    hourSlots.push({ datetime, probability, wet, covered });
+  }
+
+  const dailyByDate = new Map(daily.map(item => [item.date, item]));
+  const todayIso = shanghaiDayIso(nowEpoch);
+  const dates = [...new Set(hourSlots.map(slot => shanghaiDayIso(slot.datetime)))];
+  const daySlots: RestRainDaySlot[] = dates.map(date => {
+    const hours = hourSlots.filter(slot => shanghaiDayIso(slot.datetime) === date);
+    const dailyItem = dailyByDate.get(date);
+    const hourlyCovered = hours.length > 0 && hours.every(slot => slot.covered);
+    const dailyCovered = isCoveredDay(dailyItem);
+    const estimated = !hourlyCovered && dailyCovered;
+    const probabilities = hours
+      .map(slot => slot.probability)
+      .filter((value): value is number => value !== null);
+    if (estimated && Number.isFinite(dailyItem?.precipitation_probability)) {
+      probabilities.push(dailyItem!.precipitation_probability as number);
+    }
+    return {
+      date,
+      label: restDayLabel(date, todayIso),
+      probability: probabilities.length ? Math.max(...probabilities) : null,
+      wet: hours.some(slot => slot.covered && slot.wet)
+        || Boolean(estimated && dailyItem && isWetDay(dailyItem)),
+      covered: hourlyCovered || dailyCovered,
+      estimated,
+    };
+  });
+
+  const wetDays = daySlots.filter(slot => slot.covered && slot.wet);
+  const rainHours = hourSlots.filter(slot => slot.covered && slot.wet).length;
+  const complete = daySlots.length > 0 && daySlots.every(slot => slot.covered);
+  const estimated = daySlots.some(slot => slot.estimated);
+  const range = `${windowTimeLabel(active.start)}–${windowTimeLabel(active.end)}`;
+  const sourceNote = estimated ? ' · 远期时段按日级预报判断' : '';
+  const incomplete = complete ? '' : ' · 部分时段预报待补齐';
+
+  if (!wetDays.length && !complete) {
+    return {
+      mode: 'rest',
+      status: 'unknown',
+      title: `${active.period.label}雨情待确认，建议先收好头盔`,
+      badge: '预报时段未完整',
+      detail: `提醒窗口 ${range} · 预报补齐前建议把头盔放进收纳箱${sourceNote}${incomplete}`,
+      rainDays: 0,
+      rainHours,
+      complete,
+      days: daySlots,
+      period: active.period,
+      windowStart: active.start,
+      windowEnd: active.end,
+    };
+  }
+
+  if (!wetDays.length) {
+    return {
+      mode: 'rest',
+      status: 'dry',
+      title: `${active.period.label}雨险低，头盔可按日常放置`,
+      badge: '剩余时段暂无明显降水',
+      detail: `提醒窗口 ${range} · 目前无需因降雨调整头盔存放${sourceNote}`,
+      rainDays: 0,
+      rainHours,
+      complete,
+      days: daySlots,
+      period: active.period,
+      windowStart: active.start,
+      windowEnd: active.end,
+    };
+  }
+
+  const peak = wetDays.reduce((best, slot) => (
+    (slot.probability ?? -1) > (best.probability ?? -1) ? slot : best
+  ));
+  const peakText = peak.probability === null
+    ? `${peak.label}有降水`
+    : `最高 ${peak.label} ${Math.round(peak.probability)}%`;
+  const rainyDayText = wetDays.map(slot => slot.label).join('、');
+  return {
+    mode: 'rest',
+    status: 'rain',
+    title: `${active.period.label}有雨，建议收好头盔`,
+    badge: peakText,
+    detail: `提醒窗口 ${range} · ${rainyDayText}有降水信号，离车时请把头盔放进收纳箱${sourceNote}${incomplete}`,
+    rainDays: wetDays.length,
+    rainHours,
+    complete,
+    days: daySlots,
+    period: active.period,
+    windowStart: active.start,
+    windowEnd: active.end,
+  };
+}
+
+export function buildHelmetRainAdvice(
+  data: Pick<WeatherResponse, 'hourly' | 'daily' | 'rest_daily' | 'realtime' | 'rest_periods'>,
+  now = new Date(),
+): HelmetRainAdvice {
+  const restAdvice = buildRestRainAdvice(
+    data.hourly,
+    data.rest_daily ?? data.daily,
+    data.rest_periods ?? [],
+    now,
+    data.realtime,
+  );
+  if (restAdvice) return restAdvice;
+  return {
+    mode: 'night',
+    ...buildNightRainAdvice(data.hourly, now, data.realtime),
+  };
 }
 
 export function buildNightRainAdvice(
