@@ -122,7 +122,11 @@ export interface WeatherRestPeriod {
   label: string;
   kind: 'weekend' | 'holiday';
   next_workday: string;
+  /** 提示展示起点：休息首日前一天 00:00。 */
+  display_start?: string;
+  /** 降雨判定起点：休息首日前一天 17:00。 */
   window_start: string;
+  /** 降雨判定终点：假后首个工作日 08:00。 */
   window_end: string;
 }
 
@@ -163,7 +167,7 @@ export interface WeatherResponse {
   daily: WeatherDailyItem[];
   /** 头盔提醒的 15 天日级兜底；普通天气页面仍使用 daily。 */
   rest_daily?: WeatherDailyItem[];
-  /** 头盔提醒窗口：休息首日前一天 17:00 至假后首个工作日 08:00。 */
+  /** 头盔提示区间：前一天 00:00 起展示，降雨判定使用各 period 的 window_start/end。 */
   rest_periods?: WeatherRestPeriod[];
   alerts: WeatherAlertItem[];
   alerts_available: boolean;
