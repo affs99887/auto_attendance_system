@@ -287,15 +287,25 @@ function buildRestRainAdvice(
 ): RestRainAdvice | null {
   const nowEpoch = now.getTime();
   const active = periods
-    .map(period => ({
-      period,
-      start: new Date(period.window_start).getTime(),
-      end: new Date(period.window_end).getTime(),
-    }))
-    .find(({ start, end }) => (
-      Number.isFinite(start)
+    .map(period => {
+      const start = new Date(period.window_start).getTime();
+      const explicitDisplayStart = period.display_start
+        ? new Date(period.display_start).getTime()
+        : Number.NaN;
+      return {
+        period,
+        start,
+        displayStart: Number.isFinite(explicitDisplayStart)
+          ? explicitDisplayStart
+          : start - 17 * HOUR_MS,
+        end: new Date(period.window_end).getTime(),
+      };
+    })
+    .find(({ displayStart, start, end }) => (
+      Number.isFinite(displayStart)
+      && Number.isFinite(start)
       && Number.isFinite(end)
-      && nowEpoch >= start
+      && nowEpoch >= displayStart
       && nowEpoch < end
     ));
   if (!active) return null;

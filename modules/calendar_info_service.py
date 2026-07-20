@@ -124,8 +124,8 @@ def get_weather_rest_periods(reference_day=None, lookahead_days=15):
     """返回天气提醒覆盖范围内的连续休息区间。
 
     范围额外包含 reference_day 的前一天，确保休假结束后的首个工作日 08:00 前，
-    前端仍能识别刚结束的休息段。每段同时给出提醒窗口：
-    「休息首日前一天 17:00」至「休息结束后首个工作日 08:00」。
+    前端仍能识别刚结束的休息段。提示从休息首日前一天 00:00 起展示；
+    降雨判定窗口为「休息首日前一天 17:00」至「休息结束后首个工作日 08:00」。
     """
     today = reference_day or datetime.date.today()
     if isinstance(today, datetime.datetime):
@@ -152,8 +152,14 @@ def get_weather_rest_periods(reference_day=None, lookahead_days=15):
             seen.add(key)
             name = _span_holiday_name(first, last)
             next_workday = _workday_after(last)
+            day_before_rest = first - datetime.timedelta(days=1)
+            display_start = datetime.datetime.combine(
+                day_before_rest,
+                datetime.time(),
+                tzinfo=datetime.timezone(datetime.timedelta(hours=8)),
+            )
             window_start = datetime.datetime.combine(
-                first - datetime.timedelta(days=1),
+                day_before_rest,
                 datetime.time(hour=17),
                 tzinfo=datetime.timezone(datetime.timedelta(hours=8)),
             )
@@ -174,6 +180,7 @@ def get_weather_rest_periods(reference_day=None, lookahead_days=15):
                 ),
                 'kind': 'holiday' if name else 'weekend',
                 'next_workday': next_workday.isoformat(),
+                'display_start': display_start.isoformat(),
                 'window_start': window_start.isoformat(),
                 'window_end': window_end.isoformat(),
             })
