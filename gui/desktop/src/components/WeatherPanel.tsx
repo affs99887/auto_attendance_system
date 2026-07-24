@@ -489,17 +489,17 @@ function WeatherCompactHourlyChart({
   const gradientKey = React.useId().replace(/:/g, '');
   const hours = items.slice(0, 12);
   const isSmall = size === 's';
-  const viewBox = isSmall ? '0 -7 360 99' : '0 0 620 176';
+  const viewBox = isSmall ? '0 -7 360 99' : '0 0 620 150';
   const startX = isSmall ? 16 : 20;
   const endX = isSmall ? 344 : 588;
-  const temperatureTop = isSmall ? 14 : 50;
-  const temperatureBottom = isSmall ? 38 : 98;
-  const temperatureBaseline = isSmall ? 44 : 110;
-  const timeY = isSmall ? 56 : 128;
-  const dividerY = isSmall ? 61 : 136;
-  const rainBaseline = isSmall ? 88 : 172;
-  const rainFillBaseline = isSmall ? 89 : 173;
-  const rainScale = isSmall ? 0.18 : 0.28;
+  const temperatureTop = isSmall ? 14 : 44;
+  const temperatureBottom = isSmall ? 38 : 84;
+  const temperatureBaseline = isSmall ? 44 : 94;
+  const timeY = isSmall ? 56 : 108;
+  const dividerY = isSmall ? 61 : 114;
+  const rainBaseline = isSmall ? 88 : 146;
+  const rainFillBaseline = isSmall ? 89 : 147;
+  const rainScale = isSmall ? 0.18 : 0.22;
   const step = hours.length > 1 ? (endX - startX) / (hours.length - 1) : 0;
   const temperatures = hours
     .map(item => item.temperature)
@@ -558,7 +558,7 @@ function WeatherCompactHourlyChart({
 
           {!isSmall && hours.map((item, index) => {
             const info = skyInfo(item.skycon);
-            return <WeatherIcon key={`compact-icon-${item.datetime}-${index}`} skycon={item.skycon} size={22} x={startX + step * index - 11} y={6} className={`weather-chart-icon tone-${info.tone}`} />;
+            return <WeatherIcon key={`compact-icon-${item.datetime}-${index}`} skycon={item.skycon} size={20} x={startX + step * index - 10} y={4} className={`weather-chart-icon tone-${info.tone}`} />;
           })}
 
           {temperatureSegments.map((segment, index) => {
@@ -574,7 +574,7 @@ function WeatherCompactHourlyChart({
           })}
 
           {temperaturePoints.map((point, index) => point && temperatureLabelIndexes.has(index) ? (
-            <text key={`compact-temp-${index}`} x={point.x} y={Math.max(isSmall ? 8 : 42, point.y - 8)} className="weather-chart-temp">{roundWeather(point.item.temperature, '°')}</text>
+            <text key={`compact-temp-${index}`} x={point.x} y={Math.max(isSmall ? 8 : 36, point.y - 8)} className="weather-chart-temp">{roundWeather(point.item.temperature, '°')}</text>
           ) : null)}
           {temperaturePoints[0] && <circle cx={temperaturePoints[0].x} cy={temperaturePoints[0].y} r={isSmall ? 3.2 : 4.5} fill="var(--bg-inset)" stroke="var(--weather-plot-color)" strokeWidth={isSmall ? 2 : 2.5} />}
 
@@ -582,7 +582,7 @@ function WeatherCompactHourlyChart({
             <text key={`compact-hour-${index}`} x={startX + step * index} y={timeY} className={`weather-chart-hour ${index === 0 ? 'current' : ''}`}>{compactHourLabel(item, index, size)}</text>
           ) : null)}
           <line x1={isSmall ? 8 : 10} y1={dividerY} x2={isSmall ? 352 : 592} y2={dividerY} stroke="var(--border-soft)" strokeWidth="1" />
-          <text x={isSmall ? 4 : 6} y={isSmall ? 84 : 160} className="weather-chart-rain-label">降水</text>
+          <text x={isSmall ? 4 : 6} y={isSmall ? 84 : 136} className="weather-chart-rain-label">降水</text>
 
           {rainSegments.map((segment, index) => {
             const first = segment[0];
@@ -596,7 +596,7 @@ function WeatherCompactHourlyChart({
             );
           })}
           {maxRainPoint && (maxRainPoint.item.precipitation_probability ?? 0) > 0 && (
-            <text x={maxRainPoint.x} y={Math.max(isSmall ? 66 : 142, maxRainPoint.y - (isSmall ? 3 : 4))} className="weather-chart-rain-value">
+            <text x={maxRainPoint.x} y={Math.max(isSmall ? 66 : 120, maxRainPoint.y - (isSmall ? 3 : 4))} className="weather-chart-rain-value">
               {Math.round(maxRainPoint.item.precipitation_probability ?? 0)}%
             </text>
           )}
@@ -742,7 +742,7 @@ export function WeatherDailyStrip({
               ) : (
                 <span className={index === 0 ? 'today' : ''}>{size === 's' ? compactDayLabel(day.date, index) : weatherDayLabel(day.date, index)}</span>
               )}
-              <WeatherIcon skycon={day.skycon} size={size === 's' ? 18 : size === 'm' ? 26 : 24} className={`tone-${info.tone}`} />
+              <WeatherIcon skycon={day.skycon} size={size === 's' ? 18 : size === 'm' ? 22 : 24} className={`tone-${info.tone}`} />
               {size === 's' ? (
                 <>
                   <strong className="mono">{roundWeather(day.temperature_max, '°')}</strong>
