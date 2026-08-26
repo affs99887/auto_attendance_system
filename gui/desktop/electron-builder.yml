@@ -39,6 +39,7 @@ extraResources:
       - watchdog.py
       - requirements.txt
       - .env.example
+      - scripts/close-claude-processes.ps1
       - modules/**/*
       - templates/**/*
       - bin/**/*            # 内置网络加速：mihomo 内核 + geo 数据（由 scripts/fetch-mihomo.ps1 准备）

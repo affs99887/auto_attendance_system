@@ -55,6 +55,8 @@ contextBridge.exposeInMainWorld('AAS_SERVICE', {
 
 contextBridge.exposeInMainWorld('AAS_SYSTEM', {
   openLogs: () => ipcRenderer.invoke('system:open-logs'), // resolve 空串=成功，非空=错误
+  // 关闭 Claude Desktop / Claude Code 及其子进程；必要时由主进程触发 Windows UAC
+  closeClaude: () => ipcRenderer.invoke('system:close-claude'),
   // 用系统默认图片查看器打开本地截图（不弹浏览器）；resolve 空串=成功，非空=错误信息
   openScreenshot: (relPath) => ipcRenderer.invoke('screenshot:open', relPath),
 });

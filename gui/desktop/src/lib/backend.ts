@@ -53,6 +53,14 @@ declare global {
     /** 系统能力桥（纯浏览器下为 undefined） */
     AAS_SYSTEM?: {
       openLogs: () => Promise<string>;
+      /** 关闭 Claude Desktop / Claude Code 及其子进程；必要时触发 Windows UAC */
+      closeClaude: () => Promise<{
+        success: boolean;
+        matchedCount: number;
+        stoppedCount: number;
+        remainingCount: number;
+        message: string;
+      }>;
       /** 用系统默认图片查看器打开本地截图原图。入参为后端返回的相对路径；resolve 空串=成功，非空=错误信息 */
       openScreenshot: (path: string) => Promise<string>;
     };

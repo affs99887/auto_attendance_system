@@ -19,6 +19,7 @@ import {
 import { FxSection } from '../components/ExchangeRatePanel';
 import { useAiNewsStore, CATEGORY_BY_SLUG, relTime } from '../store/aiNews';
 import { useToastStore } from '../store/toast';
+import { appConfirm } from '../lib/dialog';
 
 /** 后端 today_records 时间字段：`'08:29:55'` 或 `'1900-01-01T08:29:55'`，统一抽 HH:MM:SS */
 function extractTime(raw: string | null | undefined): string | null {
@@ -572,6 +573,31 @@ function ActivityRow({ entry }: { entry: RecentActivityEntry }) {
 export function DashboardScreen() {
   const { sysStatus, headless, setScreen, currentUser, clock } = useApp();
   const snapshot = useSystemStore(s => s.snapshot);
+  const [claudeClosing, setClaudeClosing] = React.useState(false);
+
+  const handleCloseClaude = async () => {
+    const bridge = window.AAS_SYSTEM?.closeClaude;
+    if (!bridge) {
+      useToastStore.getState().push('err', '当前运行环境不支持本机进程管理');
+      return;
+    }
+    const confirmed = await appConfirm(
+      '将强制关闭 Claude 桌面端、Claude Code 及其子进程。未保存的 Claude 会话可能丢失，是否继续？',
+      { title: '关闭所有 Claude 进程', confirmText: '全部关闭', danger: true },
+    );
+    if (!confirmed) return;
+
+    setClaudeClosing(true);
+    useToastStore.getState().push('ok', '正在查找 Claude 相关进程，可能需要确认 Windows 管理员权限…');
+    try {
+      const result = await bridge();
+      useToastStore.getState().push(result.success ? 'ok' : 'err', result.message);
+    } catch (e) {
+      useToastStore.getState().push('err', `关闭失败：${(e as Error).message}`);
+    } finally {
+      setClaudeClosing(false);
+    }
+  };
 
   // 跨过 0 点（本地日期变化）时刷新一次系统快照，避免今日记录停留在昨天。
   // 仅比较「年-月-日」串，日期不变（每秒 tick）时不触发。
@@ -712,6 +738,16 @@ export function DashboardScreen() {
             <StatusDot tone={snapshot ? 'success' : 'warning'} />
             {modeLabel}
           </div>
+          <button
+            className="btn btn-danger btn-sm"
+            style={{ width: '100%', justifyContent: 'center', marginTop: 8 }}
+            disabled={claudeClosing}
+            onClick={() => void handleCloseClaude()}
+            title="关闭 Claude 桌面端、Claude Code 及其子进程"
+          >
+            <Icon.Power size={12} />
+            {claudeClosing ? '正在关闭 Claude…' : '一键关闭 Claude'}
+          </button>
         </div>
       </div>
 

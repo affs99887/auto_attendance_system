@@ -44,6 +44,7 @@ const RESTART_MAX = 5;
 let restartHistory = [];
 let bluetoothRequest = null;
 let pairingRequest = null;
+let claudeCleanupPending = false;
 
 // ============================================================================
 // 服务控制状态机标志（供 service:* IPC 区分「手动停止 / 重启 / 崩溃」三种 exit）
@@ -859,6 +860,87 @@ ipcMain.handle('system:open-logs', () => {
   const dir = path.join(DATA_DIR, 'logs');
   try { fs.mkdirSync(dir, { recursive: true }); } catch { /* ignore */ }
   return shell.openPath(dir); // 返回空串=成功，非空=错误信息
+});
+
+// 一键关闭 Claude Desktop / Claude Code 及其子进程。
+// 进程识别、提权和终止都在固定脚本中完成；渲染层不能传脚本路径或任意参数。
+ipcMain.handle('system:close-claude', async () => {
+  if (process.platform !== 'win32') {
+    return { success: false, matchedCount: 0, stoppedCount: 0, remainingCount: 0, message: '此功能仅支持 Windows' };
+  }
+  if (claudeCleanupPending) {
+    return { success: false, matchedCount: 0, stoppedCount: 0, remainingCount: 0, message: '正在关闭 Claude 进程，请稍候' };
+  }
+
+  const scriptPath = path.join(PROJECT_ROOT, 'scripts', 'close-claude-processes.ps1');
+  if (!fs.existsSync(scriptPath)) {
+    return { success: false, matchedCount: 0, stoppedCount: 0, remainingCount: 0, message: '关闭脚本不存在，请重新安装或打包应用' };
+  }
+
+  const resultPath = path.join(app.getPath('temp'), `aas-close-claude-${process.pid}-${Date.now()}.json`);
+  claudeCleanupPending = true;
+  try {
+    const execution = await new Promise(resolve => {
+      const child = spawn(
+        'powershell.exe',
+        [
+          '-NoProfile',
+          '-ExecutionPolicy', 'Bypass',
+          '-WindowStyle', 'Hidden',
+          '-File', scriptPath,
+          '-ResultFile', resultPath,
+        ],
+        { windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] },
+      );
+      let stderr = '';
+      child.stderr.on('data', chunk => {
+        if (stderr.length < 4000) stderr += chunk.toString();
+      });
+      child.on('error', error => resolve({ code: -1, error: error.message, stderr }));
+      child.on('close', code => resolve({ code: code ?? -1, error: '', stderr }));
+    });
+
+    let result = null;
+    if (fs.existsSync(resultPath)) {
+      const raw = fs.readFileSync(resultPath, 'utf8').replace(/^\uFEFF/, '');
+      result = JSON.parse(raw);
+    }
+
+    if (!result || typeof result.success !== 'boolean') {
+      const detail = execution.error || execution.stderr.trim() || `PowerShell 退出码 ${execution.code}`;
+      return { success: false, matchedCount: 0, stoppedCount: 0, remainingCount: 0, message: `关闭失败：${detail}` };
+    }
+
+    if (result.success && result.matchedCount === 0) {
+      return { ...result, message: '当前没有正在运行的 Claude 相关进程' };
+    }
+    if (result.success) {
+      return { ...result, message: `已关闭 ${result.stoppedCount} 个 Claude 相关进程` };
+    }
+    if (/approval was cancelled|privileges were not granted/i.test(result.message || '')) {
+      return { ...result, message: '未获得管理员权限，操作已取消' };
+    }
+    if (result.remainingCount > 0) {
+      return {
+        ...result,
+        message: `已关闭 ${result.stoppedCount} 个，仍有 ${result.remainingCount} 个 Claude 相关进程未能关闭`,
+      };
+    }
+    return { ...result, message: `关闭失败：${result.message || '未知错误'}` };
+  } catch (error) {
+    return {
+      success: false,
+      matchedCount: 0,
+      stoppedCount: 0,
+      remainingCount: 0,
+      message: `关闭失败：${(error && error.message) || error}`,
+    };
+  } finally {
+    claudeCleanupPending = false;
+    try {
+      if (fs.existsSync(resultPath)) fs.unlinkSync(resultPath);
+    } catch { /* ignore temporary result cleanup failure */ }
+  }
 });
 
 // 用系统默认图片查看器打开本地截图原图（入参为后端返回的相对路径，如 screenshots\user\punch_in\xxx.png）
