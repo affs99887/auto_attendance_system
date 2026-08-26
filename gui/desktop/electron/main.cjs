@@ -9,7 +9,7 @@
 //   1. dev:  AAS_DEV=1 npx electron electron/main.cjs   （Vite 必须先启）
 //   2. prod: npx electron .                             （走 build 后的 dist）
 
-const { app, BrowserWindow, Tray, Menu, nativeImage, shell, dialog, ipcMain, screen, powerMonitor, net } = require('electron');
+const { app, BrowserWindow, Tray, Menu, nativeImage, shell, dialog, ipcMain, screen, powerMonitor, net, crashReporter } = require('electron');
 const path = require('node:path');
 const fs = require('node:fs');
 const { spawn, execFileSync } = require('node:child_process');
@@ -28,6 +28,8 @@ const DATA_DIR = process.env.AAS_DATA_DIR
 const TOKEN_PATH = path.join(DATA_DIR, 'logs', '.gui_token');
 // 窗口尺寸/位置/最大化状态持久化文件（关窗缩托盘不退进程，靠 resize/move 防抖落盘覆盖关闭场景）
 const WINDOW_STATE_PATH = path.join(DATA_DIR, 'window-state.json');
+// 运行诊断日志：渲染/GPU 进程死亡、界面无响应、显示器变化、各进程内存采样都写这里，供排查偶发黑屏
+const DIAG_LOG_PATH = path.join(DATA_DIR, 'logs', 'gui-main.log');
 const DEV_SERVER_URL = process.env.AAS_DEV_SERVER || 'http://127.0.0.1:5173';
 const HTTP_PORT = parseInt(process.env.AAS_HTTP_PORT || '8765', 10);
 const WS_PORT = parseInt(process.env.AAS_WS_PORT || '8766', 10);
@@ -531,6 +533,158 @@ ipcMain.on('epd:log-append', (_event, line) => {
   epaperLogTimer = setTimeout(flushEpaperLog, 250);
 });
 
+// ============================================================================
+// 运行诊断日志（logs/epaper.log 之外单独一份 logs/gui-main.log）
+//  排查「偶现整个窗口全黑、拖不动也点不动」用。这个窗口是自绘标题栏（frame: false），
+//  拖动区和按钮都是页面里的元素、由渲染进程处理，所以渲染进程一死就同时表现为全黑 +
+//  拖不动 + 点不动，光看现象分不出是渲染进程没了、GPU 进程没了、还是界面卡住。
+//  能分开它们的信息只在主进程手里（哪个子进程退出、退出原因和退出码、系统是否刚唤醒、
+//  显示器是否刚变过），而主进程原本只把日志推给渲染进程存在内存里 —— 窗口一黑就跟着没了。
+//  故这里同步追加到文件：事件本身很稀疏（正常时一天只有几条内存采样），不做防抖，
+//  保证事故当时那一行一定已经落在盘上。
+// ============================================================================
+const DIAG_LOG_MAX_BYTES = 2 * 1024 * 1024; // 超出保留尾部一半；给到 2MB 是因为黑屏几个月才一次，得留得下几个月的内存曲线
+const DIAG_METRICS_INTERVAL_MS = 5 * 60 * 1000;
+// 渲染进程死亡后自动重载的限频：1 小时内最多 3 次。
+// 加上限是因为「一加载就崩」的情况下无限重载会变成刷屏死循环，反而盖掉首次的真实原因。
+const DIAG_RELOAD_WINDOW_MS = 3600 * 1000;
+const DIAG_RELOAD_MAX = 3;
+let diagLogDirReady = false;
+let diagReloadHistory = [];
+let diagMetricsTimer = null;
+
+/** 追加一行诊断日志：`2026-08-25T16:00:00.000Z event key=value key=value` */
+function diagLog(event, detail) {
+  const parts = [];
+  for (const [key, value] of Object.entries(detail || {})) {
+    if (value === undefined || value === null) continue;
+    parts.push(`${key}=${typeof value === 'string' ? value.replace(/\s+/g, ' ') : String(value)}`);
+  }
+  const line = `${new Date().toISOString()} ${event}${parts.length ? ' ' + parts.join(' ') : ''}\n`;
+  try {
+    if (!diagLogDirReady) {
+      fs.mkdirSync(path.dirname(DIAG_LOG_PATH), { recursive: true });
+      diagLogDirReady = true;
+    }
+    fs.appendFileSync(DIAG_LOG_PATH, line, 'utf-8');
+    const { size } = fs.statSync(DIAG_LOG_PATH);
+    if (size > DIAG_LOG_MAX_BYTES) {
+      const buf = fs.readFileSync(DIAG_LOG_PATH);
+      const tail = buf.subarray(buf.length - Math.floor(DIAG_LOG_MAX_BYTES / 2));
+      const nl = tail.indexOf(0x0a);
+      fs.writeFileSync(DIAG_LOG_PATH, nl >= 0 ? tail.subarray(nl + 1) : tail);
+    }
+  } catch {
+    // 写盘失败不能影响主流程；下次重建目录再试
+    diagLogDirReady = false;
+  }
+}
+
+// 各进程内存采样。两个用途：
+//  1. 单次事故就能看出「黑屏前几小时内存是不是一直在涨」，不用攒多次才能判断是不是内存耗尽。
+//  2. 当心跳用。写日志的代码本身跑在主进程里，主进程要是自己卡住就一个字也写不出来 ——
+//     那种情况下这条每 5 分钟一次的记录会断掉，断口的时刻就是主进程停摆的时刻。
+function diagLogMetrics(reason) {
+  let metrics;
+  try { metrics = app.getAppMetrics(); } catch { return; }
+  const summary = metrics
+    .map(m => `${m.type}${m.serviceName ? ':' + m.serviceName : ''}/${m.pid}=${Math.round((m.memory?.workingSetSize || 0) / 1024)}MB`)
+    .join(',');
+  diagLog('metrics', { reason, count: metrics.length, procs: summary });
+}
+
+// 渲染进程没了之后把页面重新加载回来：reload 会新建一个渲染进程，
+// 用户就不必手动重启整个程序。超过限频则只记录不重载。
+function diagRecoverRenderer(win) {
+  const now = Date.now();
+  diagReloadHistory = diagReloadHistory.filter(t => now - t < DIAG_RELOAD_WINDOW_MS);
+  if (diagReloadHistory.length >= DIAG_RELOAD_MAX) {
+    diagLog('renderer-reload-skipped', { recentReloads: diagReloadHistory.length });
+    return;
+  }
+  diagReloadHistory.push(now);
+  diagLog('renderer-reload', { attempt: diagReloadHistory.length });
+  try { win.webContents.reload(); } catch (e) { diagLog('renderer-reload-failed', { error: (e && e.message) || String(e) }); }
+}
+
+// 窗口级的诊断监听。渲染进程/加载失败/无响应都挂在这个窗口的 webContents 上，
+// 故随窗口创建注册；重载后 webContents 仍是同一个对象，无需重复注册。
+function installDiagWindowHandlers(win) {
+  // 渲染进程没了。details.reason 是这次排查最关键的一个字段：
+  //   crashed=渲染进程自己崩了（配 exitCode 一起看）  oom=内存耗尽
+  //   killed=被外部杀掉（杀软 / 系统内存压力）        clean-exit=正常退出
+  //   launch-failed=起都没起来（带 exitCode）
+  win.webContents.on('render-process-gone', (_e, details) => {
+    diagLog('render-process-gone', {
+      reason: details?.reason,
+      exitCode: details?.exitCode,
+      visible: win.isDestroyed() ? 'destroyed' : win.isVisible(),
+    });
+    diagLogMetrics('render-process-gone');
+    if (appQuitting || win.isDestroyed()) return;
+    if (details?.reason === 'clean-exit') return;
+    diagRecoverRenderer(win);
+  });
+
+  // 界面卡住（JS 长时间不让出主线程）。和上面是两种不同故障：
+  // 卡住时最后一帧还留在屏幕上（看到的是冻住的界面），不是全黑。
+  win.on('unresponsive', () => {
+    diagLog('window-unresponsive', {});
+    diagLogMetrics('window-unresponsive');
+  });
+  win.on('responsive', () => { diagLog('window-responsive', {}); });
+
+  win.webContents.on('did-fail-load', (_e, errorCode, errorDescription, validatedURL, isMainFrame) => {
+    diagLog('did-fail-load', { errorCode, errorDescription, url: validatedURL, isMainFrame });
+  });
+  win.webContents.on('preload-error', (_e, preloadPath, error) => {
+    diagLog('preload-error', { preload: preloadPath, error: (error && error.message) || String(error) });
+  });
+}
+
+// 进程级/系统级的诊断监听。须在 app ready 之后调用（screen 与 powerMonitor 的要求）。
+function installDiagAppHandlers() {
+  // GPU 进程死亡在这里出现（type='GPU'）。显卡驱动被 Windows 强制重置时 GPU 进程会跟着挂，
+  // 时间戳可以和系统日志里的显卡重置事件对照，判断黑屏是不是被驱动带崩的。
+  app.on('child-process-gone', (_e, details) => {
+    diagLog('child-process-gone', {
+      type: details?.type,
+      reason: details?.reason,
+      exitCode: details?.exitCode,
+      serviceName: details?.serviceName,
+      name: details?.name,
+    });
+  });
+
+  // 显示器接入/拔出/分辨率变化。虚拟显示器（远程控制类软件常带一个）插拔时，
+  // 画面合成层可能丢失导致窗口变黑，故留时间戳供对照。
+  screen.on('display-added', (_e, d) => diagLog('display-added', { id: d?.id, scale: d?.scaleFactor }));
+  screen.on('display-removed', (_e, d) => diagLog('display-removed', { id: d?.id }));
+  screen.on('display-metrics-changed', (_e, d, changed) => {
+    diagLog('display-metrics-changed', { id: d?.id, changed: (changed || []).join('|'), scale: d?.scaleFactor });
+  });
+
+  powerMonitor.on('suspend', () => diagLog('power-suspend', {}));
+  powerMonitor.on('resume', () => diagLog('power-resume', {}));
+  powerMonitor.on('lock-screen', () => diagLog('power-lock-screen', {}));
+  powerMonitor.on('unlock-screen', () => diagLog('power-unlock-screen', {}));
+
+  // 启动基线：版本 + 显卡加速各项的实际状态（能看出 Chromium 是否已自行关掉 GPU 合成）
+  let gpu = '';
+  try { gpu = JSON.stringify(app.getGPUFeatureStatus()); } catch { /* 取不到就不记 */ }
+  diagLog('startup', {
+    app: app.getVersion(),
+    electron: process.versions.electron,
+    chrome: process.versions.chrome,
+    packaged: app.isPackaged,
+    gpu,
+  });
+  diagLogMetrics('startup');
+
+  if (diagMetricsTimer) clearInterval(diagMetricsTimer);
+  diagMetricsTimer = setInterval(() => diagLogMetrics('periodic'), DIAG_METRICS_INTERVAL_MS);
+}
+
 function isVisibleOnSomeDisplay(bounds) {
   if (
     !bounds ||
@@ -595,6 +749,7 @@ async function createWindow() {
 
   mainWindow = win;
   installBluetoothHandlers(win);
+  installDiagWindowHandlers(win);
 
   win.once('ready-to-show', () => {
     win.show();
@@ -1041,6 +1196,11 @@ function migrateLegacyDataIfNeeded() {
 //  这里抢单实例锁：抢不到说明已有实例在运行，本进程直接退出；已有实例收到
 //  second-instance 事件时把窗口显示并聚焦，等价于「二次启动只唤起已有窗口」。
 // ============================================================================
+// 本地崩溃转储（只写盘、不上传任何数据）。渲染进程/GPU 进程崩溃时在
+// 用户数据目录的 Crashpad 子目录留下 dmp，配合 gui-main.log 的 render-process-gone 一行使用。
+// 须在 app ready 之前启动才能覆盖启动期的崩溃。
+crashReporter.start({ uploadToServer: false });
+
 const gotInstanceLock = app.requestSingleInstanceLock();
 if (!gotInstanceLock) {
   // 抢锁失败：已有实例在运行，本进程立即退出（不创建窗口、不 spawn 后端）
@@ -1085,6 +1245,8 @@ app.on('ready', async () => {
   // 监听系统唤醒：睡眠跨过启动/探活窗口后，唤醒重新侦测就绪 + 探活后端（详见 handleResume）。
   // powerMonitor 须在 app ready 后注册。
   powerMonitor.on('resume', () => { void handleResume(); });
+  // 诊断日志的进程级/系统级监听（须在 ready 后：screen 与 powerMonitor 的要求）
+  installDiagAppHandlers();
 });
 
 app.on('window-all-closed', () => {
@@ -1100,5 +1262,7 @@ app.on('before-quit', () => {
   clearPendingRestart(); // 退出前取消挂起的重启定时器，防止其到点后又把后端拉起
   flushGuiSettings();
   flushEpaperLog();
+  if (diagMetricsTimer) { clearInterval(diagMetricsTimer); diagMetricsTimer = null; }
+  diagLog('quit', {});
   killPython();
 });
