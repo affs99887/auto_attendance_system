@@ -705,6 +705,43 @@ function isVisibleOnSomeDisplay(bounds) {
   });
 }
 
+const DEFAULT_WIN_WIDTH = 1480;
+const DEFAULT_WIN_HEIGHT = 920;
+
+// 把落在所有显示器之外的窗口挪回屏幕内。
+// Windows 在显示器休眠唤醒、虚拟显示器增减这类时机重排窗口时，偶尔会把最小化窗口的「还原位置」
+// 改成它最小化时所在的屏幕外坐标（-32000,-32000）。之后点任务栏，窗口其实已经还原并显示，
+// 只是落在屏幕外，表现为「任务栏有图标、点了出不来」。这次改写拦不住，只能在每次还原/显示后检查并挪回。
+// 挪回目标：上次保存的位置（仍在某个显示器上时），否则按默认尺寸居中到主显示器。
+function ensureWindowOnScreen(win, reason) {
+  if (!win || win.isDestroyed() || win.isMinimized()) return;
+  // 最大化/全屏由系统铺满某个显示器，不会落在屏幕外
+  if (win.isMaximized() || win.isFullScreen()) return;
+  const bounds = win.getBounds();
+  if (isVisibleOnSomeDisplay(bounds)) return;
+  const saved = loadWindowState();
+  let target;
+  if (saved && isVisibleOnSomeDisplay(saved)) {
+    target = { x: saved.x, y: saved.y, width: saved.width, height: saved.height };
+  } else {
+    const wa = screen.getPrimaryDisplay().workArea;
+    const width = Math.min(DEFAULT_WIN_WIDTH, wa.width);
+    const height = Math.min(DEFAULT_WIN_HEIGHT, wa.height);
+    target = {
+      x: wa.x + Math.round((wa.width - width) / 2),
+      y: wa.y + Math.round((wa.height - height) / 2),
+      width,
+      height,
+    };
+  }
+  diagLog('window-offscreen-fixed', {
+    reason,
+    from: `${bounds.x},${bounds.y},${bounds.width}x${bounds.height}`,
+    to: `${target.x},${target.y},${target.width}x${target.height}`,
+  });
+  win.setBounds(target);
+}
+
 // ============================================================================
 // 创建主窗口（不再等 token —— 立刻显示，token 经 IPC 后到）
 // ============================================================================
@@ -712,8 +749,8 @@ async function createWindow() {
   const savedState = loadWindowState();
   // 默认 1480x920：不设 x/y 让其居中；有可见的历史 bounds 才复用尺寸+位置
   const winOpts = {
-    width: 1480,
-    height: 920,
+    width: DEFAULT_WIN_WIDTH,
+    height: DEFAULT_WIN_HEIGHT,
     minWidth: 1100,
     minHeight: 700,
     title: 'AAS',
@@ -766,15 +803,23 @@ async function createWindow() {
       if (win.isDestroyed()) return;
       if (win.isMaximized()) return;
       const b = win.getBounds();
+      // 屏幕外的坐标不保存：它会被当成「上次的好位置」，用于下次启动和窗口找回
+      if (!isVisibleOnSomeDisplay(b)) return;
       saveWindowState({ width: b.width, height: b.height, x: b.x, y: b.y, isMaximized: false });
     }, 300);
   };
   win.on('resize', scheduleSave);
   win.on('move', scheduleSave);
 
+  // 还原/显示后检查是否落在屏幕外（原因见 ensureWindowOnScreen）。
+  // 托盘「显示主窗口」和二次启动唤起窗口时，最小化的窗口也会先触发 restore。
+  win.on('restore', () => ensureWindowOnScreen(win, 'restore'));
+  win.on('show', () => ensureWindowOnScreen(win, 'show'));
+
   // 最大化：记录 isMaximized=true，但普通 bounds 沿用上次保存的非最大化值（避免把最大化尺寸当成还原尺寸）
   win.on('maximize', () => {
-    const prev = loadWindowState();
+    const saved = loadWindowState();
+    const prev = saved && isVisibleOnSomeDisplay(saved) ? saved : null;
     const b = win.getBounds();
     saveWindowState({
       width: prev && typeof prev.width === 'number' ? prev.width : b.width,
@@ -786,7 +831,9 @@ async function createWindow() {
   });
   // 还原：此时 getBounds 即普通 bounds，记录 isMaximized=false
   win.on('unmaximize', () => {
+    ensureWindowOnScreen(win, 'unmaximize');
     const b = win.getBounds();
+    if (!isVisibleOnSomeDisplay(b)) return;
     saveWindowState({ width: b.width, height: b.height, x: b.x, y: b.y, isMaximized: false });
   });
 
