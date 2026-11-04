@@ -549,7 +549,10 @@ class AttendanceSystem:
             safe_username = self._safe_filename_token(username)
             ts = datetime.now().strftime('%Y%m%d_%H%M%S_%f')
             # 保存并发送当前的浏览器窗口截图
-            screenshot_path = f'punch_{punch_type}_fail_uncertain_{safe_username}_{ts}.png'
+            # 文件名只能用英文：cv2.imwrite 在 Windows 上不认中文路径，"上班"会被写成乱码文件名，
+            # 下面按原名 open 时找不到文件，失败截图和失败邮件就都发不出去
+            type_token = 'in' if punch_type == '上班' else 'out'
+            screenshot_path = f'punch_{type_token}_fail_uncertain_{safe_username}_{ts}.png'
             cv2.imwrite(screenshot_path, screen)
 
             # 保存失败截图到用户目录
@@ -585,6 +588,7 @@ class AttendanceSystem:
         except Exception as e:
             error_type = type(e).__name__
             error_msg_detail = str(e)
+            logging.error(f"发送{punch_type}打卡失败截图/邮件失败: {error_type}: {error_msg_detail}")
 
             # 检查是否是HTTPXRequest初始化错误
             if "HTTPXRequest" in error_msg_detail and "not initialized" in error_msg_detail:
@@ -3613,17 +3617,20 @@ class AttendanceSystem:
                     # 为每个用户发送单独的失败消息
                     await self.send_notification("打卡失败", f"用户 {username} 上班打卡失败")
 
-                # 确保浏览器已关闭
-                await self.send_notification("打卡流程", f"确认用户 {username} 的浏览器已关闭")
-                # 使用 bot 对象的 close_browser 方法
-                browser_closed = self.bot.close_browser()
-                if not browser_closed:
-                    # 如果关闭失败，再尝试一次
-                    await self.send_notification("打卡流程", "首次关闭浏览器失败，再次尝试...")
-                    time.sleep(2)
+                # 确保浏览器已关闭（仅传统模式）：close_browser 是按标题找 Edge 窗口截图再点关闭。
+                # Selenium 模式的浏览器已在 _do_selenium_punch 的 finally 里关掉，再调它只会报"未找到窗口"，
+                # 桌面上开着用户自己的 Edge 时还可能把那个窗口误关
+                if not self.use_selenium_login:
+                    await self.send_notification("打卡流程", f"确认用户 {username} 的浏览器已关闭")
+                    # 使用 bot 对象的 close_browser 方法
                     browser_closed = self.bot.close_browser()
                     if not browser_closed:
-                        await self.send_notification("打卡流程", "浏览器关闭失败，可能需要手动关闭")
+                        # 如果关闭失败，再尝试一次
+                        await self.send_notification("打卡流程", "首次关闭浏览器失败，再次尝试...")
+                        time.sleep(2)
+                        browser_closed = self.bot.close_browser()
+                        if not browser_closed:
+                            await self.send_notification("打卡流程", "浏览器关闭失败，可能需要手动关闭")
 
                 # 如果还有下一个用户，等待一段时间再继续
                 if i < len(self.users) - 1:
@@ -3766,17 +3773,20 @@ class AttendanceSystem:
                             'remaining_time': remaining_time_info
                         })
 
-                # 确保浏览器已关闭
-                await self.send_notification("打卡流程", f"确认用户 {username} 的浏览器已关闭")
-                # 使用 bot 对象的 close_browser 方法
-                browser_closed = self.bot.close_browser()
-                if not browser_closed:
-                    # 如果关闭失败，再尝试一次
-                    await self.send_notification("打卡流程", "首次关闭浏览器失败，再次尝试...")
-                    time.sleep(2)
+                # 确保浏览器已关闭（仅传统模式）：close_browser 是按标题找 Edge 窗口截图再点关闭。
+                # Selenium 模式的浏览器已在 _do_selenium_punch 的 finally 里关掉，再调它只会报"未找到窗口"，
+                # 桌面上开着用户自己的 Edge 时还可能把那个窗口误关
+                if not self.use_selenium_login:
+                    await self.send_notification("打卡流程", f"确认用户 {username} 的浏览器已关闭")
+                    # 使用 bot 对象的 close_browser 方法
                     browser_closed = self.bot.close_browser()
                     if not browser_closed:
-                        await self.send_notification("打卡流程", "浏览器关闭失败，可能需要手动关闭")
+                        # 如果关闭失败，再尝试一次
+                        await self.send_notification("打卡流程", "首次关闭浏览器失败，再次尝试...")
+                        time.sleep(2)
+                        browser_closed = self.bot.close_browser()
+                        if not browser_closed:
+                            await self.send_notification("打卡流程", "浏览器关闭失败，可能需要手动关闭")
 
                 # 如果还有下一个用户，等待一段时间再继续
                 if i < len(users_to_process) - 1:
