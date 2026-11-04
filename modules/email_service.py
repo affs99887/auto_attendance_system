@@ -34,6 +34,9 @@ class EmailService:
         # 错误通知收件人列表（第1个和第3个邮箱）
         self.error_recipients = self._get_error_recipients()
 
+        # 老婆的邮箱（单独发趣味版邮件），空字符串表示关闭
+        self.wife_email = config.WIFE_EMAIL
+
         # 重试配置
         self.max_retries = config.MAX_RETRIES
         self.retry_delay = 2  # 重试间隔（秒）
@@ -265,7 +268,29 @@ class EmailService:
         thread = threading.Thread(target=send_thread, daemon=True)
         thread.start()
         self.logger.info(f"邮件已提交异步发送队列: {subject}")
-    
+
+    def is_wife_email(self, address: str) -> bool:
+        """判断某个收件地址是不是老婆的邮箱（忽略大小写和首尾空格）"""
+        return bool(self.wife_email) and address.strip().lower() == self.wife_email.lower()
+
+    def send_to_wife(self, subject: str, html_body: str,
+                     image_path: Optional[str] = None,
+                     cleanup_path: Optional[str] = None) -> bool:
+        """异步给老婆单独发一封趣味邮件（文案见 wife_email 模块）。没配置老婆邮箱时什么都不做，返回 False。"""
+        if not self.wife_email:
+            return False
+
+        def wife_callback(success: bool, email_subject: str):
+            if success:
+                self.logger.info(f"老婆版邮件发送成功: {email_subject}")
+            else:
+                self.logger.error(f"老婆版邮件发送失败: {email_subject}")
+
+        self.send_email_async(subject, html_body, recipients=[self.wife_email],
+                              image_path=image_path, is_html=True, send_to_all=True,
+                              callback=wife_callback, cleanup_path=cleanup_path)
+        return True
+
     def send_punch_notification(self, punch_type: str, success: bool, 
                                message: str, screenshot_path: Optional[str] = None,
                                user_name: str = "系统", async_send: bool = True) -> None:

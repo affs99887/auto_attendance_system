@@ -61,6 +61,10 @@ class Config:
     EMAIL_SMTP_SERVER = os.getenv('EMAIL_SMTP_SERVER', 'smtp.qq.com')
     EMAIL_SMTP_PORT = _int_env('EMAIL_SMTP_PORT', 465)
     EMAIL_RECIPIENTS = os.getenv('EMAIL_RECIPIENTS', '').split(',') if os.getenv('EMAIL_RECIPIENTS') else []
+    # 给老婆单独发的趣味邮件（"报告老婆，我已下班！"这类）：WIFE_EMAIL 填空字符串即关闭。
+    # WIFE_LOGIN_NAME 是她自己的打卡账号名：恢复双账号后她本人打卡时不发这类邮件，仍按原规则发正式邮件。
+    WIFE_EMAIL = os.getenv('WIFE_EMAIL', 'dududulalala@icloud.com').strip()
+    WIFE_LOGIN_NAME = os.getenv('WIFE_LOGIN_NAME', '邓蕴哲').strip()
 
     # Tesseract配置
     TESSERACT_PATH = os.getenv('TESSERACT_PATH', r'C:\Program Files\Tesseract-OCR\tesseract.exe')

@@ -13,6 +13,7 @@ from datetime import datetime, timedelta
 from typing import Optional, Tuple, Dict, List
 import re
 import json
+import shutil
 
 # Third-party imports
 import schedule
@@ -39,7 +40,8 @@ from modules.image_recognizer import image_recognizer
 from modules.record_manager import punch_record_manager
 from modules.task_manager import task_manager
 from modules.telegram_bot import TelegramBot
-from modules.selenium_login import SeleniumLoginController, ParallelSeleniumLogin
+from modules.selenium_login import SeleniumLoginController, ParallelSeleniumLogin, SeleniumRecordManager
+from modules import wife_email
 
 
 class AttendanceSystem:
@@ -578,7 +580,7 @@ class AttendanceSystem:
                     f_out.write(img_data)
 
             # 发送邮件（email_screenshot_path 的删除已交给后台发送线程 cleanup_path，主流程不再删）
-            await self.send_email_with_attachment(email_subject, email_body, email_screenshot_path, f"{punch_type}(失败)")
+            await self.send_email_with_attachment(email_subject, email_body, email_screenshot_path, f"{punch_type}(失败)", username=username)
 
         except Exception as e:
             error_type = type(e).__name__
@@ -2303,7 +2305,7 @@ class AttendanceSystem:
                                 f_out.write(img_data)
 
                         # 发送邮件
-                        await self.send_email_with_attachment(email_subject, email_body, email_screenshot_path, f"{punch_type}(登录失败)")
+                        await self.send_email_with_attachment(email_subject, email_body, email_screenshot_path, f"{punch_type}(登录失败)", username=username)
 
                         # 删除临时文件（邮件截图由后台发送线程清理，主流程仅删 Telegram 临时截图）
                         os.remove(screenshot_path)
@@ -2447,7 +2449,7 @@ class AttendanceSystem:
                                     f_out.write(img_data)
 
                             # 发送邮件
-                            await self.send_email_with_attachment(email_subject, email_body, email_screenshot_path, f"{punch_type}(失败)")
+                            await self.send_email_with_attachment(email_subject, email_body, email_screenshot_path, f"{punch_type}(失败)", username=username)
 
                             # 删除临时文件（邮件截图由后台发送线程清理，主流程仅删 Telegram 临时截图）
                             os.remove(screenshot_path)
@@ -2605,7 +2607,7 @@ class AttendanceSystem:
                                         f_out.write(img_data)
 
                                 # 发送邮件
-                                await self.send_email_with_attachment(subject, body, email_screenshot_path, punch_type)
+                                await self.send_email_with_attachment(subject, body, email_screenshot_path, punch_type, username=username)
 
                                 os.remove(screenshot_path)  # 删除Telegram发送的临时截图（邮件截图由后台发送线程清理）
                                 break
@@ -2713,7 +2715,7 @@ class AttendanceSystem:
                                 f_out.write(img_data)
 
                         # 发送邮件
-                        await self.send_email_with_attachment(email_subject, email_body, email_screenshot_path, f"{punch_type}(登录失败)")
+                        await self.send_email_with_attachment(email_subject, email_body, email_screenshot_path, f"{punch_type}(登录失败)", username=username)
 
                         # 删除临时文件（邮件截图由后台发送线程清理，主流程仅删 Telegram 临时截图）
                         os.remove(screenshot_path)
@@ -2760,7 +2762,7 @@ class AttendanceSystem:
                             f_out.write(img_data)
 
                     # 发送邮件
-                    await self.send_email_with_attachment(email_subject, email_body, email_screenshot_path, f"{punch_type}(系统错误)")
+                    await self.send_email_with_attachment(email_subject, email_body, email_screenshot_path, f"{punch_type}(系统错误)", username=username)
 
                     # 删除临时文件（邮件截图由后台发送线程清理，主流程仅删 Telegram 临时截图）
                     os.remove(screenshot_path)
@@ -3088,7 +3090,8 @@ class AttendanceSystem:
                             # 邮件截图由后台发送线程读取后清理（cleanup_path），主流程不再提前删除，
                             # 避免与后台读取竞争导致 WinError 32（即日志中"发送成功邮件失败"的根因）。
                             await self.send_email_with_attachment(
-                                subject, body, email_screenshot_path, punch_type
+                                subject, body, email_screenshot_path, punch_type,
+                                username=effective_username
                             )
                         except Exception as email_err:
                             logging.error(f"发送{punch_type}成功邮件失败: {email_err}")
@@ -4131,8 +4134,12 @@ class AttendanceSystem:
             logging.error(f"识别打卡记录时发生错误: {str(e)}\n{traceback.format_exc()}")
             return False
 
-    async def send_email_with_attachment(self, subject, body, attachment_path, punch_type):
-        """发送带附件的电子邮件（异步，不阻塞打卡流程）"""
+    async def send_email_with_attachment(self, subject, body, attachment_path, punch_type, username=None):
+        """发送带附件的电子邮件（异步，不阻塞打卡流程）
+
+        username: 本次打卡的用户名。只要不是老婆本人在打卡，就另外给老婆单独发一封趣味版邮件，
+        失败时群发的正式版也不再抄送她，免得她一次收到两封。
+        """
         try:
             await self.send_notification("邮件发送", f"准备发送{punch_type}打卡截图邮件...")
 
@@ -4148,16 +4155,38 @@ class AttendanceSystem:
             # 如果是失败、错误相关的打卡，发送给所有用户
             send_to_all = any(keyword in punch_type for keyword in ["失败", "错误", "异常"])
 
+            # 老婆单独收趣味版：配置了她的邮箱，且这次不是她本人在打卡
+            notify_wife = bool(self.email_service.wife_email) and username != config.WIFE_LOGIN_NAME
+            recipients = None  # None = 沿用默认收件人规则
+            if send_to_all and notify_wife:
+                recipients = [r for r in self.email_service.email_recipients
+                              if not self.email_service.is_wife_email(r)]
+
+            # 正式版的后台线程发完会删掉截图，所以先给老婆版复制一份，两边各删各的
+            wife_attachment = None
+            if notify_wife and attachment_path and os.path.exists(attachment_path):
+                root, ext = os.path.splitext(attachment_path)
+                wife_attachment = f"{root}_wife{ext}"
+                try:
+                    shutil.copyfile(attachment_path, wife_attachment)
+                except Exception as copy_err:
+                    logging.warning(f"复制老婆版邮件截图失败，老婆版将不带附件: {copy_err}")
+                    wife_attachment = None
+
             # 异步发送邮件；把临时截图的删除交给后台发送线程（cleanup_path），
             # 避免主流程提前 os.remove 与后台读取附件竞争（WinError 32）。
             self.email_service.send_email_async(
                 subject=subject,
                 body=body,
+                recipients=recipients,
                 image_path=attachment_path,
                 send_to_all=send_to_all,
                 callback=email_callback,
                 cleanup_path=attachment_path
             )
+
+            if notify_wife:
+                self._send_wife_punch_email(punch_type, send_to_all, username, wife_attachment)
 
             # 立即返回True，不等待邮件发送完成
             return True
@@ -4167,6 +4196,46 @@ class AttendanceSystem:
             logging.error(error_msg)
             await self.send_notification("邮件发送", error_msg)
             return False
+
+    def _send_wife_punch_email(self, punch_type, failed, username, attachment_path):
+        """给老婆发趣味版打卡邮件。出任何错只记日志，不影响打卡流程。"""
+        try:
+            kind = '下班' if '下班' in punch_type else '上班'
+            now = datetime.now()
+            if failed:
+                subject, html_body = wife_email.build_punch_failure(kind, now)
+            else:
+                worked = self._today_worked_minutes(username, now) if kind == '下班' else None
+                subject, html_body = wife_email.build_punch_success(kind, now, worked)
+            self.email_service.send_to_wife(subject, html_body,
+                                            image_path=attachment_path, cleanup_path=attachment_path)
+        except Exception as e:
+            logging.error(f"发送老婆版打卡邮件失败: {e}")
+            if attachment_path and os.path.exists(attachment_path):
+                try:
+                    os.remove(attachment_path)
+                except Exception:
+                    pass
+
+    def _today_worked_minutes(self, username, now):
+        """算今天从上班打卡到现在过了多少分钟；拿不到今天的上班时间就返回 None。"""
+        punch_in = None
+        record = self.today_punch_records.get(username or 'default') or {}
+        if record.get('date') == now.date() and isinstance(record.get('punch_in_time'), datetime):
+            # 内存里的上班时间有时是从 'HH:MM:SS' 解析出来的（日期是 1900 年），所以只取时分秒
+            punch_in = record['punch_in_time'].time()
+        if punch_in is None:
+            # 后端在上下班之间重启过时内存为空，再查一次该用户的打卡记录文件
+            try:
+                time_str = SeleniumRecordManager(username or 'default').get_today_punch_in_time()
+                if time_str:
+                    punch_in = datetime.strptime(time_str, '%H:%M:%S').time()
+            except Exception as e:
+                logging.debug(f"读取今日上班时间失败（老婆版邮件不显示工时）: {e}")
+        if punch_in is None:
+            return None
+        minutes = int((now - datetime.combine(now.date(), punch_in)).total_seconds() // 60)
+        return minutes if 0 < minutes < 24 * 60 else None
 
     async def get_today_punch_in_time(self):
         """获取当日上班打卡时间，支持从记录和页面识别两种方式

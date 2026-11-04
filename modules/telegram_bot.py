@@ -37,6 +37,7 @@ from modules.config import config
 
 from modules.selenium_login import SeleniumLoginController
 from modules.email_service import email_service
+from modules import wife_email
 
 
 class TelegramBot:
@@ -3238,7 +3239,7 @@ class TelegramBot:
 
     def _send_scheduled_task_email_notification(self, punch_type: str, scheduled_time: str,
                                                  username: str = None, task_type: str = "定时打卡"):
-        """发送定时任务设置成功的邮件通知
+        """发送定时任务设置成功的邮件通知（只发给老婆，用趣味版文案）
 
         Args:
             punch_type: 打卡类型（"上班" 或 "下班"）
@@ -3247,34 +3248,18 @@ class TelegramBot:
             task_type: 任务类型描述
         """
         try:
-            current_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-            user_info = f"用户: {username}" if username else "用户: 默认用户"
-            if username == 'all':
-                user_info = "用户: 所有用户"
+            # 文案里的"我的 / 你的 / 咱俩的"：'all' 只有在老婆账号也启用时才算两个人
+            if username == config.WIFE_LOGIN_NAME:
+                who = 'her'
+            elif username == 'all' and any(
+                    u.get('username') == config.WIFE_LOGIN_NAME for u in config.get_user_configs()):
+                who = 'both'
+            else:
+                who = 'me'
 
-            subject = f"【打卡任务设置】{punch_type}打卡任务已设置 - {scheduled_time}"
-
-            body = f"""
-            <html>
-            <body>
-                <h3>✅ 定时打卡任务设置成功</h3>
-                <p><strong>任务类型:</strong> {task_type}</p>
-                <p><strong>打卡类型:</strong> {punch_type}打卡</p>
-                <p><strong>{user_info}</strong></p>
-                <p><strong>计划执行时间:</strong> {scheduled_time}</p>
-                <p><strong>设置时间:</strong> {current_time}</p>
-                <hr>
-                <p><em>此邮件由自动打卡系统发送，任务将在计划时间自动执行。</em></p>
-            </body>
-            </html>
-            """
-
-            email_service.send_email_async(
-                subject, body,
-                recipients=['dududulalala@icloud.com'],
-                is_html=True
-            )
-            logging.info(f"已发送定时任务设置通知邮件: {punch_type}打卡 @ {scheduled_time}")
+            subject, body = wife_email.build_task_scheduled(punch_type, scheduled_time, task_type, who)
+            if email_service.send_to_wife(subject, body):
+                logging.info(f"已发送定时任务设置通知邮件: {punch_type}打卡 @ {scheduled_time}")
 
         except Exception as e:
             logging.error(f"发送定时任务设置通知邮件失败: {e}")
