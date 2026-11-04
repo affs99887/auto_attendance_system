@@ -137,24 +137,12 @@ def build_punch_failure(kind: str, punch_time: datetime) -> Tuple[str, str]:
     return f'{title} · {_short_time(punch_time)}', html_body
 
 
-def build_task_scheduled(kind: str, scheduled_time: str, task_type: str,
-                         who: str = 'me') -> Tuple[str, str]:
-    """定时打卡任务设置好了。
-
-    who: 'me' = 只给我打卡；'her' = 给老婆本人打卡；'both' = 两个人都打（恢复双账号后才会出现）。
-    scheduled_time 形如 '2026-11-04 16:50'。
-    """
+def build_task_scheduled(kind: str, scheduled_time: str, task_type: str) -> Tuple[str, str]:
+    """定时打卡任务设置好了。scheduled_time 形如 '2026-11-04 16:50'。"""
     hhmm = scheduled_time[-5:] if len(scheduled_time) >= 5 else scheduled_time
     name = random.choice(NICKNAMES)
-    if who == 'her':
-        title = f'{name}：你的{kind}卡已帮你安排在 {hhmm}'
-        line = '到点会自动帮你打卡，你只管安心～'
-    elif who == 'both':
-        title = f'报告{name}：咱俩的{kind}卡已安排在 {hhmm}'
-        line = '到点两个人一起自动打卡，打完再来汇报～'
-    else:
-        title = f'报告{name}：我的{kind}卡已安排在 {hhmm}'
-        line = '闹钟已经定好，到点自动打卡，打完再来跟你汇报～'
+    title = f'报告{name}：我的{kind}卡已安排在 {hhmm}'
+    line = '闹钟已经定好，到点自动打卡，打完再来跟你汇报～'
 
     rows = [
         ('计划时间', scheduled_time),

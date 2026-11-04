@@ -3244,20 +3244,11 @@ class TelegramBot:
         Args:
             punch_type: 打卡类型（"上班" 或 "下班"）
             scheduled_time: 计划执行时间
-            username: 用户名（可选）
+            username: 用户名（只有一个人打卡，邮件文案用不到；保留参数是为了不改各调用处）
             task_type: 任务类型描述
         """
         try:
-            # 文案里的"我的 / 你的 / 咱俩的"：'all' 只有在老婆账号也启用时才算两个人
-            if username == config.WIFE_LOGIN_NAME:
-                who = 'her'
-            elif username == 'all' and any(
-                    u.get('username') == config.WIFE_LOGIN_NAME for u in config.get_user_configs()):
-                who = 'both'
-            else:
-                who = 'me'
-
-            subject, body = wife_email.build_task_scheduled(punch_type, scheduled_time, task_type, who)
+            subject, body = wife_email.build_task_scheduled(punch_type, scheduled_time, task_type)
             if email_service.send_to_wife(subject, body):
                 logging.info(f"已发送定时任务设置通知邮件: {punch_type}打卡 @ {scheduled_time}")
 
