@@ -17,13 +17,13 @@ SUCCESS_TITLES = {
     '上班': [
         '报告老婆，我已到岗！',
         '报告老婆：今日份搬砖已开工',
-        '老婆大人，你老公到公司啦',
+        '老婆大人，嘎哥到公司啦',
         '上班打卡成功，今天也会好好赚钱的',
     ],
     '下班': [
         '报告老婆，我已下班！',
         '报告老婆：今日搬砖任务圆满完成',
-        '老婆大人，你老公下班啦',
+        '老婆大人，老公下班啦',
         '下班打卡成功，正在奔向老婆',
     ],
 }
@@ -50,6 +50,13 @@ TOMORROW_OFF_LINES = {
 }
 
 ICONS = {'上班': '💼', '下班': '🏠', '失败': '🙈', '任务': '⏰'}
+
+# 落款里的自称，每次随机挑一个
+SELF_NAMES = ['老公', '嘎哥']
+
+
+def _signature() -> str:
+    return f'—— {random.choice(SELF_NAMES)}的自动打卡小助手代发'
 
 
 def _short_time(dt: datetime) -> str:
@@ -108,7 +115,7 @@ def build_punch_success(kind: str, punch_time: datetime,
         rows.append(('今日工时', worked))
 
     html_body = _render(ICONS[kind], title, lines, rows,
-                        '打卡截图在附件里，请老婆查收 —— 你老公的自动打卡小助手代发')
+                        f'打卡截图在附件里，请老婆查收 {_signature()}')
     return f'{title} · {_short_time(punch_time)}', html_body
 
 
@@ -121,7 +128,7 @@ def build_punch_failure(kind: str, punch_time: datetime) -> Tuple[str, str]:
     ]
     rows = [('发生时间', punch_time.strftime('%H:%M:%S'))]
     html_body = _render(ICONS['失败'], title, lines, rows,
-                        '当时的页面截图在附件里 —— 你老公的自动打卡小助手代发')
+                        f'当时的页面截图在附件里 {_signature()}')
     return f'{title} · {_short_time(punch_time)}', html_body
 
 
@@ -148,7 +155,7 @@ def build_task_scheduled(kind: str, scheduled_time: str, task_type: str,
         ('任务类型', task_type),
         ('设置时间', datetime.now().strftime('%Y-%m-%d %H:%M:%S')),
     ]
-    html_body = _render(ICONS['任务'], title, [line], rows, '—— 你老公的自动打卡小助手代发')
+    html_body = _render(ICONS['任务'], title, [line], rows, _signature())
     try:
         scheduled_dt = datetime.strptime(scheduled_time, '%Y-%m-%d %H:%M')
         subject = f'{title} · {scheduled_dt.month}月{scheduled_dt.day}日'
