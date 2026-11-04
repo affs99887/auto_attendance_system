@@ -13,18 +13,21 @@ from typing import Optional, Tuple
 from modules.safe_calendar import is_workday
 
 
+# 对她的称呼，每封邮件随机挑一个，整封邮件统一用这一个；文案里的 {name} 会被替换成它
+NICKNAMES = ['老婆', '娇嘟', '乖乖']
+
 SUCCESS_TITLES = {
     '上班': [
-        '报告老婆，我已到岗！',
-        '报告老婆：今日份搬砖已开工',
-        '老婆大人，嘎哥到公司啦',
+        '报告{name}，我已到岗！',
+        '报告{name}：今日份搬砖已开工',
+        '{name}，嘎哥到公司啦',
         '上班打卡成功，今天也会好好赚钱的',
     ],
     '下班': [
-        '报告老婆，我已下班！',
-        '报告老婆：今日搬砖任务圆满完成',
-        '老婆大人，老公下班啦',
-        '下班打卡成功，正在奔向老婆',
+        '报告{name}，我已下班！',
+        '报告{name}：今日搬砖任务圆满完成',
+        '{name}，老公下班啦',
+        '下班打卡成功，正在奔向{name}',
     ],
 }
 
@@ -33,13 +36,13 @@ SUCCESS_LINES = {
         '今天也会认真搬砖，下班第一时间向你汇报。',
         '已在工位坐好，想你的进度条开始加载。',
         '开工！今天的目标：准时下班回家。',
-        '老婆今天也要开开心心的呀。',
+        '{name}今天也要开开心心的呀。',
     ],
     '下班': [
         '正在收拾东西准备回家，晚饭吃什么你来定～',
         '今天也有好好工作，回家求夸夸。',
-        '电量剩余 5%，急需老婆充电。',
-        '已离开工位，预计很快抵达老婆身边。',
+        '电量剩余 5%，急需{name}充电。',
+        '已离开工位，预计很快抵达{name}身边。',
     ],
 }
 
@@ -101,8 +104,9 @@ def _render(icon: str, title: str, lines: list, rows: list, footer: str) -> str:
 def build_punch_success(kind: str, punch_time: datetime,
                         worked_minutes: Optional[int] = None) -> Tuple[str, str]:
     """打卡成功。kind 为 '上班' 或 '下班'；worked_minutes 只在下班时传，拿不到就不显示工时这一行。"""
-    title = random.choice(SUCCESS_TITLES[kind])
-    lines = [random.choice(SUCCESS_LINES[kind])]
+    name = random.choice(NICKNAMES)
+    title = random.choice(SUCCESS_TITLES[kind]).format(name=name)
+    lines = [random.choice(SUCCESS_LINES[kind]).format(name=name)]
     if _tomorrow_is_off(punch_time):
         lines.append(TOMORROW_OFF_LINES[kind])
 
@@ -115,13 +119,14 @@ def build_punch_success(kind: str, punch_time: datetime,
         rows.append(('今日工时', worked))
 
     html_body = _render(ICONS[kind], title, lines, rows,
-                        f'打卡截图在附件里，请老婆查收 {_signature()}')
+                        f'打卡截图在附件里，请{name}查收 {_signature()}')
     return f'{title} · {_short_time(punch_time)}', html_body
 
 
 def build_punch_failure(kind: str, punch_time: datetime) -> Tuple[str, str]:
     """打卡失败。语气轻松，但要把"没打上、我已经知道了"说清楚。"""
-    title = f'报告老婆：{kind}卡出了点小状况'
+    name = random.choice(NICKNAMES)
+    title = f'报告{name}：{kind}卡出了点小状况'
     lines = [
         f'刚才的{kind}自动打卡没成功，系统已经同时提醒我本人了。',
         '我会马上处理，不用担心～',
@@ -140,14 +145,15 @@ def build_task_scheduled(kind: str, scheduled_time: str, task_type: str,
     scheduled_time 形如 '2026-11-04 16:50'。
     """
     hhmm = scheduled_time[-5:] if len(scheduled_time) >= 5 else scheduled_time
+    name = random.choice(NICKNAMES)
     if who == 'her':
-        title = f'老婆大人：你的{kind}卡已帮你安排在 {hhmm}'
+        title = f'{name}：你的{kind}卡已帮你安排在 {hhmm}'
         line = '到点会自动帮你打卡，你只管安心～'
     elif who == 'both':
-        title = f'报告老婆：咱俩的{kind}卡已安排在 {hhmm}'
+        title = f'报告{name}：咱俩的{kind}卡已安排在 {hhmm}'
         line = '到点两个人一起自动打卡，打完再来汇报～'
     else:
-        title = f'报告老婆：我的{kind}卡已安排在 {hhmm}'
+        title = f'报告{name}：我的{kind}卡已安排在 {hhmm}'
         line = '闹钟已经定好，到点自动打卡，打完再来跟你汇报～'
 
     rows = [
