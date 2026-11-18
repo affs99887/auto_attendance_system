@@ -1,4 +1,4 @@
-// AI 资讯 —— AI HOT (aihot.virxact.com) 精选资讯页（设计稿 screens/news.jsx 的 TS 平移）。
+// AI 资讯 —— AI HOT (aihot.news) 精选资讯页（设计稿 screens/news.jsx 的 TS 平移）。
 import * as React from 'react';
 import { Icon } from '../lib/icons';
 import {
@@ -185,7 +185,7 @@ export function NewsScreen() {
           <div className="col" style={{ gap: 2, minWidth: 0 }}>
             <div className="card-title" style={{ fontSize: 14 }}>AI HOT · 中文 AI 资讯</div>
             <div className="card-sub" style={{ whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
-              数据来自 aihot.virxact.com · 模型 / 产品 / 论文 / 行业动态
+              数据来自 aihot.news · 模型 / 产品 / 论文 / 行业动态 / 教程 / 观点
             </div>
           </div>
         </div>

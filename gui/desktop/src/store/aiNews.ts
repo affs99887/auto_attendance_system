@@ -21,7 +21,8 @@ export const AI_NEWS_CATEGORIES: AiNewsCategory[] = [
   { slug: 'ai-products', label: '产品发布', hue: 150 },
   { slug: 'paper', label: '论文研究', hue: 290 },
   { slug: 'industry', label: '行业动态', hue: 30 },
-  { slug: 'tip', label: '技巧观点', hue: 70 },
+  { slug: 'tip', label: '教程实践', hue: 70 },
+  { slug: 'opinion', label: '观点评论', hue: 200 },
 ];
 
 export const CATEGORY_BY_SLUG: Record<string, AiNewsCategory> = Object.fromEntries(

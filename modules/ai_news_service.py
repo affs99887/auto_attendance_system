@@ -1,8 +1,8 @@
 """
 AI 资讯服务模块（AI HOT）
 
-通过 aihot.virxact.com 公开接口拉取精选 AI 资讯，带本地缓存与惰性刷新：
-- 网络请求统一带浏览器 User-Agent（默认 UA 会被 403）+ Accept: application/json。
+通过 aihot.news 公开接口（/api/v1/items）拉取精选 AI 资讯，带本地缓存与惰性刷新：
+- 网络请求统一带客户端标识 User-Agent（aihot-api/2.0.0）+ Accept: application/json，并支持 ETag（If-None-Match）协商 304。
 - 若内置网络加速（mihomo）已启用则优先走本地代理；代理连接失败时立即回退默认网络。
 - 所有网络/解析异常 try/except 捕获，绝不外抛；失败时回退旧缓存。
 - 缓存文件 ai_news_cache.json，定位方式与 scheduled_tasks.json 一致（程序运行根目录）。
@@ -26,28 +26,30 @@ from modules.proxy_manager import request_get_with_local_proxy_fallback
 
 logger = logging.getLogger(__name__)
 
-# AI HOT 公开接口（category 服务端过滤，take 控制每页条数，cursor 游标翻页）
-_API_URL = 'https://aihot.virxact.com/api/public/items'
-# 拉取口径：all=全量（约 1900+ 条，内容最全），每条自带 selected 标记编辑精选。
-# selected=仅主编精选（约 112 条，量少质高）。当前用 all 保内容量，精选靠 item.selected 标出。
+# AI HOT v1 公开接口（category 服务端过滤，limit 控制每页条数，cursor 游标翻页）
+_API_URL = 'https://aihot.news/api/v1/items'
+# 拉取口径：all=最近 7 天全量动态，每条自带 selected 标记编辑精选。
+# selected=仅主编精选。当前用 all 保内容量，精选靠 item.selected 标出。
 _MODE = 'all'
 # 每页/首屏条数（游标分页逐页加载）
 _PAGE_TAKE = 30
 
-# 伪装浏览器 UA：默认 requests UA 会被该站点 403，必须带浏览器 UA
-_USER_AGENT = (
-    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 '
-    '(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36'
-)
+# 官方 v1 接口推荐客户端 UA（不伪装浏览器 UA，避免触发边缘规则）
+_USER_AGENT = 'aihot-api/2.0.0'
 
 # 缓存惰性刷新 TTL（秒）
 _TTL_SECONDS = 600
 
 # 缓存文件名（与 scheduled_tasks.json 一致，落在程序运行根目录）
 _CACHE_FILE = 'ai_news_cache.json'
+# 缓存结构版本号：v2 对应 aihot.news/api/v1（淘汰旧版 /api/public 缓存与失效旧游标）
+_CACHE_SCHEMA_VERSION = 2
 
 # 合法版块取值（其余原样保留或 None）
-_VALID_CATEGORIES = {'ai-models', 'ai-products', 'industry', 'paper', 'tip'}
+_VALID_CATEGORIES = {'ai-models', 'ai-products', 'industry', 'paper', 'tip', 'opinion'}
+
+# ETag 命中 304 Not Modified 时的内部哨兵对象（区别于异常返回的 None 与空列表 []）
+_NOT_MODIFIED = object()
 
 # 缓存读写互斥（参考 record_manager 的 _lock）
 _lock = threading.Lock()
@@ -69,11 +71,11 @@ def _cache_path():
 
 
 def _load_cache():
-    """读取缓存文件，失败返回空 dict（不抛）。
+    """读取缓存文件，失败或版本不匹配时返回空 dict（不抛）。
 
-    缓存结构为 {'buckets': {<视图key>: {updated_at,items,fetched,next_cursor,has_next}}}，
+    缓存结构为 {'schema_version': 2, 'buckets': {<视图key>: {updated_at,items,fetched,next_cursor,has_next,etag}}}，
     视图 key = f"{mode}:{category or 'all'}"（如 all:all / all:ai-models / selected:all）。
-    兼容旧版结构（无 buckets 的扁平缓存忽略即可，TTL 内自动重拉，无副作用）。
+    旧版（无 schema_version=2）缓存忽略，避免复用已停用旧接口的游标或 ETag。
     """
     path = _cache_path()
     if not os.path.exists(path):
@@ -81,7 +83,7 @@ def _load_cache():
     try:
         with open(path, 'r', encoding='utf-8') as f:
             data = json.load(f)
-        if isinstance(data, dict):
+        if isinstance(data, dict) and data.get('schema_version') == _CACHE_SCHEMA_VERSION:
             return data
     except Exception:
         logger.warning('[AI资讯] 读取缓存失败，忽略旧缓存', exc_info=True)
@@ -120,6 +122,7 @@ def _save_cache(cache):
     """
     path = _cache_path()
     try:
+        cache['schema_version'] = _CACHE_SCHEMA_VERSION
         tmp_path = f"{path}.tmp"
         with open(tmp_path, 'w', encoding='utf-8') as f:
             json.dump(cache, f, ensure_ascii=False, indent=2)
@@ -131,59 +134,85 @@ def _save_cache(cache):
 
 
 def _normalize_item(raw):
-    """把 API 原始 item 归一化为统一结构 dict。
+    """把 API v1 原始 item 归一化为统一结构 dict。
 
     必有字段 id/title/url/source；可选 title_en/summary/publishedAt/category/selected。
-    category 正常取值为 _VALID_CATEGORIES 之一；上游偶发的非法取值原样透传、由前端兜底展示。
-    请求参数侧的 category 白名单校验在 web_server 路由层做（复用 _VALID_CATEGORIES）。
+    v1 字段映射：
+    - url <- links.original（缺失时回退 links.aihot / 旧版 url）
+    - source <- source.name（兼容字符串兜底）
+    - title_en <- originalTitle（兼容旧版 title_en）
+    - publishedAt <- publishedAt（为 null 时回退 discoveredAt，保证相对时间与排序稳定）
+    category 正常取值为 _VALID_CATEGORIES 之一；上游偶发的未知取值原样透传、由前端兜底展示。
     selected=True 表示该条是上游主编精选（前端据此打「精选」标）。
     """
+    links = raw.get('links')
+    if isinstance(links, dict):
+        url = links.get('original') or links.get('aihot') or raw.get('url')
+    else:
+        url = raw.get('url')
+
+    raw_source = raw.get('source')
+    if isinstance(raw_source, dict):
+        source = raw_source.get('name') or ''
+    else:
+        source = raw_source or ''
+
+    title_en = raw.get('originalTitle') if 'originalTitle' in raw else raw.get('title_en')
+    published_at = raw.get('publishedAt') or raw.get('discoveredAt')
+
     return {
         'id': raw.get('id'),
         'title': raw.get('title'),
-        'title_en': raw.get('title_en'),
-        'url': raw.get('url'),
-        'source': raw.get('source'),
-        'publishedAt': raw.get('publishedAt'),
+        'title_en': title_en,
+        'url': url,
+        'source': source,
+        'publishedAt': published_at,
         'summary': raw.get('summary'),
         'category': raw.get('category'),
         'selected': bool(raw.get('selected')),
     }
 
 
-def _fetch_from_aihot(cursor=None, take=None, category=None, mode=None):
-    """调用 AI HOT 接口，返回 (items, next_cursor, has_next)。
+def _fetch_from_aihot(cursor=None, take=None, category=None, mode=None, etag=None):
+    """调用 AI HOT v1 接口，返回 (items, next_cursor, has_next, etag)。
 
     - mode 缺省 _MODE(all 全量)，'selected' 时仅主编精选（供"只看精选"筛选）；
-      take 控制每页条数；cursor 非空时翻下一页。
+      limit 控制每页条数；cursor 非空时翻下一页。
     - category 非空时按版块服务端过滤（各版块游标独立，可与 mode 组合）。
-    - 每条返回带 selected 标记（是否主编精选），归一化后透传给前端。
-    - 任何网络/解析异常都捕获并向上返回 (None, None, None)，由调用方回退旧缓存或上抛。
+    - 首屏若传入 etag 则附带 If-None-Match，命中 304 时返回 (_NOT_MODIFIED, None, None, etag)。
+    - 任何网络/解析异常都捕获并向上返回 (None, None, None, None)，由调用方回退旧缓存或上抛。
     """
     params = {
         'mode': mode or _MODE,
-        'take': take or _PAGE_TAKE,
+        'limit': take or _PAGE_TAKE,
     }
     if category:
         params['category'] = category
     if cursor:
         params['cursor'] = cursor
+
+    headers = {
+        'User-Agent': _USER_AGENT,
+        'Accept': 'application/json',
+    }
+    if etag and not cursor:
+        headers['If-None-Match'] = etag
+
     try:
         resp = request_get_with_local_proxy_fallback(
             'ai_news',
             _API_URL,
             params=params,
-            headers={
-                'User-Agent': _USER_AGENT,
-                'Accept': 'application/json',
-            },
+            headers=headers,
             timeout=10,
         )
+        if resp.status_code == 304:
+            return _NOT_MODIFIED, None, None, resp.headers.get('ETag') or etag
         resp.raise_for_status()
         data = resp.json()
     except Exception:
         logger.warning('[AI资讯] 拉取 AI HOT 数据失败', exc_info=True)
-        return None, None, None
+        return None, None, None, None
 
     try:
         raw_items = data.get('items') or []
@@ -192,12 +221,14 @@ def _fetch_from_aihot(cursor=None, take=None, category=None, mode=None):
             if not isinstance(raw, dict):
                 continue
             items.append(_normalize_item(raw))
-        next_cursor = data.get('nextCursor')
-        has_next = bool(data.get('hasNext'))
-        return items, next_cursor, has_next
+        page = data.get('page') if isinstance(data.get('page'), dict) else {}
+        next_cursor = page.get('nextCursor') if 'nextCursor' in page else data.get('nextCursor')
+        has_next = bool(page.get('hasMore') if 'hasMore' in page else data.get('hasNext'))
+        resp_etag = resp.headers.get('ETag')
+        return items, next_cursor, has_next, resp_etag
     except Exception:
         logger.warning('[AI资讯] 解析 AI HOT 数据失败', exc_info=True)
-        return None, None, None
+        return None, None, None, None
 
 
 def _build_contract(bucket):
@@ -222,44 +253,62 @@ def refresh(category=None, mode=None):
     mode = mode or _MODE
     key = _bucket_key(mode, category)
     with _lock:
+        prev_bucket = _get_bucket(_load_cache(), mode, category)
         if key in _inflight:
             # single-flight：同视图已有拉取在途，后来者直接回旧缓存（不等待），
             # 避免对上游重复发起相同拉取、多占一个 waitress 线程陪跑网络超时
-            return _build_contract(_get_bucket(_load_cache(), mode, category))
+            return _build_contract(prev_bucket)
         _inflight.add(key)
         # 无论本次成败都记发起时刻，供 get_ai_news 的失败冷却判定
         _last_attempt[key] = time.time()
+        prev_etag = prev_bucket.get('etag') if prev_bucket.get('updated_at') is not None else None
 
     try:
         # 网络请求挪到锁外执行：_fetch_from_aihot 只做网络拉取+解析，不触碰共享缓存，
         # 因此最长 ~20s 的慢网络不会持锁阻塞 get_ai_news 的 TTL 快速读路径，
         # 避免 waitress 工作线程被一并卡死（M66，与 exchange_rate_service 同款改造）。
-        items, next_cursor, has_next = _fetch_from_aihot(category=category, mode=mode)
+        items, next_cursor, has_next, new_etag = _fetch_from_aihot(
+            category=category, mode=mode, etag=prev_etag)
 
         with _lock:
             cache = _load_cache()
+            cur_bucket = _get_bucket(cache, mode, category) or prev_bucket
 
             if items is None:
                 # 本次彻底失败：回退该视图旧缓存（冷却期内首屏不会再打网络）
                 logger.warning('[AI资讯] 刷新失败，回退旧缓存 view=%s', key)
-                return _build_contract(_get_bucket(cache, mode, category))
+                return _build_contract(cur_bucket)
 
-            # 写入/更新该视图缓存（含首屏游标，作为"加载更多"续拉起点）
-            bucket = {
-                'updated_at': int(time.time()),
-                'items': items,
-                'fetched': int(time.time()),
-                'next_cursor': next_cursor,
-                'has_next': bool(has_next),
-            }
+            now_ts = int(time.time())
+            if items is _NOT_MODIFIED:
+                # 304 Not Modified：上游内容未变化，复用已有条目与游标，推进刷新时间戳
+                bucket = {
+                    'updated_at': now_ts,
+                    'items': cur_bucket.get('items') or [],
+                    'fetched': now_ts,
+                    'next_cursor': cur_bucket.get('next_cursor'),
+                    'has_next': bool(cur_bucket.get('has_next')),
+                    'etag': new_etag or cur_bucket.get('etag'),
+                }
+            else:
+                # 写入/更新该视图缓存（含首屏游标与 ETag，作为"加载更多"续拉起点与下次协商依据）
+                bucket = {
+                    'updated_at': now_ts,
+                    'items': items,
+                    'fetched': now_ts,
+                    'next_cursor': next_cursor,
+                    'has_next': bool(has_next),
+                    'etag': new_etag,
+                }
             _set_bucket(cache, mode, category, bucket)
 
             _save_cache(cache)
             # 一次成功即证明上游可达：清掉全部视图的失败冷却，
             # 让 WS 推送触发的其他视图重拉立即回源，而不是被冷却挡回空缓存
             _last_attempt.clear()
-            logger.info('[AI资讯] 刷新成功 view=%s 条数=%d has_next=%s',
-                        key, len(items), has_next)
+            logger.info('[AI资讯] 刷新成功 view=%s 条数=%d has_next=%s%s',
+                        key, len(bucket['items']), bucket['has_next'],
+                        ' (304)' if items is _NOT_MODIFIED else '')
             return _build_contract(bucket)
     finally:
         with _lock:
@@ -284,9 +333,9 @@ def get_ai_news(force=False, cursor=None, take=None, category=None, mode=None):
     mode = mode or _MODE
     if cursor:
         # 加载更多：游标续拉（带 mode+category 过滤），实时返回，不进缓存（避免污染首屏缓存）
-        items, next_cursor, has_next = _fetch_from_aihot(
+        items, next_cursor, has_next, _ = _fetch_from_aihot(
             cursor=cursor, take=take, category=category, mode=mode)
-        if items is None:
+        if items is None or items is _NOT_MODIFIED:
             raise RuntimeError('ai-news load_more failed')
         return {
             'updated_at': int(time.time()),

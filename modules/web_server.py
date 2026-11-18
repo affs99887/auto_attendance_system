@@ -1102,8 +1102,8 @@ def _build_flask_app(attendance_system, bridge: AsyncioBridge,
         query:
           - force=0|1（1 跳过 TTL 立即拉，仅首屏有效）；
           - cursor=<base64>（"加载更多"游标续拉，实时拉不走缓存）；
-          - take=N（每页条数，1..100；仅对带 cursor 的续拉生效，首屏固定 30 条、传了也会被忽略）；
-          - category=ai-models|ai-products|industry|paper|tip（按版块服务端过滤，
+          - take=N（或 limit=N，每页条数，1..100；仅对带 cursor 的续拉生效，首屏固定 30 条、传了也会被忽略）；
+          - category=ai-models|ai-products|industry|paper|tip|opinion（按版块服务端过滤，
             缺省 / all / 非法值均按"全部"处理）；
           - mode=all|selected（selected 只取主编精选"只看精选"，缺省全量；可与 category 组合，
             各视图独立一份列表/游标/缓存）。
@@ -1124,7 +1124,7 @@ def _build_flask_app(attendance_system, bridge: AsyncioBridge,
         if mode not in ('all', 'selected'):
             mode = None  # 非法/缺省 → 交由服务层用默认口径(all)
         take = None
-        take_raw = request.args.get('take')
+        take_raw = request.args.get('take') or request.args.get('limit')
         if take_raw:
             try:
                 take = max(1, min(100, int(take_raw)))
