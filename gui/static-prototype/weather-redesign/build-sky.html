@@ -1,0 +1,23 @@
+<!doctype html>
+<html lang="zh-CN">
+<meta charset="utf-8">
+<title>生成天空图片</title>
+<style>
+  body { margin: 24px; font: 14px/1.6 system-ui, sans-serif; background: #20242c; color: #dfe3ea; }
+  figure { display: inline-block; margin: 0 16px 16px 0; }
+  figure img { display: block; max-width: 560px; background: linear-gradient(#3f7fc4, #2a5aa0); }
+  a { color: #9cc7ff; }
+</style>
+<h1>生成天空图片</h1>
+<p>这一页把 sky-build.js 里定义的云和月亮各画一遍。点图片下面的文件名下载，放进 sky/ 目录，sky.js 用的就是那里的文件。<br>
+只想重画其中几张时，在网址后面加 # 和名字，例如 build-sky.html#cumulus,moon</p>
+<div id="list"></div>
+<script src="sky-build.js"></script>
+<script>
+  const names = location.hash ? location.hash.slice(1).split(',') : Object.keys(SkyBuild.CLOUDS).concat('moon');
+  for (const name of names) {
+    const c = name === 'moon' ? SkyBuild.moon(384) : SkyBuild.cloud(name, 1), url = c.toDataURL('image/webp', .9);
+    document.getElementById('list').insertAdjacentHTML('beforeend', `<figure><img src="${url}" alt=""><a download="${name}.webp" href="${url}">${name}.webp（${c.width}×${c.height}）</a></figure>`);
+  }
+</script>
+</html>

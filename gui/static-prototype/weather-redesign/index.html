@@ -1,0 +1,1017 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>天气新设计稿</title>
+<link rel="icon" href="data:,">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<!-- 字体和应用里用的是同一套，只多要了一个细体（300）给大号气温数字用；
+     用 media 切换的写法是为了字体下载慢时不卡住页面显示 -->
+<link rel="stylesheet" media="print" onload="this.media='all'" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@300;400;500;600;700&family=IBM+Plex+Sans+SC:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap">
+<style>
+:root {
+  --font: 'IBM Plex Sans', 'IBM Plex Sans SC', 'Segoe UI', 'Microsoft YaHei UI', system-ui, sans-serif;
+  --font-mono: 'JetBrains Mono', ui-monospace, Consolas, monospace;
+  --radius: 6px;
+  --radius-lg: 10px;
+}
+* { box-sizing: border-box; }
+html, body { margin: 0; height: 100%; }
+body {
+  min-height: 100%;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  font-family: var(--font);
+  font-size: 13px;
+  color: #fff;
+  background:
+    radial-gradient(ellipse at 20% 0%, rgba(70,90,120,0.4), transparent 50%),
+    radial-gradient(ellipse at 80% 100%, rgba(120,80,60,0.3), transparent 50%),
+    #2a2926;
+  -webkit-font-smoothing: antialiased;
+}
+button { font: inherit; color: inherit; }
+button:focus-visible { outline: 2px solid #fff; outline-offset: 2px; }
+
+/* ===== 设计稿自己的顶部切换条（不属于应用界面，只用来切换示例场景） ===== */
+.review { flex: none; width: 1528px; height: 44px; display: flex; align-items: center; gap: 18px; padding: 0 24px; color: #cfccc2; font-size: 12.5px; }
+.review strong { color: #fff; font-weight: 600; font-size: 13.5px; }
+.review-note { margin-left: auto; color: #a29f95; }
+.seg { display: inline-flex; gap: 2px; padding: 3px; border-radius: 9px; background: rgba(255,255,255,.08); }
+.seg button { padding: 4px 11px; border: 0; border-radius: 6px; background: transparent; color: #cfccc2; cursor: pointer; white-space: nowrap; }
+.seg button:hover { color: #fff; }
+.seg button[aria-pressed="true"] { background: #f5f4ee; color: #1b1b17; font-weight: 600; }
+.seg-label { margin-right: -10px; color: #a29f95; }
+/* 应用窗口按 1480×920 的固定大小画出来，再整体缩放到浏览器窗口放得下 */
+.stage { flex: none; width: 1528px; height: 932px; padding: 0 24px 12px; }
+
+/* =====================================================================
+   整屏天气背景：天空本身由 sky.js 画（云、雨、雪、星空、月亮），这里只管它在窗口里的位置和切换时的淡入。
+   天气页打开时，整个窗口（标题栏、侧栏、内容区）都铺在这片天空上。
+   ===================================================================== */
+.win {
+  position: relative; isolation: isolate;
+  width: 1480px; height: 920px;
+  display: grid; grid-template-rows: 32px 1fr;
+  overflow: hidden;
+  border: 1px solid rgba(0,0,0,.1); border-radius: 8px;
+  background: #18181a;
+  box-shadow: 0 20px 60px -10px rgba(20,18,12,0.25), 0 8px 20px rgba(20,18,12,0.08);
+}
+/* --glass-blur 是玻璃面板的模糊程度，--glass-k 是面板底色的浓淡倍数（1 是原样），顶部两个拖动条改的就是它们。
+   data-tone 是当前天空的色调，由 sky.js 给出；--wx-h 是这个色调对应的色相，选中的地点标签用它配文字颜色；--side 是侧栏那片磨砂玻璃上盖的颜色 */
+.win { --glass-blur: 16px; --glass-k: 1; }
+.win[data-tone='blue'] { --wx-h: 250; --side: oklch(.34 .09 256 / .34); }
+.win[data-tone='grey'] { --wx-h: 252; --side: oklch(.3 .02 255 / .3); }
+.win[data-tone='storm'] { --wx-h: 258; --side: oklch(.22 .035 262 / .3); }
+.win[data-tone='night'] { --wx-h: 272; --side: rgb(255 255 255 / .05); }
+.win[data-tone='warm'] { --wx-h: 70; --side: oklch(.32 .035 70 / .3); }
+.titlebar, .shell { position: relative; z-index: 1; }
+.weather-theme-stack { position: absolute; inset: 0; z-index: 0; overflow: hidden; pointer-events: none; contain: paint; }
+/* 切换天气时新天空淡入；页面刚打开的第一张不做淡入，直接显示 */
+.sky.fade-in { animation: weather-theme-scene-in .72s ease both; }
+@keyframes weather-theme-scene-in { from { opacity: 0; } }
+
+/* 应用外框在整屏天气下的样子（同样照搬应用现状） */
+.titlebar { display: grid; grid-template-columns: 240px 1fr auto; align-items: stretch; border-bottom: 1px solid rgba(255,255,255,.14); font-size: 12px; user-select: none; text-shadow: 0 1px 2px rgba(18,22,38,.28); }
+.titlebar-app { display: flex; align-items: center; gap: 8px; padding: 0 12px; font-weight: 500; }
+.app-mark { width: 16px; height: 16px; border-radius: 3px; display: grid; place-items: center; background: oklch(0.50 0.13 250); color: #fff; font: 700 10px var(--font-mono); text-shadow: none; }
+.tb-ver { color: rgba(255,255,255,.85); font-weight: 400; }
+.titlebar-title { display: flex; align-items: center; justify-content: center; color: rgba(255,255,255,.85); letter-spacing: .02em; }
+.window-controls { display: flex; }
+.win-btn { width: 46px; display: grid; place-items: center; color: rgba(255,255,255,.82); }
+.win-btn svg { width: 10px; height: 10px; }
+.shell { display: grid; grid-template-columns: 240px 1fr; min-height: 0; }
+/* 侧栏是一整片磨砂玻璃：背景模糊后再盖一层颜色，白色的文字压在亮云上也看得清 */
+.sidebar { display: flex; flex-direction: column; background: var(--side); -webkit-backdrop-filter: blur(22px) saturate(1.3); backdrop-filter: blur(22px) saturate(1.3); border-right: 1px solid rgba(255,255,255,.16); box-shadow: inset -1px 0 0 rgba(255,255,255,.06); overflow: hidden; text-shadow: 0 1px 2px rgba(18,22,38,.28); }
+.side-section { padding: 14px 12px 8px; }
+.side-label { padding: 0 8px 6px; font-size: 11px; font-weight: 500; color: rgba(255,255,255,.72); letter-spacing: .06em; }
+.side-item { display: flex; align-items: center; gap: 10px; padding: 7px 10px; border-radius: var(--radius); font-size: 13px; color: rgba(255,255,255,.92); white-space: nowrap; }
+.side-item svg { width: 16px; height: 16px; color: rgba(255,255,255,.82); }
+.side-item.active { background: rgba(255,255,255,.2); font-weight: 500; }
+.side-item.active svg { color: #fff; }
+.side-badge { margin-left: auto; padding: 1px 6px; border: 1px solid rgba(255,255,255,.26); border-radius: 8px; background: rgba(255,255,255,.16); color: #fff; font: 10px var(--font-mono); }
+.side-footer { margin-top: auto; padding: 10px 12px; }
+.svc { display: flex; align-items: center; gap: 8px; padding: 9px 10px; border: 1px solid rgba(255,255,255,.2); border-radius: var(--radius-lg); background: rgba(255,255,255,.12); font-size: 12px; }
+.svc i { width: 7px; height: 7px; border-radius: 50%; background: oklch(.8 .16 150); }
+.main { display: flex; flex-direction: column; min-width: 0; min-height: 0; }
+.toolbar { flex: none; height: 48px; padding: 0 24px; display: flex; align-items: center; justify-content: space-between; border-bottom: 1px solid rgba(255,255,255,.14); }
+.toolbar-lead { display: flex; align-items: baseline; min-width: 0; }
+.toolbar-title { font-size: 14px; font-weight: 500; white-space: nowrap; }
+.toolbar-sub { margin-left: 10px; font-size: 12px; color: rgba(255,255,255,.85); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.clock { padding: 4px 10px; border: 1px solid rgba(255,255,255,.22); border-radius: var(--radius); background: rgba(255,255,255,.14); font: 12px var(--font-mono); letter-spacing: .04em; white-space: nowrap; }
+.content { flex: 1; min-height: 0; overflow: auto; padding: 18px 24px 22px; scrollbar-width: thin; scrollbar-color: rgba(255,255,255,.3) transparent; }
+
+/* =====================================================================
+   以下是这次重新设计的天气页内容
+   ===================================================================== */
+.wx {
+  /* 三档文字深浅 + 分隔线 */
+  --ink-2: rgb(255 255 255 / .8);
+  --ink-3: rgb(255 255 255 / .68);
+  --line: rgb(255 255 255 / .13);
+  /* 玻璃面板上盖的一层很淡的颜色：白天用比天空深一档的同色，夜里用很淡的白，保证白色的文字在哪种天气上都看得清。
+     --glass-c 是颜色，--glass-a 是原本的浓度，再乘上拖动条给的倍数 --glass-k 才是最后盖上去的颜色 --glass */
+  --glass-c: oklch(.3 .09 256); --glass-a: .3;
+  --glass: color-mix(in oklab, var(--glass-c) calc(var(--glass-a) * var(--glass-k) * 100%), transparent);
+  --track: rgb(4 18 46 / .26);
+  /* 跟雨有关的标记统一用这个浅青色；头盔提醒里"有雨"的标签用暖黄 */
+  --rain: oklch(.88 .085 222);
+  --warm: oklch(.9 .13 90);
+  display: flex; flex-direction: column; gap: 16px;
+  max-width: 1400px; margin: 0 auto;
+  color: #fff;
+  font-variant-numeric: tabular-nums;
+}
+[data-tone='grey'] .wx { --glass-c: oklch(.27 .02 255); --glass-a: .26; --track: rgb(10 16 28 / .28); }
+[data-tone='storm'] .wx { --glass-c: oklch(.2 .035 262); --glass-a: .28; --track: rgb(6 12 30 / .3); }
+[data-tone='night'] .wx { --glass-c: #fff; --glass-a: .04; --track: rgb(255 255 255 / .1); }
+[data-tone='warm'] .wx { --glass-c: oklch(.3 .035 70); --glass-a: .26; --track: rgb(40 28 10 / .26); }
+
+/* 液态玻璃面板，从下到上一共三层，都垫在文字下面：
+   ::before  把面板后面的背景模糊掉（模糊多少由 --glass-blur 定）
+   .lg-inner 开源库 @avenra/liquid-glass 插进来的一层，让背景在面板边缘一圈被弯折，并加上边缘高光
+   ::after   一层很淡的底色、边缘的亮线和面板下方的投影 */
+.glass { position: relative; isolation: isolate; border-radius: 22px; }
+.glass::before { content: ''; position: absolute; inset: 0; z-index: -1; border-radius: inherit; pointer-events: none; -webkit-backdrop-filter: blur(var(--glass-blur)) saturate(1.25); backdrop-filter: blur(var(--glass-blur)) saturate(1.25); }
+.lg-inner { position: absolute; inset: 0; z-index: -1; border-radius: inherit; pointer-events: none; }
+.lg-clone { display: none; }
+.glass::after {
+  content: ''; position: absolute; inset: 0; z-index: -1; border-radius: inherit; pointer-events: none;
+  background: linear-gradient(165deg, rgb(255 255 255 / .15), rgb(255 255 255 / .02) 38%, rgb(255 255 255 / .06)), var(--glass);
+  box-shadow: inset 0 0 0 1px rgb(255 255 255 / .13), inset 0 1px 0 rgb(255 255 255 / .38), inset 0 -1px 0 rgb(255 255 255 / .1), 0 16px 36px -16px rgb(4 12 36 / .5);
+}
+.panel-title { margin: 0; font-size: 13px; font-weight: 600; }
+
+/* --- 第一行：收藏地点切换 + 更新时间 / 刷新 / 设置 --- */
+.loc-row { display: flex; align-items: center; gap: 14px; min-height: 32px; }
+/* 几个地点放在同一条玻璃胶囊里；地点多到放不下时，胶囊里面可以左右滑动 */
+.loc-bar { flex: 0 1 auto; min-width: 0; padding: 3px; border-radius: 999px; }
+.loc-tabs { display: flex; align-items: center; gap: 2px; overflow-x: auto; scrollbar-width: none; border-radius: 999px; }
+.loc-tab { flex: none; display: inline-flex; align-items: center; border-radius: 999px; color: var(--ink-2); }
+.loc-tab:hover { background: rgb(255 255 255 / .12); color: #fff; }
+.loc-tab.active { background: rgb(255 255 255 / .94); color: oklch(.34 .09 var(--wx-h)); }
+.loc-pick { padding: 6px 13px; border: 0; border-radius: 999px; background: none; font-size: 13px; font-weight: 500; cursor: pointer; }
+.loc-tab.active .loc-pick { font-weight: 600; }
+.loc-del { width: 20px; height: 20px; margin: 0 6px 0 -8px; display: grid; place-items: center; border: 0; border-radius: 50%; background: none; color: inherit; opacity: .7; cursor: pointer; }
+.loc-del:hover { opacity: 1; background: rgb(255 255 255 / .16); }
+.loc-del svg { width: 10px; height: 10px; }
+.loc-add { flex: none; display: inline-flex; align-items: center; gap: 5px; margin-left: 4px; padding: 6px 12px; border: 0; border-radius: 999px; background: none; color: var(--ink-2); font-size: 13px; font-weight: 500; cursor: pointer; }
+.loc-add:hover { background: rgb(255 255 255 / .12); color: #fff; }
+.loc-add svg { width: 12px; height: 12px; }
+/* 右上角只放两个按钮、不放文字：夜晚背景的月亮正好在这一带，文字压在月亮上会看不清 */
+.loc-meta { position: relative; flex: none; margin-left: auto; display: flex; align-items: center; gap: 8px; }
+/* "外观"按钮点开的小面板：调玻璃面板的模糊和底色。它自己不做玻璃效果，用不透明的深色底，拖的时候才能看清数值 */
+.glass-pop { position: absolute; z-index: 6; top: calc(100% + 10px); right: 0; width: 318px; padding: 14px 16px 12px; border: 1px solid rgb(255 255 255 / .16); border-radius: 14px; background: rgb(18 26 50 / .97); box-shadow: 0 18px 40px -14px rgb(0 6 24 / .7); }
+.glass-pop[hidden] { display: none; }
+.glass-pop h3 { margin: 0 0 10px; font-size: 13px; font-weight: 600; }
+.gp-row { display: grid; grid-template-columns: 34px minmax(0, 1fr) 44px; align-items: center; gap: 10px; height: 30px; font-size: 12.5px; color: rgb(255 255 255 / .8); }
+.gp-row input { width: 100%; margin: 0; accent-color: #fff; cursor: pointer; }
+.gp-row output { text-align: right; color: #fff; font: 500 12.5px var(--font-mono); }
+.gp-foot { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-top: 8px; padding-top: 10px; border-top: 1px solid rgb(255 255 255 / .12); font-size: 11.5px; color: rgb(255 255 255 / .6); }
+.gp-foot button { padding: 3px 10px; border: 1px solid rgb(255 255 255 / .22); border-radius: 999px; background: rgb(255 255 255 / .08); color: #fff; font-size: 11.5px; cursor: pointer; white-space: nowrap; }
+.gp-foot button:hover { background: rgb(255 255 255 / .18); }
+/* 小按钮只做磨砂（背景模糊 + 一层底色 + 顶上一道亮线），不做边缘弯折 */
+.sky-btn { display: inline-flex; align-items: center; gap: 6px; padding: 5px 11px; border: 1px solid rgb(255 255 255 / .2); border-radius: 999px; background: var(--glass); -webkit-backdrop-filter: blur(12px) saturate(1.3); backdrop-filter: blur(12px) saturate(1.3); box-shadow: inset 0 1px 0 rgb(255 255 255 / .28); color: #fff; font-size: 12px; font-weight: 500; cursor: pointer; white-space: nowrap; }
+.sky-btn:hover { background: color-mix(in oklab, var(--glass), #fff 16%); border-color: rgb(255 255 255 / .36); }
+.sky-btn svg { width: 13px; height: 13px; }
+
+/* --- 顶部展示区：左边直接把现在的天气写在天空上（不加底框），右边是头盔提醒 --- */
+.hero { display: grid; grid-template-columns: minmax(0, 1fr) minmax(360px, 460px); gap: 32px; align-items: end; padding: 6px 2px 2px 6px; }
+.hero-now { min-width: 0; text-shadow: 0 1px 2px rgb(10 18 40 / .3), 0 0 22px rgb(10 18 40 / .22); }
+.hero-addr { display: flex; align-items: baseline; flex-wrap: wrap; gap: 2px 14px; }
+.hero-addr strong { font-size: 15px; font-weight: 500; letter-spacing: .01em; }
+.hero-addr span { font-size: 12px; color: var(--ink-3); }
+.hero-main { margin-top: 8px; display: flex; align-items: flex-end; gap: 30px; }
+.hero-temp { flex: none; font-size: 172px; font-weight: 300; line-height: .8; letter-spacing: -.055em; margin-left: -6px; padding-bottom: 6px; }
+.hero-temp sup { font-size: .34em; font-weight: 300; line-height: 1; letter-spacing: 0; vertical-align: top; position: relative; top: .16em; margin-left: .06em; }
+.hero-copy { min-width: 0; padding-bottom: 8px; }
+.hero-cond { display: flex; align-items: center; gap: 10px; font-size: 26px; font-weight: 500; line-height: 1.2; letter-spacing: .01em; }
+.hero-cond svg { flex: none; width: 30px; height: 30px; }
+.hero-sub { margin-top: 6px; display: flex; flex-wrap: wrap; gap: 2px 18px; font-size: 14px; color: var(--ink-2); }
+.hero-say { margin: 16px 0 0; padding-top: 14px; border-top: 1px solid var(--line); font-size: 16px; font-weight: 500; line-height: 1.45; text-wrap: pretty; }
+.hero-say2 { margin: 4px 0 0; font-size: 13px; line-height: 1.5; color: var(--ink-2); text-wrap: pretty; }
+
+/* 头盔提醒 */
+.helmet { padding: 16px 18px 14px; }
+.helmet-head { display: flex; align-items: flex-start; gap: 12px; }
+.helmet-ico { flex: none; width: 38px; height: 38px; display: grid; place-items: center; border-radius: 11px; background: rgb(255 255 255 / .16); }
+.helmet-ico svg { width: 22px; height: 22px; }
+.helmet-copy { min-width: 0; flex: 1; }
+.helmet-title { display: flex; align-items: center; flex-wrap: wrap; gap: 6px 9px; }
+.helmet h2 { margin: 0; font-size: 16px; font-weight: 600; line-height: 1.35; }
+.helmet-pill { padding: 2px 9px; border-radius: 999px; background: var(--warm); color: oklch(.3 .07 260); font-size: 11.5px; font-weight: 600; white-space: nowrap; }
+.helmet.is-dry .helmet-pill { background: oklch(.9 .12 145); color: oklch(.28 .07 155); }
+.helmet.is-unknown .helmet-pill { background: rgb(255 255 255 / .78); color: oklch(.3 .03 255); }
+.helmet-detail { margin: 4px 0 0; font-size: 12.5px; line-height: 1.55; color: var(--ink-2); text-wrap: pretty; }
+.helmet-line { margin-top: 14px; }
+.helmet-line-head { display: flex; align-items: baseline; justify-content: space-between; margin-bottom: 7px; font-size: 12px; color: var(--ink-3); }
+.helmet-line-head b { font-weight: 600; color: #fff; }
+.helmet-cells { display: grid; grid-template-columns: repeat(var(--n), minmax(0, 1fr)); gap: 3px; }
+.helmet-cells > span { height: 16px; display: grid; place-items: center; border-radius: 4px; background: rgb(255 255 255 / .15); color: var(--ink-2); font-size: 12px; font-weight: 500; }
+.helmet-cells > span.wet { background: color-mix(in oklab, var(--rain) calc(var(--s) * 100%), rgb(255 255 255 / .15)); color: oklch(.28 .06 250); font-weight: 600; }
+.helmet-cells > span.uncovered { background: transparent; box-shadow: inset 0 0 0 1px rgb(255 255 255 / .3); opacity: .8; }
+.helmet-cells.days > span { height: 28px; }
+.helmet-axis { display: flex; justify-content: space-between; margin-top: 5px; font-size: 11px; color: var(--ink-3); }
+
+/* --- 预警：跟其他面板用同一套液态玻璃（模糊、底色都跟着"外观"里的设置走），只有前面的图标用暖黄色提醒 --- */
+.alert { display: flex; gap: 12px; padding: 13px 18px; }
+.alert-ico { flex: none; width: 18px; height: 18px; margin-top: 1px; color: var(--warm); }
+.alert h3 { margin: 0; font-size: 14px; font-weight: 600; }
+.alert p { margin: 3px 0 0; font-size: 13px; line-height: 1.6; color: var(--ink-2); }
+.alert small { display: block; margin-top: 4px; font-size: 12px; color: var(--ink-3); }
+
+/* --- 24 小时 --- */
+.hours { padding: 14px 0 6px; }
+.hours-head { display: flex; align-items: center; justify-content: space-between; padding: 0 20px; }
+.hours-legend { display: flex; gap: 16px; font-size: 12px; color: var(--ink-3); }
+.hours-legend span { display: inline-flex; align-items: center; gap: 6px; }
+.hours-legend i { display: inline-block; }
+.hours-legend .lg-line { width: 18px; height: 2px; border-radius: 1px; background: #fff; }
+.hours-legend .lg-bar { width: 6px; height: 12px; border-radius: 3px; background: var(--rain); }
+.hours-plot { position: relative; margin-top: 8px; }
+.hours-plot svg { display: block; width: 100%; }
+.hours-plot text { font-family: var(--font); fill: #fff; }
+.c-cond { font-size: 12px; font-weight: 500; }
+.c-temp { font-size: 13px; font-weight: 500; text-anchor: middle; }
+.c-rain { font-size: 11px; font-weight: 600; text-anchor: middle; fill: var(--rain) !important; }
+.c-hour { font-size: 11.5px; text-anchor: middle; fill-opacity: .62; }
+.c-hour.strong { font-weight: 600; fill-opacity: 1; }
+.hours-tip { position: absolute; z-index: 3; pointer-events: none; padding: 7px 11px; border-radius: 9px; background: rgb(12 18 38 / .9); box-shadow: 0 6px 18px -6px rgb(0 0 0 / .5); font-size: 12px; line-height: 1.5; white-space: nowrap; transform: translate(-50%, -100%); opacity: 0; transition: opacity .12s; }
+.hours-tip.on { opacity: 1; }
+.hours-tip b { font-weight: 600; }
+.hours-tip span { opacity: .78; }
+
+/* --- 最下面一行：左边未来 7 天，右边 8 项实况 --- */
+.duo { display: grid; grid-template-columns: minmax(0, 1.18fr) minmax(0, 1fr); gap: 16px; }
+.week { padding: 14px 8px 8px; }
+.week .panel-title { padding: 0 12px 6px; }
+.drow { display: grid; grid-template-columns: 44px 46px minmax(96px, 1.1fr) 62px 34px minmax(80px, 2fr) 34px; align-items: center; gap: 0 10px; height: 34px; padding: 0 12px; border-radius: 9px; font-size: 13px; }
+.drow:hover { background: rgb(255 255 255 / .07); }
+.drow + .drow { box-shadow: 0 -1px 0 var(--line); }
+.drow:hover, .drow:hover + .drow { box-shadow: none; }
+.d-name { font-weight: 500; }
+.drow.is-today .d-name { font-weight: 700; }
+.d-date { font-size: 12px; color: var(--ink-3); }
+.d-sky { display: flex; align-items: center; gap: 8px; min-width: 0; white-space: nowrap; }
+.d-sky svg { flex: none; width: 20px; height: 20px; }
+.d-rain { display: inline-flex; align-items: center; gap: 4px; font-size: 12px; color: var(--ink-3); }
+.d-rain svg { width: 10px; height: 10px; }
+.d-rain.wet { color: var(--rain); font-weight: 600; }
+.d-lo { text-align: right; color: var(--ink-2); }
+.d-hi { font-weight: 600; }
+.d-bar { position: relative; height: 6px; border-radius: 3px; background: var(--track); }
+.d-bar i { position: absolute; top: 0; bottom: 0; border-radius: 3px; }
+
+.metrics { padding: 14px 20px 6px; display: flex; flex-direction: column; }
+.metrics-grid { flex: 1; display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 0 28px; margin-top: 2px; }
+.metric { min-width: 0; display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: center; gap: 0 10px; padding: 7px 0; border-top: 1px solid var(--line); }
+.metric:nth-child(-n + 2) { border-top: 0; }
+.metric-label { font-size: 12px; color: var(--ink-3); }
+.metric-note { grid-column: 1; font-size: 12px; color: var(--ink-2); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.metric-value { grid-column: 2; grid-row: 1 / span 2; display: flex; align-items: baseline; gap: 0 5px; white-space: nowrap; }
+.metric-value b { font-size: 21px; font-weight: 500; letter-spacing: -.02em; }
+.metric-value b.word { font-size: 16px; letter-spacing: 0; }
+.metric-value i { font-size: 12px; font-style: normal; color: var(--ink-3); }
+.metric-value .wind-arrow { align-self: center; width: 15px; height: 15px; }
+.aqi-dot { align-self: center; width: 8px; height: 8px; border-radius: 50%; background: var(--tone); }
+.aqi-scale { position: relative; height: 4px; margin: 5px 0 1px; display: flex; gap: 2px; max-width: 150px; }
+.aqi-scale > span { height: 100%; border-radius: 2px; opacity: .75; }
+.aqi-scale > em { position: absolute; top: -3px; width: 10px; height: 10px; margin-left: -5px; border: 2px solid #fff; border-radius: 50%; background: var(--tone); }
+
+
+/* =====================================================================
+   首页（仪表盘）。只有"天气"那张卡片是这次重新设计的；其余几块照应用现状画个大概，没有改动
+   ===================================================================== */
+.win[data-view='home'] {
+  --bg-base: #f5f4ee; --bg-card: #fff; --bg-sidebar: #efede5; --bg-active: #e2dfd4; --bg-inset: #f9f8f3;
+  --border: #e4e2d8; --border-soft: #ecead9;
+  --text-primary: #1b1b17; --text-secondary: #65645b; --text-muted: #98968b;
+  --accent: oklch(0.50 0.13 250); --accent-bg: oklch(0.96 0.02 250); --accent-fg: oklch(0.36 0.13 250); --accent-border: oklch(0.85 0.06 250);
+  --success: oklch(0.55 0.12 150); --success-bg: oklch(0.96 0.03 150); --warning: oklch(0.62 0.13 70); --danger: oklch(0.55 0.18 25);
+  background: var(--bg-base); color: var(--text-primary);
+}
+.win[data-view='home'] :is(.weather-theme-stack, #viewWeather), .win[data-view='weather'] #viewHome { display: none; }
+.win[data-view='home'] :is(.titlebar, .sidebar) { text-shadow: none; }
+.win[data-view='home'] :is(.titlebar, .toolbar) { border-bottom-color: var(--border); }
+.win[data-view='home'] :is(.tb-ver, .titlebar-title, .win-btn, .clock) { color: var(--text-secondary); }
+.win[data-view='home'] .toolbar-sub { color: var(--text-muted); }
+.win[data-view='home'] .sidebar { background: var(--bg-sidebar); border-right-color: var(--border); -webkit-backdrop-filter: none; backdrop-filter: none; box-shadow: none; }
+.win[data-view='home'] .side-label { color: var(--text-muted); }
+.win[data-view='home'] .side-item { color: var(--text-primary); }
+.win[data-view='home'] .side-item svg { color: var(--text-secondary); }
+.win[data-view='home'] .side-item.active { background: var(--bg-active); }
+.win[data-view='home'] .side-item.active svg { color: var(--accent); }
+.win[data-view='home'] :is(.svc, .clock, .side-badge) { border-color: var(--border); background: var(--bg-card); }
+.win[data-view='home'] .side-badge { color: var(--text-secondary); }
+.home { padding: 24px; scrollbar-color: #d4d1c4 transparent; }
+.h-col { display: flex; flex-direction: column; gap: 24px; }
+.h-block { display: flex; flex-direction: column; gap: 8px; min-width: 0; }
+.h-kicker { display: flex; align-items: center; justify-content: space-between; min-height: 26px; font-size: 10px; font-weight: 500; letter-spacing: .08em; color: var(--text-muted); }
+.h-btn { display: inline-flex; align-items: center; gap: 6px; padding: 4px 8px; border: 1px solid var(--border); border-radius: 6px; background: var(--bg-card); font-size: 11px; letter-spacing: 0; color: var(--text-primary); white-space: nowrap; }
+.h-btn.primary { border-color: var(--accent); background: var(--accent); color: #fff; }
+.h-btn.danger { justify-content: center; margin-top: 4px; color: var(--danger); }
+.h-btn.off { opacity: .5; }
+.h-kpis { display: grid; grid-template-columns: repeat(4, 1fr); gap: 16px; }
+.h-kpi { display: flex; flex-direction: column; gap: 4px; padding: 14px 16px; border: 1px solid var(--border); border-radius: 10px; background: var(--bg-card); }
+.h-kpi small { font-size: 11px; font-weight: 500; letter-spacing: .06em; color: var(--text-muted); }
+.h-kpi b { font: 500 26px/1.1 var(--font-mono); letter-spacing: -.01em; }
+.h-kpi b.word { font: 600 18px/1.6 var(--font); letter-spacing: 0; }
+.h-kpi b em { font-size: 14px; font-style: normal; color: var(--text-muted); }
+.h-kpi > span { display: flex; align-items: center; gap: 6px; font-size: 11px; color: var(--text-secondary); }
+.h-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--success); box-shadow: 0 0 0 3px var(--success-bg); }
+.h-two { display: grid; grid-template-columns: minmax(0, .82fr) minmax(0, 1fr); gap: 16px; }
+.h-card { display: flex; flex-direction: column; height: 300px; overflow: hidden; border: 1px solid var(--border); border-radius: 10px; background: var(--bg-card); }
+.h-card-head { display: flex; align-items: center; gap: 8px; padding: 12px 16px; border-bottom: 1px solid var(--border-soft); font-size: 13px; font-weight: 500; line-height: 1.35; }
+.h-card-head small { display: block; font-size: 11px; font-weight: 400; color: var(--text-muted); }
+.h-avatar { flex: none; width: 28px; height: 28px; display: grid; place-items: center; border-radius: 50%; background: oklch(0.55 0.13 30); color: #fff; font-size: 12px; font-style: normal; }
+.h-avatar.sq { border-radius: 6px; background: var(--accent); }
+.h-pill { margin-left: auto; padding: 2px 8px; border: 1px solid var(--accent-border); border-radius: 10px; background: var(--accent-bg); color: var(--accent-fg); font-size: 11px; }
+.h-card-body { flex: 1; display: flex; flex-direction: column; padding: 14px 16px; font-size: 11px; color: var(--text-muted); }
+.h-times { flex: 1; display: flex; align-items: center; justify-content: center; gap: 40px; text-align: center; }
+.h-times > i { width: 1px; height: 40px; background: var(--border-soft); }
+.h-times small { display: block; margin-bottom: 4px; font-size: 10px; letter-spacing: .08em; }
+.h-times b { font: 600 28px/1 var(--font-mono); color: var(--text-primary); }
+.h-times b.est { color: var(--text-muted); }
+.h-prog-row { display: flex; justify-content: space-between; }
+.h-bar { position: relative; height: 8px; margin: 6px 0; overflow: hidden; border-radius: 999px; background: var(--bg-inset); }
+.h-bar i { position: absolute; inset: 0 auto 0 0; border-radius: 999px; background: var(--accent); }
+.h-bar em { position: absolute; top: 0; bottom: 0; background: var(--warning); opacity: .9; }
+.h-actions { display: flex; gap: 8px; margin-top: 14px; padding-top: 14px; border-top: 1px solid var(--border-soft); }
+.h-news { flex: 1; overflow: hidden; padding: 4px 16px; }
+.h-news div { padding: 9px 0; border-bottom: 1px solid var(--border-soft); color: var(--text-primary); font-size: 12.5px; font-weight: 500; line-height: 1.5; }
+.h-news small { display: flex; align-items: center; gap: 8px; margin-top: 4px; font-size: 10.5px; font-weight: 400; color: var(--text-muted); }
+.h-news small b { padding: 1px 7px; border: 1px solid oklch(0.88 0.05 var(--ch)); border-radius: 6px; background: oklch(0.96 0.03 var(--ch)); color: oklch(0.42 0.10 var(--ch)); font-size: 10px; font-weight: 500; }
+.h-stub { height: 150px; display: grid; place-items: center; color: var(--text-muted); font-size: 12px; }
+
+/* ---- 首页的天气卡片（这次重新设计）：整张卡片就是一小片天空，用的是跟天气页同一套背景；
+        左边把现在的天气直接写在天空上，右边一块半透明面板放 12 小时图和未来 5 天 ---- */
+.wcard {
+  --ink-2: rgb(255 255 255 / .8); --ink-3: rgb(255 255 255 / .68); --line: rgb(255 255 255 / .13);
+  --glass-c: oklch(.3 .09 256); --glass-a: .3; --track: rgb(4 18 46 / .26);
+  --glass: color-mix(in oklab, var(--glass-c) calc(var(--glass-a) * var(--glass-k) * 100%), transparent);
+  --rain: oklch(.88 .085 222); --warm: oklch(.9 .13 90);
+  position: relative; isolation: isolate; overflow: hidden;
+  height: 268px; display: grid; grid-template-columns: 388px minmax(0, 1fr);
+  border-radius: 10px; background: #1c2a4a; color: #fff; font-variant-numeric: tabular-nums;
+}
+.wcard[data-tone='grey'] { --glass-c: oklch(.27 .02 255); --glass-a: .26; }
+.wcard[data-tone='storm'] { --glass-c: oklch(.2 .035 262); --glass-a: .28; }
+.wcard[data-tone='night'] { --glass-c: #fff; --glass-a: .04; }
+.wcard[data-tone='warm'] { --glass-c: oklch(.3 .035 70); --glass-a: .26; }
+.wcard > .sky { z-index: -2; }
+.wc-now { min-width: 0; display: flex; flex-direction: column; padding: 14px 18px 12px 20px; text-shadow: 0 1px 2px rgb(10 18 40 / .3), 0 0 18px rgb(10 18 40 / .2); }
+.wc-addr { display: flex; align-items: baseline; gap: 10px; font-size: 12.5px; font-weight: 500; white-space: nowrap; }
+.wc-addr span { font-size: 11px; font-weight: 400; color: var(--ink-3); }
+.wc-main { margin-top: 12px; display: flex; align-items: flex-end; gap: 16px; }
+.wc-temp { flex: none; margin-left: -3px; font-size: 84px; font-weight: 300; line-height: .8; letter-spacing: -.05em; }
+.wc-temp sup { position: relative; top: .14em; margin-left: .05em; font-size: .36em; line-height: 1; letter-spacing: 0; vertical-align: top; }
+.wc-copy { min-width: 0; padding-bottom: 1px; }
+.wc-cond { display: flex; align-items: center; gap: 7px; font-size: 16px; font-weight: 500; white-space: nowrap; }
+.wc-cond svg { flex: none; width: 20px; height: 20px; }
+.wc-sub { margin-top: 3px; display: flex; gap: 10px; font-size: 12px; color: var(--ink-2); white-space: nowrap; }
+.wc-say { margin: 12px 0 0; display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2; overflow: hidden; font-size: 13px; font-weight: 500; line-height: 1.45; }
+.wc-alert { margin-top: 8px; display: flex; align-items: center; gap: 7px; padding: 6px 10px; border: 0; border-radius: 12px; background: none; color: inherit; font-size: 12px; font-weight: 600; text-shadow: none; text-align: left; cursor: pointer; }
+.wc-alert svg { flex: none; width: 13px; height: 13px; }
+.wc-alert .alert-ico { color: var(--warm); }
+.wc-alert span { flex: 1; min-width: 0; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
+.wc-helmet { margin-top: auto; display: flex; align-items: center; gap: 10px; padding: 8px 11px 7px 9px; border-radius: 14px; text-shadow: none; }
+.wc-helmet .helmet-ico { width: 32px; height: 32px; border-radius: 9px; }
+.wc-helmet .helmet-ico svg { width: 19px; height: 19px; }
+.wc-helmet-copy { flex: 1; min-width: 0; }
+.wc-helmet-copy > b { display: block; margin-bottom: 5px; font-size: 12.5px; font-weight: 600; }
+.wc-helmet .helmet-cells > span { height: 7px; border-radius: 2px; font-size: 0; }
+.wc-helmet .helmet-axis { margin-top: 3px; font-size: 10.5px; }
+.wc-side { min-width: 0; margin: 10px 10px 10px 0; display: flex; flex-direction: column; border-radius: 18px; }
+.wc-side-head { display: flex; align-items: center; justify-content: space-between; padding: 8px 8px 0 16px; }
+.wc-side-head h3 { margin: 0; font-size: 12.5px; font-weight: 600; }
+.wc-actions { display: flex; gap: 6px; }
+.wc-actions .sky-btn { padding: 3px 9px; font-size: 11.5px; }
+.wc-actions .sky-btn.ico { padding: 3px 6px; }
+.wc-actions .sky-btn svg { width: 12px; height: 12px; }
+.wc-plot { flex: 1; min-height: 0; display: flex; align-items: center; }
+.wc-plot svg { display: block; width: 100%; }
+.wc-plot text { font-family: var(--font); fill: #fff; }
+.wc-days { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); border-top: 1px solid var(--line); }
+.wc-day { height: 42px; display: flex; align-items: center; justify-content: center; gap: 7px; font-size: 12.5px; white-space: nowrap; }
+.wc-day + .wc-day { box-shadow: -1px 0 0 var(--line); }
+.wc-day b { font-weight: 500; }
+.wc-day.is-today b { font-weight: 700; }
+.wc-day svg { flex: none; width: 18px; height: 18px; }
+.wc-day strong { font-weight: 600; }
+.wc-day em { font-style: normal; color: var(--ink-3); }
+</style>
+</head>
+<body>
+
+<div class="review">
+  <strong>天气新设计稿</strong>
+  <span class="seg-label">页面</span>
+  <div class="seg" id="segView"><button data-view="weather" aria-pressed="true">天气页</button><button data-view="home" aria-pressed="false">首页</button></div>
+  <span class="seg-label">示例数据</span>
+  <div class="seg" id="segScene"></div>
+  <span class="seg-label">天气背景</span>
+  <div class="seg" id="segSky"></div>
+</div>
+
+<div class="stage">
+  <div class="win" id="win" data-view="weather">
+    <div class="weather-theme-stack" id="backdrop" aria-hidden="true"></div>
+    <div class="titlebar">
+      <div class="titlebar-app"><div class="app-mark">A</div><span>AAS</span><span class="tb-ver">v2.0</span></div>
+      <div class="titlebar-title">Auto Attendance</div>
+      <div class="window-controls">
+        <span class="win-btn"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M3 8h10"/></svg></span>
+        <span class="win-btn"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><rect x="3" y="3" width="10" height="10"/></svg></span>
+        <span class="win-btn"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M4 4l8 8M12 4l-8 8"/></svg></span>
+      </div>
+    </div>
+    <div class="shell">
+      <aside class="sidebar" id="sidebar"></aside>
+      <main class="main">
+        <div class="toolbar">
+          <div class="toolbar-lead"><div class="toolbar-title" id="tbTitle"></div><div class="toolbar-sub" id="tbSub"></div></div>
+          <div class="clock" id="clock"></div>
+        </div>
+        <div class="content" id="viewWeather">
+          <div class="wx">
+            <div class="loc-row">
+              <div class="loc-bar glass"><div class="loc-tabs" role="group" aria-label="切换天气地点">
+                <span class="loc-tab active"><button class="loc-pick" aria-pressed="true">华山路1076号</button></span>
+                <span class="loc-tab"><button class="loc-pick" aria-pressed="false">杭州市西湖区</button><button class="loc-del" aria-label="删除收藏地点 杭州市西湖区"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M4 4l8 8M12 4l-8 8"/></svg></button></span>
+                <span class="loc-tab"><button class="loc-pick" aria-pressed="false">苏州市姑苏区</button><button class="loc-del" aria-label="删除收藏地点 苏州市姑苏区"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M4 4l8 8M12 4l-8 8"/></svg></button></span>
+                <button class="loc-add"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M8 3v10M3 8h10"/></svg>添加地点</button>
+              </div></div>
+              <div class="loc-meta">
+                <button class="sky-btn"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M13.5 7a5.5 5.5 0 0 0-10-2.5"/><path d="M2.5 9a5.5 5.5 0 0 0 10 2.5"/><path d="M2.5 2v3h3M13.5 14v-3h-3"/></svg>刷新</button>
+                <button class="sky-btn"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><circle cx="8" cy="8" r="2"/><path d="M8 1.5v1.5M8 13v1.5M2.5 8H1M15 8h-1.5M3.8 3.8l1 1M11.2 11.2l1 1M3.8 12.2l1-1M11.2 4.8l1-1"/></svg>设置</button>
+                <button class="sky-btn" id="btnGlass" aria-expanded="false" aria-controls="glassPop"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M2 4.5h6.5M12 4.5h2M2 11.5h2M7.5 11.5H14"/><circle cx="10.2" cy="4.5" r="1.8"/><circle cx="5.8" cy="11.5" r="1.8"/></svg>外观</button>
+                <div class="glass-pop" id="glassPop" role="dialog" aria-label="面板玻璃效果" hidden>
+                  <h3>面板玻璃效果</h3>
+                  <label class="gp-row"><span>模糊</span><input type="range" id="rngBlur" min="0" max="40" step="1"><output id="outBlur"></output></label>
+                  <label class="gp-row"><span>底色</span><input type="range" id="rngTint" min="0" max="250" step="5"><output id="outTint"></output></label>
+                  <div class="gp-foot"><span>改动会自动保存</span><button id="btnGlassReset">恢复默认</button></div>
+                </div>
+              </div>
+            </div>
+
+            <section class="hero" aria-label="现在的天气">
+              <div class="hero-now" id="heroNow"></div>
+              <div class="helmet glass" id="helmet"><div id="helmetBody"></div></div>
+            </section>
+
+            <div id="alerts"></div>
+
+            <section class="hours glass">
+              <div class="hours-head">
+                <h2 class="panel-title">24 小时</h2>
+                <div class="hours-legend"><span><i class="lg-line"></i>气温</span><span><i class="lg-bar"></i>降水概率</span></div>
+              </div>
+              <div class="hours-plot" id="hoursPlot">
+                <svg id="chart" role="img" aria-label="未来 24 小时的天气、气温和降水概率"></svg>
+                <div class="hours-tip" id="hoursTip"></div>
+              </div>
+            </section>
+
+            <div class="duo">
+              <section class="week glass">
+                <h2 class="panel-title">未来 7 天</h2>
+                <div id="week"></div>
+              </section>
+              <section class="metrics glass">
+                <h2 class="panel-title">实况</h2>
+                <div class="metrics-grid" id="metrics"></div>
+              </section>
+            </div>
+          </div>
+        </div>
+        <div class="content home" id="viewHome">
+          <div class="h-col">
+            <div class="h-kpis">
+              <div class="h-kpi"><small>今日状态</small><b class="word">工作中</b><span><i class="h-dot"></i>赖得鑫 · 08:29:55 上班</span></div>
+              <div class="h-kpi"><small>下次任务</small><b>16:47</b><span>下班 · 赖得鑫</span></div>
+              <div class="h-kpi"><small>本月出勤</small><b>11 <em>/ 工作日</em></b><span><i class="h-dot"></i>准点率 100%</span></div>
+              <div class="h-kpi"><small>系统</small><b class="word">运行正常</b><span><i class="h-dot"></i>Selenium · 无头</span><span class="h-btn danger">一键关闭 Claude</span></div>
+            </div>
+            <div class="h-two">
+              <div class="h-block">
+                <div class="h-kicker"><span>今日打卡 · 2026-11-17 周二</span><span class="h-btn">打卡控制台 ›</span></div>
+                <div class="h-card">
+                  <div class="h-card-head"><i class="h-avatar">赖</i><div>赖得鑫<small>LOGIN_USERNAME</small></div><span class="h-pill">工作中</span></div>
+                  <div class="h-card-body">
+                    <div>Selenium · 已写入 · 预计下班 16:47（8h15m + 随机）</div>
+                    <div class="h-times"><div><small>上班</small><b>08:29:55</b></div><i></i><div><small>下班</small><b class="est">16:47</b></div></div>
+                    <div class="h-prog-row"><span>已工作 6h02m</span><span>剩余 2h15m</span></div>
+                    <div class="h-bar"><i style="width:73%"></i><em style="left:30.2%;width:27.2%"></em></div>
+                    <div class="h-prog-row"><span>进度 73%</span><span>午休 11:00–13:15</span></div>
+                    <div class="h-actions"><span class="h-btn primary off">上班打卡</span><span class="h-btn">下班打卡</span><span class="h-btn">自动下班</span><span class="h-btn">获取打卡情况</span></div>
+                  </div>
+                </div>
+              </div>
+              <div class="h-block">
+                <div class="h-kicker"><span>AI 资讯 · AI HOT 中文精选</span><span class="h-btn">查看全部 ›</span></div>
+                <div class="h-card">
+                  <div class="h-card-head"><i class="h-avatar sq">✦</i><div>AI 资讯<small>AI HOT · 今日精选</small></div></div>
+                  <div class="h-news">
+                    <div>开源多模态模型发布新版本，推理速度提升两倍<small><b style="--ch:250">模型</b>开源社区 · 12 分钟前</small></div>
+                    <div>研究团队提出新的长上下文评测基准<small><b style="--ch:300">论文</b>arXiv · 40 分钟前</small></div>
+                    <div>多家厂商下调大模型接口价格<small><b style="--ch:150">行业</b>科技媒体 · 1 小时前</small></div>
+                    <div>智能体开发框架发布 2.0，支持并行调用工具<small><b style="--ch:70">产品</b>官方博客 · 2 小时前</small></div>
+                  </div>
+                </div>
+              </div>
+            </div>
+            <div class="h-block">
+              <div class="h-kicker"><span>天气 · 华山路1076号</span></div>
+              <section class="wcard" id="homeCard" aria-label="华山路1076号的天气"></section>
+            </div>
+            <div class="h-block">
+              <div class="h-kicker"><span>汇率 · 人民币 / 日元</span></div>
+              <div class="h-card h-stub">汇率卡片（这次不改，这里只占个位置）</div>
+            </div>
+          </div>
+        </div>
+      </main>
+    </div>
+  </div>
+</div>
+
+<script src="vendor/liquid-glass.umd.min.js"></script>
+<script src="sky.js"></script>
+<script src="panel-fx.js"></script>
+<script>
+'use strict';
+
+/* ---------- 天气类型：文字、图标跟应用里 lib/weather.ts 的 SKYCON 一致 ---------- */
+const SKYCON = {
+  CLEAR_DAY:           { label: '晴',   icon: 'sun',          tone: 'sun',   wet: false },
+  CLEAR_NIGHT:         { label: '晴夜', icon: 'moon',         tone: 'night', wet: false },
+  PARTLY_CLOUDY_DAY:   { label: '多云', icon: 'partly',       tone: 'cloud', wet: false },
+  PARTLY_CLOUDY_NIGHT: { label: '多云', icon: 'partly-night', tone: 'night', wet: false },
+  CLOUDY:              { label: '阴',   icon: 'cloud',        tone: 'cloud', wet: false },
+  LIGHT_RAIN:          { label: '小雨', icon: 'rain',         tone: 'rain',  wet: true },
+  MODERATE_RAIN:       { label: '中雨', icon: 'rain',         tone: 'rain',  wet: true },
+  HEAVY_RAIN:          { label: '大雨', icon: 'rain',         tone: 'rain',  wet: true },
+};
+
+/* 天气线条图标：路径照抄应用里 components/WeatherPanel.tsx 的 WeatherIconPaths */
+const WICON = {
+  sun: '<circle cx="12" cy="12" r="4"/><path d="M12 2.6v2.2M12 19.2v2.2M21.4 12h-2.2M4.8 12H2.6M18.6 5.4l-1.55 1.55M6.95 17.05L5.4 18.6M18.6 18.6l-1.55-1.55M6.95 6.95L5.4 5.4"/>',
+  moon: '<path d="M20.5 14.9A8.3 8.3 0 0 1 9.1 3.5 6.9 6.9 0 1 0 20.5 14.9z"/>',
+  partly: '<circle cx="8.4" cy="7.9" r="2.7"/><path d="M8.4 2.7v1.7M3.5 7.9h1.7M4.9 4.4l1.2 1.2M11.9 4.4l-1.2 1.2M2.5 12.6h1.6"/><path d="M9.4 19h6.9a2.95 2.95 0 0 0 .28-5.88 4.15 4.15 0 0 0-7.86-1.13A2.95 2.95 0 0 0 9.4 19z"/>',
+  'partly-night': '<path d="M12.4 4.1A4.3 4.3 0 0 1 8.3 8 3.5 3.5 0 1 0 12.4 4.1z"/><path d="M9.4 19h6.9a2.95 2.95 0 0 0 .28-5.88 4.15 4.15 0 0 0-7.86-1.13A2.95 2.95 0 0 0 9.4 19z"/>',
+  cloud: '<path d="M7.3 18.4h9.1a3.8 3.8 0 0 0 .35-7.58 5.3 5.3 0 0 0-10.16-1.4A3.8 3.8 0 0 0 7.3 18.4z"/>',
+  rain: '<path d="M7.3 15.4h9.1a3.7 3.7 0 0 0 .34-7.38 5.15 5.15 0 0 0-9.88-1.36A3.7 3.7 0 0 0 7.3 15.4z"/><path d="M9 18.1l-1 2.5M12 18.1l-1 2.5M15 18.1l-1 2.5"/>',
+};
+const ICON_ATTR = 'viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"';
+const wicon = kind => `<svg ${ICON_ATTR}>${WICON[kind] || WICON.cloud}</svg>`;
+const HELMET_ICON = `<svg ${ICON_ATTR}><path d="M3.8 15a8.2 8.2 0 0 1 16.4 0z"/><path d="M20.2 15c1.35.1 2.15-.35 2.35-1.3"/><path d="M9.4 8.8l1.2 3M13 8.3l1 3.2"/></svg>`;
+const DROP_ICON = '<svg viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M8 1.8S3.6 6.7 3.6 10A4.4 4.4 0 0 0 8 14.4 4.4 4.4 0 0 0 12.4 10C12.4 6.7 8 1.8 8 1.8z"/></svg>';
+
+/* ---------- 示例数据：四个场景，backdrop 是这个场景默认配的天空种类（种类清单在 sky.js 的 KINDS）。
+   hourly 每项是 [天气类型, 气温, 降水概率]，从 startHour 这个整点开始连续 24 小时 ---------- */
+const ADDRESS = '上海市长宁区华山路1076号', COORDS = '121.4358, 31.2113';
+const SCENES = [
+  {
+    name: '阴天下午，今晚有雨', backdrop: 'overcast',
+    clock: '2026/11/17 14:32:08', updated: '彩云天气 11/17 14:30 更新',
+    now: { temp: 16, feels: 14, sky: 'CLOUDY', hi: 17, lo: 11, humidity: 68, cloud: 86, windName: '东北风', windDir: 40, windSpeed: 14, visibility: 12, pressure: 1021, aqi: 58, aqiDesc: '良', pm25: 38, pm10: 61, uv: '弱', comfort: '凉爽', rain: '0.00', rainNote: '最近降水带约 34.5 km' },
+    say: '未来两小时不会下雨，放心出门吧',
+    say2: '未来 24 小时多云，今天晚间 19 点钟后转小雨，其后多云',
+    startHour: 14, tomorrow: '周三',
+    hourly: [['CLOUDY',16,5],['CLOUDY',16,8],['CLOUDY',15,12],['CLOUDY',15,18],['CLOUDY',14,26],['LIGHT_RAIN',14,62],['MODERATE_RAIN',13,86],['LIGHT_RAIN',13,72],['LIGHT_RAIN',12,46],['CLOUDY',12,20],['CLOUDY',12,10],['PARTLY_CLOUDY_NIGHT',11,5],['PARTLY_CLOUDY_NIGHT',11,3],['CLEAR_NIGHT',10,0],['CLEAR_NIGHT',10,0],['CLEAR_NIGHT',9,0],['CLEAR_NIGHT',9,0],['CLEAR_DAY',10,0],['CLEAR_DAY',12,0],['CLEAR_DAY',14,0],['PARTLY_CLOUDY_DAY',15,0],['PARTLY_CLOUDY_DAY',16,2],['PARTLY_CLOUDY_DAY',17,2],['PARTLY_CLOUDY_DAY',17,4]],
+    daily: [['今天','11/17','LIGHT_RAIN',11,17,70],['明天','11/18','PARTLY_CLOUDY_DAY',9,17,10],['周四','11/19','CLEAR_DAY',8,18,0],['周五','11/20','LIGHT_RAIN',12,19,80],['周六','11/21','PARTLY_CLOUDY_DAY',11,18,20],['周日','11/22','MODERATE_RAIN',12,16,85],['周一','11/23','CLOUDY',8,13,35]],
+    alerts: [],
+    helmet: { mode: 'night', status: 'rain', title: '今晚建议收好头盔', pill: '预计最强 20:00–21:00', detail: '停车后把头盔放进收纳箱。预计 19:00–23:00 有雨，23:00 后转干。', head: '今夜降雨时段', headValue: '约 4 小时有雨' },
+  },
+  {
+    name: '晴天上午', backdrop: 'sun',
+    clock: '2026/11/19 09:10:41', updated: '彩云天气 11/19 09:08 更新',
+    now: { temp: 12, feels: 11, sky: 'CLEAR_DAY', hi: 18, lo: 8, humidity: 46, cloud: 4, windName: '西北风', windDir: 315, windSpeed: 9, visibility: 24, pressure: 1026, aqi: 41, aqiDesc: '优', pm25: 22, pm10: 40, uv: '中等', comfort: '舒适', rain: '0.00', rainNote: '最近降水带约 213.4 km' },
+    say: '未来两小时不会下雨，最近的降雨带在 213 公里外',
+    say2: '未来 24 小时晴',
+    startHour: 9, tomorrow: '周五',
+    hourly: [['CLEAR_DAY',12,0],['CLEAR_DAY',14,0],['CLEAR_DAY',16,0],['CLEAR_DAY',17,0],['CLEAR_DAY',18,0],['CLEAR_DAY',18,0],['CLEAR_DAY',17,0],['CLEAR_DAY',16,0],['CLEAR_NIGHT',14,0],['CLEAR_NIGHT',13,0],['CLEAR_NIGHT',12,0],['CLEAR_NIGHT',12,0],['CLEAR_NIGHT',11,0],['CLEAR_NIGHT',11,0],['CLEAR_NIGHT',10,0],['CLEAR_NIGHT',10,0],['CLEAR_NIGHT',9,0],['CLEAR_NIGHT',9,2],['CLEAR_NIGHT',9,2],['CLEAR_NIGHT',8,3],['CLEAR_NIGHT',8,3],['CLEAR_NIGHT',8,3],['CLEAR_DAY',9,2],['PARTLY_CLOUDY_DAY',11,3]],
+    daily: [['今天','11/19','CLEAR_DAY',8,18,0],['明天','11/20','LIGHT_RAIN',12,19,80],['周六','11/21','PARTLY_CLOUDY_DAY',11,18,20],['周日','11/22','MODERATE_RAIN',12,16,85],['周一','11/23','CLOUDY',8,13,35],['周二','11/24','CLEAR_DAY',6,12,5],['周三','11/25','CLEAR_DAY',5,13,0]],
+    alerts: [],
+    helmet: { mode: 'night', status: 'dry', title: '今晚降雨风险较低', pill: '暂无明显降水', detail: '17:00–次日 08:00 暂无明显降水信号。', head: '今夜降雨时段', headValue: '暂无明显降水' },
+  },
+  {
+    name: '周五夜里下雨（带预警）', backdrop: 'rainNight',
+    clock: '2026/11/20 21:40:17', updated: '彩云天气 11/20 21:38 更新',
+    now: { temp: 13, feels: 11, sky: 'LIGHT_RAIN', hi: 19, lo: 12, humidity: 92, cloud: 100, windName: '北风', windDir: 5, windSpeed: 28, visibility: 6, pressure: 1016, aqi: 32, aqiDesc: '优', pm25: 18, pm10: 30, uv: '无', comfort: '湿冷', rain: '0.42', rainNote: '所在位置正在降水' },
+    say: '小雨还会再下一个多小时，出门记得带伞',
+    say2: '未来 24 小时小雨，明天凌晨 0 点钟后转阴，其后多云',
+    startHour: 21, tomorrow: '周六',
+    hourly: [['LIGHT_RAIN',13,78],['MODERATE_RAIN',13,88],['LIGHT_RAIN',12,62],['CLOUDY',12,26],['CLOUDY',12,18],['CLOUDY',11,12],['CLOUDY',11,10],['CLOUDY',11,8],['CLOUDY',10,8],['CLOUDY',10,6],['CLOUDY',11,5],['CLOUDY',12,5],['CLOUDY',13,4],['CLOUDY',14,4],['PARTLY_CLOUDY_DAY',16,2],['PARTLY_CLOUDY_DAY',17,0],['PARTLY_CLOUDY_DAY',18,0],['PARTLY_CLOUDY_DAY',18,0],['PARTLY_CLOUDY_DAY',18,0],['PARTLY_CLOUDY_DAY',17,0],['PARTLY_CLOUDY_NIGHT',16,0],['CLEAR_NIGHT',15,0],['CLEAR_NIGHT',14,0],['CLEAR_NIGHT',13,0]],
+    daily: [['今天','11/20','LIGHT_RAIN',12,19,88],['明天','11/21','PARTLY_CLOUDY_DAY',11,18,26],['周日','11/22','MODERATE_RAIN',12,16,85],['周一','11/23','CLOUDY',8,13,35],['周二','11/24','CLEAR_DAY',6,12,5],['周三','11/25','CLEAR_DAY',5,13,0],['周四','11/26','PARTLY_CLOUDY_DAY',7,15,10]],
+    alerts: [{ title: '上海市发布大风蓝色预警', desc: '受冷空气影响，预计未来 24 小时内本市大部地区将出现 6 级、阵风 7～8 级的偏北大风，请注意防范。', meta: '预警中　上海市　上海中心气象台　11/20 20:15' }],
+    helmet: { mode: 'rest', status: 'rain', title: '周末有雨，建议收好头盔', pill: '最高 今天 88%', detail: '提醒窗口 11/20 17:00–11/23 08:00。今天、周日、周一有降水信号，离车时请把头盔放进收纳箱。', head: '周末雨情', headValue: '3 天有雨', days: [['今天',88,true],['明天',26,false],['周日',85,true],['周一',35,true]] },
+  },
+  {
+    name: '晴朗夜晚', backdrop: 'night',
+    clock: '2026/11/19 22:10:26', updated: '彩云天气 11/19 22:08 更新',
+    now: { temp: 10, feels: 9, sky: 'CLEAR_NIGHT', hi: 18, lo: 8, humidity: 58, cloud: 6, windName: '西北风', windDir: 315, windSpeed: 7, visibility: 20, pressure: 1027, aqi: 46, aqiDesc: '优', pm25: 26, pm10: 44, uv: '无', comfort: '凉爽', rain: '0.00', rainNote: '最近降水带约 186.0 km' },
+    say: '未来两小时不会下雨，放心出门吧',
+    say2: '未来 24 小时晴，明天傍晚 18 点钟后转小雨',
+    startHour: 22, tomorrow: '周五',
+    hourly: [['CLEAR_NIGHT',11,0],['CLEAR_NIGHT',10,0],['CLEAR_NIGHT',10,0],['CLEAR_NIGHT',9,0],['CLEAR_NIGHT',9,0],['CLEAR_NIGHT',9,0],['CLEAR_NIGHT',8,0],['CLEAR_NIGHT',8,0],['CLEAR_NIGHT',8,0],['CLEAR_DAY',9,0],['PARTLY_CLOUDY_DAY',11,0],['PARTLY_CLOUDY_DAY',13,2],['PARTLY_CLOUDY_DAY',15,4],['CLOUDY',16,6],['CLOUDY',17,8],['CLOUDY',18,10],['CLOUDY',19,12],['CLOUDY',18,14],['CLOUDY',17,18],['CLOUDY',16,24],['LIGHT_RAIN',15,48],['LIGHT_RAIN',15,66],['LIGHT_RAIN',14,74],['MODERATE_RAIN',13,82]],
+    daily: [['今天','11/19','CLEAR_DAY',8,18,0],['明天','11/20','LIGHT_RAIN',12,19,80],['周六','11/21','PARTLY_CLOUDY_DAY',11,18,20],['周日','11/22','MODERATE_RAIN',12,16,85],['周一','11/23','CLOUDY',8,13,35],['周二','11/24','CLEAR_DAY',6,12,5],['周三','11/25','CLEAR_DAY',5,13,0]],
+    alerts: [],
+    helmet: { mode: 'night', status: 'dry', title: '今晚降雨风险较低', pill: '暂无明显降水', detail: '23:00–次日 08:00 暂无明显降水信号。', head: '今夜降雨时段', headValue: '暂无明显降水' },
+  },
+];
+
+/* ---------- 小工具 ---------- */
+const $ = s => document.querySelector(s);
+const clamp = (v, a, b) => Math.min(b, Math.max(a, v));
+const lerp = (a, b, f) => a + (b - a) * f;
+const f1 = v => v.toFixed(1);
+let scene = SCENES[0];
+let geo = null;   // 24 小时图这次绘制用的坐标，鼠标悬停时要用
+
+let view = 'weather';   // 当前看的是天气页还是首页
+let skyPick = '';       // 顶部切换条里手动选的天空种类；空着表示跟随示例数据
+const skyKind = () => skyPick || scene.backdrop;
+const condText = () => {
+  const label = SKYCON[scene.now.sky].label, next = scene.hourly.slice(1, 7).map(h => SKYCON[h[0]].label).find(l => l !== label);
+  return next ? `${label}转${next}` : label;
+};
+
+/* ---------- 整屏天气背景 ---------- */
+let fall = { mode: '', level: 1 };   // 现在是下雨、下雪还是都不是，面板上的水花和积雪按它来
+function renderBackdrop() {
+  /* 旧天空先留在下面，新天空叠在上面淡入，淡入结束后再把旧的删掉 */
+  const stack = $('#backdrop'), old = [...stack.children];
+  const sky = Sky.mount(stack, skyKind());
+  if (old.length) sky.classList.add('fade-in');
+  $('#win').dataset.tone = sky.dataset.tone;
+  fall = { mode: sky.dataset.fall, level: +sky.dataset.level };
+  setTimeout(() => old.forEach(el => el.remove()), 760);
+}
+
+/* ---------- 顶部展示区左侧：现在的天气 ---------- */
+function renderNow() {
+  const s = scene, n = s.now, info = SKYCON[n.sky];
+  $('#heroNow').innerHTML = `
+    <div class="hero-addr"><strong>${ADDRESS}</strong><span>${COORDS}</span><span>${s.updated}</span></div>
+    <div class="hero-main">
+      <div class="hero-temp">${n.temp}<sup>°</sup></div>
+      <div class="hero-copy">
+        <div class="hero-cond">${wicon(info.icon)}${condText()}</div>
+        <div class="hero-sub"><span>体感 ${n.feels}°</span><span>最高 ${n.hi}°</span><span>最低 ${n.lo}°</span></div>
+        <p class="hero-say">${s.say}</p>
+        <p class="hero-say2">${s.say2}</p>
+      </div>
+    </div>`;
+}
+
+/* ---------- 头盔提醒 ---------- */
+/* 画提醒时段的小格子，天气页和首页卡片共用。返回格子的 HTML，以及第一格（17 点）有没有预报、有没有雨 */
+function helmetCells() {
+  const s = scene, h = s.helmet;
+  if (h.mode === 'rest') {
+    return { html: `<div class="helmet-cells days" style="--n:${h.days.length}">${h.days.map(d => `<span class="${d[2] ? 'wet' : ''}" style="--s:${Math.max(.5, d[1] / 100).toFixed(2)}" title="${d[0]} 降水概率 ${d[1]}%">${d[0]}</span>`).join('')}</div>` };
+  }
+  /* 今天 17 点到明天 8 点共 15 个小时，一小时一格；已经过去、没有预报的小时画成空心格 */
+  const items = Array.from({ length: 15 }, (_, j) => { const idx = 17 + j - (s.startHour < 9 ? s.startHour + 24 : s.startHour); return idx >= 0 ? s.hourly[idx] : null; });
+  const isWet = item => item[2] >= 30 || SKYCON[item[0]].wet;
+  const slots = items.map((item, j) => item
+    ? `<span class="${isWet(item) ? 'wet' : ''}" style="--s:${Math.max(.45, item[2] / 100).toFixed(2)}" title="${(17 + j) % 24}:00 降水概率 ${item[2]}%"></span>`
+    : `<span class="uncovered" title="${(17 + j) % 24}:00 没有预报数据"></span>`);
+  return { html: `<div class="helmet-cells" style="--n:15">${slots.join('')}</div>`, firstCovered: Boolean(items[0]), firstWet: Boolean(items[0]) && isWet(items[0]) };
+}
+function renderHelmet() {
+  const h = scene.helmet, cells = helmetCells().html;
+  const axis = h.mode === 'rest' ? '<span>放假前一日 17:00</span><span>首个工作日 08:00</span>' : '<span>17</span><span>20</span><span>23</span><span>02</span><span>05</span><span>08</span>';
+  const el = $('#helmet');
+  el.className = `helmet glass is-${h.status}`;
+  $('#helmetBody').innerHTML = `
+    <div class="helmet-head">
+      <span class="helmet-ico">${HELMET_ICON}</span>
+      <div class="helmet-copy">
+        <div class="helmet-title"><h2>${h.title}</h2><span class="helmet-pill">${h.pill}</span></div>
+        <p class="helmet-detail">${h.detail}</p>
+      </div>
+    </div>
+    <div class="helmet-line" role="img" aria-label="${h.head}：${h.headValue}">
+      <div class="helmet-line-head"><span>${h.head}</span><b>${h.headValue}</b></div>
+      ${cells}
+      <div class="helmet-axis">${axis}</div>
+    </div>`;
+}
+
+function renderAlerts() {
+  $('#alerts').innerHTML = scene.alerts.map(a => `
+    <div class="alert glass" role="alert">
+      <svg class="alert-ico" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M8 1.5l6.5 11.5H1.5z"/><path d="M8 6.5v3M8 11.2h.01"/></svg>
+      <div><h3>${a.title}</h3><p>${a.desc}</p><small>${a.meta}</small></div>
+    </div>`).join('');
+  $('#alerts').style.display = scene.alerts.length ? '' : 'none';
+}
+
+/* 过一串点的平滑曲线，返回不带开头 M 的路径片段 */
+function curveThrough(pts) {
+  let d = '';
+  for (let i = 0; i < pts.length - 1; i++) {
+    const p0 = pts[Math.max(0, i - 1)], p1 = pts[i], p2 = pts[i + 1], p3 = pts[Math.min(pts.length - 1, i + 2)];
+    d += ` C${f1(p1[0] + (p2[0] - p0[0]) / 6)},${f1(p1[1] + (p2[1] - p0[1]) / 6)} ${f1(p2[0] - (p3[0] - p1[0]) / 6)},${f1(p2[1] - (p3[1] - p1[1]) / 6)} ${f1(p2[0])},${f1(p2[1])}`;
+  }
+  return d;
+}
+
+/* ---------- 逐小时图：从上到下依次是 天气 / 气温线 / 降水概率柱 / 钟点 ----------
+   天气页画 24 小时，首页卡片画 12 小时，两处用同一个函数，只是尺寸不同。
+   o 里是各行的纵向位置：yIcon 天气图标，yT0~yT1 气温线的上下范围，yRain 降水柱的底边，rainH 降水柱最高多高，yHour 钟点文字 */
+const CHART_PAGE = { n: 24, H: 200, padX: 34, yIcon: 4, yT0: 62, yT1: 110, yRain: 164, rainH: 28, yHour: 188, id: 'Page', hover: true };
+const CHART_HOME = { n: 12, H: 158, padX: 36, yIcon: 4, yT0: 56, yT1: 84, yRain: 130, rainH: 20, yHour: 150, id: 'Home', hover: false };
+function chartSvg(W, o) {
+  const s = scene, last = o.n - 1, step = (W - o.padX * 2) / last, X = i => o.padX + i * step;
+  const hrs = s.hourly.slice(0, o.n).map((h, i) => ({ i, hour: (s.startHour + i) % 24, info: SKYCON[h[0]], t: h[1], p: h[2] }));
+  const T = hrs.map(h => h.t), tMin = Math.min(...T), spread = Math.max(4, Math.max(...T) - tMin);
+  const Y = t => o.yT1 - (t - tMin) / spread * (o.yT1 - o.yT0);
+  const pts = hrs.map(h => [X(h.i), Y(h.t)]), every = step >= 40 ? 1 : 2, floor = o.yT1 + 20, out = [];
+
+  out.push(`<defs><linearGradient id="gArea${o.id}" x1="0" x2="0" y1="0" y2="1"><stop offset="0" stop-color="#fff" stop-opacity=".2"/><stop offset="1" stop-color="#fff" stop-opacity="0"/></linearGradient></defs>`);
+
+  /* "现在"这一列加一条很淡的底色 */
+  out.push(`<rect x="${f1(X(0) - step / 2)}" y="-2" width="${f1(step)}" height="${o.H}" rx="10" fill="#fff" fill-opacity=".07"/>`);
+
+  /* 天气图标：每小时一个。天气跟上一小时相同的图标调淡，一眼能看出天气是在哪个小时变的 */
+  hrs.forEach(h => {
+    const same = h.i > 0 && hrs[h.i - 1].info.label === h.info.label;
+    if (h.i % every === 0 || !same) out.push(`<svg x="${f1(X(h.i) - 10)}" y="${o.yIcon}" width="20" height="20" ${ICON_ATTR} color="#fff" opacity="${same ? .42 : 1}">${WICON[h.info.icon] || WICON.cloud}</svg>`);
+  });
+
+  /* 气温线 + 线下的淡色面积 */
+  out.push(`<path d="M${f1(pts[0][0])},${f1(pts[0][1])}${curveThrough(pts)} L${f1(pts[last][0])},${floor} L${f1(pts[0][0])},${floor} Z" fill="url(#gArea${o.id})"/>`);
+  out.push(`<path d="M${f1(pts[0][0])},${f1(pts[0][1])}${curveThrough(pts)}" fill="none" stroke="#fff" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>`);
+  hrs.forEach(h => { if (h.i % every === 0) out.push(`<text class="c-temp" x="${f1(X(h.i))}" y="${f1(Y(h.t) - 10)}">${h.t}°</text>`); });
+  out.push(`<circle cx="${f1(pts[0][0])}" cy="${f1(pts[0][1])}" r="4" fill="#fff"/>`);
+
+  /* 降水概率：一小时一根柱子；判定为有雨的小时（概率 ≥ 30% 或天气类型是雨）用浅青色并标出数字 */
+  hrs.forEach(h => {
+    const wet = h.p >= 30 || h.info.wet, bh = Math.max(3, h.p / 100 * o.rainH), bw = Math.min(10, step * .26);
+    out.push(`<rect x="${f1(X(h.i) - bw / 2)}" y="${f1(o.yRain - bh)}" width="${f1(bw)}" height="${f1(bh)}" rx="${f1(Math.min(bw / 2, bh / 2))}" ${wet ? 'fill="var(--rain)"' : 'fill="#fff" fill-opacity=".22"'}/>`);
+    if (wet) out.push(`<text class="c-rain" x="${f1(X(h.i))}" y="${f1(o.yRain - bh - 5)}">${h.p}%</text>`);
+  });
+
+  /* 钟点：跨过零点的位置写星期几 */
+  hrs.forEach(h => {
+    if (h.i === 0) out.push(`<text class="c-hour strong" x="${f1(X(0))}" y="${o.yHour}">现在</text>`);
+    else if (h.hour === 0) out.push(`<text class="c-hour strong" x="${f1(X(h.i))}" y="${o.yHour}">${s.tomorrow}</text>`);
+    else if (h.i % every === 0) out.push(`<text class="c-hour" x="${f1(X(h.i))}" y="${o.yHour}">${h.hour}时</text>`);
+  });
+
+  /* 鼠标悬停时显示的竖条和圆点，默认隐藏 */
+  if (o.hover) out.push(`<g id="hover" visibility="hidden"><rect id="hoverBand" y="-2" width="${f1(step)}" height="${o.H}" rx="10" fill="#fff" fill-opacity=".09"/><circle id="hoverDot" r="4.5" fill="#fff"/></g>`);
+  return { html: out.join(''), geo: { padX: o.padX, step, X, Y, hrs, W } };
+}
+function paintChart(svg, W, o) {
+  if (!W) return null;
+  const c = chartSvg(W, o);
+  svg.setAttribute('viewBox', `0 0 ${W} ${o.H}`);
+  svg.setAttribute('height', o.H);
+  svg.innerHTML = c.html;
+  return c.geo;
+}
+function drawChart() { geo = paintChart($('#chart'), $('#hoursPlot').clientWidth, CHART_PAGE); }
+function drawHomeChart() { paintChart($('#homeChart'), $('#homePlot').clientWidth, CHART_HOME); }
+
+function bindHover() {
+  const plot = $('#hoursPlot'), tip = $('#hoursTip');
+  const hide = () => { tip.classList.remove('on'); const g = document.getElementById('hover'); if (g) g.setAttribute('visibility', 'hidden'); };
+  plot.addEventListener('mousemove', e => {
+    if (!geo) return;
+    const r = plot.getBoundingClientRect(), mx = (e.clientX - r.left) * (plot.clientWidth / r.width);
+    const h = geo.hrs[clamp(Math.round((mx - geo.padX) / geo.step), 0, geo.hrs.length - 1)], x = geo.X(h.i), y = geo.Y(h.t);
+    document.getElementById('hover').setAttribute('visibility', 'visible');
+    document.getElementById('hoverBand').setAttribute('x', x - geo.step / 2);
+    const dot = document.getElementById('hoverDot'); dot.setAttribute('cx', x); dot.setAttribute('cy', y);
+    tip.innerHTML = `<b>${String(h.hour).padStart(2, '0')}:00　${h.info.label}　${h.t}°</b><br><span>降水概率 ${h.p}%</span>`;
+    tip.style.left = clamp(x, 70, geo.W - 70) + 'px';
+    tip.style.top = (y - 26) + 'px';
+    tip.classList.add('on');
+  });
+  plot.addEventListener('mouseleave', hide);
+}
+
+/* ---------- 未来 7 天 ---------- */
+/* 气温对应的颜色：越冷越蓝，越热越暖。都取偏亮的颜色，放在深色天空上才看得清 */
+function tempColor(t) {
+  const st = [[0, .8, .1, 245], [10, .87, .09, 215], [19, .93, .1, 105], [27, .86, .14, 70], [36, .74, .18, 35]];
+  const lab = c => [c[1], c[2] * Math.cos(c[3] * Math.PI / 180), c[2] * Math.sin(c[3] * Math.PI / 180)];
+  t = clamp(t, st[0][0], st[st.length - 1][0]);
+  for (let i = 0; i < st.length - 1; i++) if (t <= st[i + 1][0]) {
+    const f = (t - st[i][0]) / (st[i + 1][0] - st[i][0]), a = lab(st[i]), b = lab(st[i + 1]);
+    return `oklab(${lerp(a[0], b[0], f).toFixed(3)} ${lerp(a[1], b[1], f).toFixed(3)} ${lerp(a[2], b[2], f).toFixed(3)})`;
+  }
+}
+function renderWeek() {
+  const d = scene.daily, gMin = Math.min(...d.map(x => x[3])), gMax = Math.max(...d.map(x => x[4])), sp = Math.max(1, gMax - gMin);
+  $('#week').innerHTML = d.map((x, i) => {
+    const info = SKYCON[x[2]], left = (x[3] - gMin) / sp * 100, width = Math.max(8, (x[4] - x[3]) / sp * 100);
+    return `<div class="drow ${i === 0 ? 'is-today' : ''}">
+      <span class="d-name">${x[0]}</span><span class="d-date">${x[1]}</span>
+      <span class="d-sky">${wicon(info.icon)}${info.label}</span>
+      <span class="d-rain ${x[5] >= 30 ? 'wet' : ''}" title="降水概率">${DROP_ICON}${x[5]}%</span>
+      <span class="d-lo">${x[3]}°</span>
+      <span class="d-bar" title="${x[3]}° 至 ${x[4]}°"><i style="left:${f1(Math.min(left, 100 - width))}%;width:${f1(width)}%;background:linear-gradient(to right in oklab, ${tempColor(x[3])}, ${tempColor(x[4])})"></i></span>
+      <span class="d-hi">${x[4]}°</span>
+    </div>`;
+  }).join('');
+}
+
+/* ---------- 8 项实况 ---------- */
+function renderMetrics() {
+  const n = scene.now;
+  const tone = n.aqi <= 50 ? 'oklch(.82 .17 150)' : n.aqi <= 100 ? 'oklch(.88 .15 95)' : n.aqi <= 150 ? 'oklch(.8 .15 65)' : 'oklch(.7 .19 28)';
+  const bands = [['50', 'oklch(.82 .17 150)'], ['50', 'oklch(.88 .15 95)'], ['50', 'oklch(.8 .15 65)'], ['50', 'oklch(.7 .19 28)'], ['100', 'oklch(.66 .16 330)']];
+  const arrow = `<svg class="wind-arrow" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" style="transform:rotate(${n.windDir + 180}deg)" aria-hidden="true"><path d="M8 13.5v-11M3.8 6.6L8 2.5l4.2 4.1"/></svg>`;
+  const scale = `<div class="aqi-scale">${bands.map(b => `<span style="flex:${b[0]};background:${b[1]}"></span>`).join('')}<em style="left:${(Math.min(n.aqi, 300) / 300 * 100).toFixed(1)}%"></em></div>`;
+  const items = [
+    ['相对湿度', `<b>${n.humidity}</b><i>%</i>`, `云量 ${n.cloud}%`],
+    ['风况', `${arrow}<b class="word">${n.windName}</b><b>${n.windSpeed}</b><i>km/h</i>`, '地表 10 米风速'],
+    ['能见度', `<b>${n.visibility}</b><i>km</i>`, '地表水平能见度'],
+    ['气压', `<b>${n.pressure}</b><i>hPa</i>`, '当前地面气压'],
+    ['空气质量', `<span class="aqi-dot"></span><b>${n.aqi}</b><b class="word">${n.aqiDesc}</b>`, scale, tone],
+    ['颗粒物', `<i>PM2.5</i><b>${n.pm25}</b>`, `PM10 ${n.pm10} μg/m³`],
+    ['紫外线', `<b class="word">${n.uv}</b>`, `舒适度 ${n.comfort}`],
+    ['当前降水', `<b>${n.rain}</b><i>mm/h</i>`, n.rainNote],
+  ];
+  $('#metrics').innerHTML = items.map(m => `
+    <div class="metric"${m[3] ? ` style="--tone:${m[3]}"` : ''}>
+      <div class="metric-label">${m[0]}</div>
+      <div class="metric-value">${m[1]}</div>
+      <div class="metric-note">${m[2]}</div>
+    </div>`).join('');
+}
+
+/* ---------- 液态玻璃面板 ----------
+   bezelWidth 是边缘那圈"弯折带"的宽度，不能超过面板圆角；glassThickness 越大弯折越明显。
+   模糊不交给这个库（blur 设 0），由样式里的 .glass::before 单独做，这样拖动条改一个样式变量就能马上生效 */
+const GLASS = { bezelWidth: 20, glassThickness: 140, blur: 0, saturation: 1, specularSlope: .7 };
+const glassOn = new Map();
+function applyGlass(root) {
+  /* 已经从页面上拿掉的面板，先把它的玻璃停掉 */
+  glassOn.forEach((handle, el) => { if (!el.isConnected) { handle.destroy(); glassOn.delete(el); } });
+  root.querySelectorAll('.glass').forEach(el => {
+    if (glassOn.has(el)) return;
+    /* 胶囊形的圆角写的是 999px，实际圆角最大只到高度的一半 */
+    const radius = Math.min(parseFloat(getComputedStyle(el).borderTopLeftRadius) || 0, el.clientHeight / 2, el.clientWidth / 2);
+    glassOn.set(el, LiquidGlass.createLiquidGlass(el, { ...GLASS, radius, bezelWidth: Math.min(GLASS.bezelWidth, radius - 2) }));
+  });
+  /* 下雨、下雪时，雨滴溅起的水花和积雪画在这些面板的上沿 */
+  PanelFx.set([...root.querySelectorAll('.glass')], fall.mode, fall.level);
+}
+
+/* ---------- 首页的天气卡片 ---------- */
+function renderHomeCard() {
+  const s = scene, n = s.now, h = s.helmet, card = $('#homeCard'), cells = helmetCells();
+  const axis = h.mode === 'rest' ? ['放假前17时', '上班日8时'] : [cells.firstCovered ? (cells.firstWet ? '17时 有雨' : '17时 无雨') : '17时', '次日8时'];
+  const alert = s.alerts[0];
+  card.innerHTML = `
+    <div class="wc-now">
+      <div class="wc-addr"><strong>${ADDRESS}</strong><span>${s.updated.match(/\d\d:\d\d/)[0]} 更新</span></div>
+      <div class="wc-main">
+        <div class="wc-temp">${n.temp}<sup>°</sup></div>
+        <div class="wc-copy">
+          <div class="wc-cond">${wicon(SKYCON[n.sky].icon)}${condText()}</div>
+          <div class="wc-sub"><span>体感 ${n.feels}°</span><span>最高 ${n.hi}°</span><span>最低 ${n.lo}°</span></div>
+        </div>
+      </div>
+      <p class="wc-say">${s.say}</p>
+      ${alert ? `<button class="wc-alert glass" title="${alert.desc}"><svg class="alert-ico" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M8 1.5l6.5 11.5H1.5z"/><path d="M8 6.5v3M8 11.2h.01"/></svg><span>${alert.title}</span><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M6 3.5L10.5 8 6 12.5"/></svg></button>` : ''}
+      <div class="wc-helmet glass">
+        <span class="helmet-ico">${HELMET_ICON}</span>
+        <div class="wc-helmet-copy"><b>${h.title}</b>${cells.html}<div class="helmet-axis"><span>${axis[0]}</span><span>${axis[1]}</span></div></div>
+      </div>
+    </div>
+    <div class="wc-side glass" data-snow="8">
+      <div class="wc-side-head">
+        <h3>未来 12 小时</h3>
+        <div class="wc-actions">
+          <button class="sky-btn ico" aria-label="刷新天气" title="刷新天气"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M13.5 7a5.5 5.5 0 0 0-10-2.5"/><path d="M2.5 9a5.5 5.5 0 0 0 10 2.5"/><path d="M2.5 2v3h3M13.5 14v-3h-3"/></svg></button>
+          <button class="sky-btn" data-open-weather>查看详情<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M6 3.5L10.5 8 6 12.5"/></svg></button>
+        </div>
+      </div>
+      <div class="wc-plot" id="homePlot"><svg id="homeChart" role="img" aria-label="未来 12 小时的天气、气温和降水概率"></svg></div>
+      <div class="wc-days">${s.daily.slice(0, 5).map((d, i) => `<div class="wc-day ${i === 0 ? 'is-today' : ''}"><b>${d[0]}</b>${wicon(SKYCON[d[2]].icon)}<span><strong>${d[4]}°</strong> <em>/ ${d[3]}°</em></span></div>`).join('')}</div>
+    </div>`;
+  /* 卡片比窗口矮得多：太阳、月亮缩小一些，放在左边文字和右侧面板之间的空位里（放到面板后面会被玻璃模糊成一团光）；云层放大后只露出靠上的一段 */
+  const sky = Sky.mount(card, skyKind(), { orb: { x: 30.5, y: 24, scale: .7 }, cloudScale: 1.9, calm: { x: 15, y: 42, rx: 24, ry: 62 } });
+  card.dataset.tone = sky.dataset.tone;
+  fall = { mode: sky.dataset.fall, level: +sky.dataset.level };
+  drawHomeChart();
+  applyGlass(card);
+}
+
+/* ---------- 侧栏（照应用现状画） ---------- */
+function renderSidebar() {
+  const ic = p => `<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">${p}</svg>`;
+  const groups = [
+    ['工作台', [
+      ['仪表盘', '<rect x="1.5" y="1.5" width="5.5" height="6.5" rx="1"/><rect x="9" y="1.5" width="5.5" height="4" rx="1"/><rect x="1.5" y="9.5" width="5.5" height="5" rx="1"/><rect x="9" y="7" width="5.5" height="7.5" rx="1"/>'],
+      ['打卡操作', '<circle cx="8" cy="8" r="6"/><path d="M8 4.5V8l2.2 2.2"/>'],
+      ['打卡记录', '<rect x="2" y="3" width="12" height="11" rx="1.5"/><path d="M5 1.5v3M11 1.5v3M2 6.5h12"/><path d="M5 9h2M9 9h2M5 11.5h2"/>'],
+      ['截图档案', '<rect x="1.5" y="4" width="13" height="9" rx="1.5"/><path d="M5.5 4l1-1.5h3l1 1.5"/><circle cx="8" cy="8.5" r="2.5"/>'],
+      ['定时任务', '<rect x="1.5" y="2.5" width="13" height="11" rx="1.5"/><path d="M4 6h8M4 9h8M4 12h5"/>', '4'],
+      ['系统日志', '<path d="M3 1.5h7l3 3v10H3z"/><path d="M10 1.5v3h3"/><path d="M5.5 8h5M5.5 10.5h5M5.5 5.5h2"/>'],
+    ]],
+    ['资讯', [
+      ['天气预报', '<path d="M4.5 12.5a3 3 0 0 1-.5-6 4 4 0 0 1 7.7.5 2.8 2.8 0 0 1 .3 5.5z"/>'],
+      ['AI 资讯', '<path d="M8 2l1.4 4.2L13.5 8l-4.1 1.4L8 14l-1.4-4.6L2.5 8l4.1-1.8L8 2z"/>'],
+    ]],
+    ['配置', [
+      ['墨水屏', '<rect x="2" y="2" width="12" height="12" rx="1.5"/><path d="M4.5 5h7M4.5 8h5M4.5 11h7"/>'],
+      ['系统设置', '<circle cx="8" cy="8" r="2"/><path d="M8 1.5v1.5M8 13v1.5M2.5 8H1M15 8h-1.5M3.8 3.8l1 1M11.2 11.2l1 1M3.8 12.2l1-1M11.2 4.8l1-1"/>'],
+      ['网络加速', '<circle cx="8" cy="8" r="6.5"/><path d="M1.5 8h13M8 1.5c2 2 3 4 3 6.5s-1 4.5-3 6.5M8 1.5c-2 2-3 4-3 6.5s1 4.5 3 6.5"/>'],
+      ['关于 & 命令', '<circle cx="8" cy="8" r="6.5"/><path d="M8 7v4M8 5h.01"/>'],
+    ]],
+  ];
+  $('#sidebar').innerHTML = groups.map(g => `<div class="side-section"><div class="side-label">${g[0]}</div>${g[1].map(n => `<div class="side-item ${n[0] === (view === 'home' ? '仪表盘' : '天气预报') ? 'active' : ''}">${ic(n[1])}<span>${n[0]}</span>${n[2] ? `<span class="side-badge">${n[2]}</span>` : ''}</div>`).join('')}</div>`).join('')
+    + '<div class="side-footer"><div class="svc"><i></i>服务运行中</div></div>';
+}
+
+/* ---------- 组装 ---------- */
+function renderAll() {
+  const home = view === 'home';
+  $('#win').dataset.view = view;
+  $('#tbTitle').textContent = home ? '仪表盘' : '天气预报';
+  $('#tbSub').textContent = home ? '今日打卡、汇率行情与最近活动' : '多地点实况、逐时趋势与未来天气';
+  $('#clock').textContent = scene.clock;
+  renderSidebar();
+  if (home) { renderHomeCard(); return; }
+  renderBackdrop(); renderNow(); renderHelmet(); renderAlerts(); renderWeek(); renderMetrics(); drawChart();
+  applyGlass($('#viewWeather'));
+}
+/* 把整张设计稿缩放到浏览器窗口里：宽度一定放得下；高度差得不多时也一起缩进去，差得多就让页面上下滚动，免得字太小 */
+function fit() {
+  const z = Math.min(1, window.innerWidth / 1528, Math.max(.86, window.innerHeight / 976));
+  document.body.style.zoom = z;
+}
+
+/* ---------- 顶部切换条：看哪个页面、用哪组示例数据、配哪种天空 ---------- */
+const press = (seg, btn) => document.querySelectorAll(`${seg} button`).forEach(x => x.setAttribute('aria-pressed', x === btn));
+const bindSeg = (seg, apply) => $(seg).addEventListener('click', e => { const b = e.target.closest('button'); if (!b) return; press(seg, b); apply(b.dataset); renderAll(); });
+$('#segScene').innerHTML = SCENES.map((s, i) => `<button data-scene="${i}" aria-pressed="${i === 0}">${s.name}</button>`).join('');
+$('#segSky').innerHTML = '<button data-sky="" aria-pressed="true">跟随数据</button>' + Object.keys(Sky.KINDS).map(k => `<button data-sky="${k}" aria-pressed="false">${Sky.KINDS[k].label}</button>`).join('');
+bindSeg('#segView', d => { view = d.view; });
+bindSeg('#segScene', d => { scene = SCENES[+d.scene]; });
+bindSeg('#segSky', d => { skyPick = d.sky; });
+/* 首页卡片上的"查看详情"和预警条，点了进天气页 */
+$('#homeCard').addEventListener('click', e => { if (e.target.closest('[data-open-weather], .wc-alert')) $('#segView button[data-view="weather"]').click(); });
+
+/* 网址后面可以带三段参数直接打开指定画面：#数据序号,天空种类,页面。例如 index.html#2,thunder,home；后两段可以不写。
+   什么都不带时打开"晴天上午"的数据配"多云"的天空 */
+const [hScene, hSky, hView] = (location.hash.slice(1) || '1,partly').split(',');
+if (SCENES[+hScene]) { scene = SCENES[+hScene]; press('#segScene', $(`#segScene button[data-scene="${+hScene}"]`)); }
+if (Sky.KINDS[hSky]) { skyPick = hSky; press('#segSky', $(`#segSky button[data-sky="${hSky}"]`)); }
+if (hView === 'home') { view = 'home'; press('#segView', $('#segView button[data-view="home"]')); }
+
+/* ---------- 面板玻璃效果的设置：模糊、底色 ----------
+   这是应用里的正式功能：天气页右上角"外观"按钮点开一个小面板，拖动两个拖动条，面板马上跟着变，改动自动保存。
+   保存时写两处：浏览器自带的存储，和应用主进程管的设置文件（window.AAS_SETTINGS）。
+   打包后的应用里浏览器自带的存储重启后不一定还在，以设置文件为准；设计稿在普通浏览器里打开，没有设置文件，只用前者 */
+const GLASS_KEY = 'aas.weather.glass';
+const GLASS_DEFAULT = { blur: 20, tint: 125 };
+const glassTune = { ...GLASS_DEFAULT };
+/* 读到的值只认合法范围内的数字，别的一律当没读到 */
+function takeGlass(v) {
+  if (!v || typeof v !== 'object') return;
+  if (Number.isFinite(v.blur)) glassTune.blur = clamp(v.blur, 0, 40);
+  if (Number.isFinite(v.tint)) glassTune.tint = clamp(v.tint, 0, 250);
+}
+function applyGlassTune(save) {
+  $('#win').style.setProperty('--glass-blur', glassTune.blur + 'px');
+  $('#win').style.setProperty('--glass-k', glassTune.tint / 100);
+  $('#rngBlur').value = glassTune.blur; $('#outBlur').textContent = glassTune.blur;
+  $('#rngTint').value = glassTune.tint; $('#outTint').textContent = glassTune.tint + '%';
+  if (!save) return;
+  try { localStorage.setItem(GLASS_KEY, JSON.stringify(glassTune)); } catch (e) { /* 浏览器不让存就算了，这次打开期间照样生效 */ }
+  if (window.AAS_SETTINGS) window.AAS_SETTINGS.set(GLASS_KEY, { ...glassTune });
+}
+try { takeGlass(JSON.parse(localStorage.getItem(GLASS_KEY) || 'null')); } catch (e) { /* 存的内容坏了就用默认值 */ }
+if (window.AAS_SETTINGS) window.AAS_SETTINGS.getAll().then(all => { takeGlass(all[GLASS_KEY]); applyGlassTune(false); });
+$('#rngBlur').addEventListener('input', e => { glassTune.blur = +e.target.value; applyGlassTune(true); });
+$('#rngTint').addEventListener('input', e => { glassTune.tint = +e.target.value; applyGlassTune(true); });
+$('#btnGlassReset').addEventListener('click', () => { Object.assign(glassTune, GLASS_DEFAULT); applyGlassTune(true); });
+/* 小面板的开和关：点"外观"按钮开关，点面板外面或按 Esc 关掉 */
+function toggleGlassPop(open) { $('#glassPop').hidden = !open; $('#btnGlass').setAttribute('aria-expanded', open); }
+$('#btnGlass').addEventListener('click', () => toggleGlassPop($('#glassPop').hidden));
+document.addEventListener('click', e => { if (!e.target.closest('#glassPop, #btnGlass')) toggleGlassPop(false); });
+document.addEventListener('keydown', e => { if (e.key === 'Escape') toggleGlassPop(false); });
+
+fit();
+applyGlassTune(false);
+if (location.hash.endsWith(',pop')) toggleGlassPop(true);
+bindHover();
+renderAll();
+let resizeTimer;
+window.addEventListener('resize', () => { clearTimeout(resizeTimer); resizeTimer = setTimeout(() => { fit(); if (view === 'home') drawHomeChart(); else drawChart(); }, 80); });
+</script>
+</body>
+</html>
