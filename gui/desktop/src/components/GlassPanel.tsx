@@ -21,6 +21,20 @@ const DISP_MAP_MAX_SHRINK = 3;
 const REBUILD_DELAY = 120;
 const SVG_NS = 'http://www.w3.org/2000/svg';
 
+// 同样大小、同样圆角的面板算出来的两张图是一样的。页面重新出现时（比如从"全部地点"放大回天气页）直接用上次算好的，
+// 不用再算一遍：算图加转成图片要几十毫秒，正赶上动画开始时会让动画卡一下
+const IMAGE_CACHE_MAX = 40;
+const imageCache = new Map<string, string>();
+function cachedImage(key: string, make: () => string): string {
+  let url = imageCache.get(key);
+  if (url === undefined) {
+    url = make();
+    if (imageCache.size >= IMAGE_CACHE_MAX) imageCache.delete(imageCache.keys().next().value as string);
+    imageCache.set(key, url);
+  }
+  return url;
+}
+
 /** 建一个只做"按一张图把背景弯折"的滤镜。图会被拉伸到 width × height（面板大小），scale 是图里最大值对应弯折多少像素 */
 function createBendFilter(id: string, width: number, height: number, mapUrl: string, scale: number): SVGSVGElement {
   const svg = document.createElementNS(SVG_NS, 'svg');
@@ -63,10 +77,11 @@ function useGlassLens(hostRef: React.RefObject<HTMLElement>, lensRef: React.RefO
       const bend = compute1D(THICKNESS, bezel, 'convexSquircle', REFRACTIVE_INDEX);
       const maxBend = maxDisp(bend);
       const shrink = Math.min(DISP_MAP_MAX_SHRINK, Math.max(1, Math.sqrt(w * h / DISP_MAP_PIXELS)));
-      const mapUrl = imageDataToURL(compute2D(
+      const shape = `${w}x${h}:${radius}:${bezel}`;
+      const mapUrl = cachedImage(`map:${shape}`, () => imageDataToURL(compute2D(
         Math.max(1, Math.round(w / shrink)), Math.max(1, Math.round(h / shrink)),
         radius / shrink, bezel / shrink, maxBend || 1, bend,
-      ));
+      )));
       // 每次重算都新建一个滤镜、换一个新名字，再把旧的删掉：面板引用的名字变了，浏览器就会按新滤镜重画。
       // 模糊不放进这个滤镜，由样式里的 ::before 单独做：改一个样式变量就能马上生效
       const filterId = nextFilterId('wx-glass');
@@ -74,7 +89,7 @@ function useGlassLens(hostRef: React.RefObject<HTMLElement>, lensRef: React.RefO
       document.body.appendChild(filter);
       lens.style.setProperty('-webkit-backdrop-filter', `url("#${filterId}")`);
       lens.style.setProperty('backdrop-filter', `url("#${filterId}")`);
-      lens.style.setProperty('--wx-spec', `url("${specularImageUrl(w, h, radius, bezel)}")`);
+      lens.style.setProperty('--wx-spec', `url("${cachedImage(`spec:${shape}`, () => specularImageUrl(w, h, radius, bezel))}")`);
       svg?.remove();
       svg = filter;
     };

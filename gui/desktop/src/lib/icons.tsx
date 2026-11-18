@@ -246,6 +246,14 @@ export const Icon = {
     </>,
   ),
   Minus: makeIcon(<path d="M3 8h10" />),
+  Grid: makeIcon(
+    <>
+      <rect x="2.5" y="2.5" width="4.5" height="4.5" rx="1" />
+      <rect x="9" y="2.5" width="4.5" height="4.5" rx="1" />
+      <rect x="2.5" y="9" width="4.5" height="4.5" rx="1" />
+      <rect x="9" y="9" width="4.5" height="4.5" rx="1" />
+    </>,
+  ),
   Maximize: makeIcon(<rect x="2.5" y="2.5" width="11" height="11" rx="1" />),
   Close: makeIcon(<path d="M3 3l10 10M13 3L3 13" />),
 };

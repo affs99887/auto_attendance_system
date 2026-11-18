@@ -124,22 +124,26 @@
 .wx-title { margin: 0; font-size: 13px; font-weight: 600; }
 .wx-empty { padding: 18px 12px; font-size: 13px; color: var(--ink-3); }
 
-/* --- 第一行：左边一条玻璃胶囊放收藏的地点，右边是刷新 / 设置 / 外观 --- */
+/* --- 第一行：左边一条玻璃胶囊，"全部"按钮 + 收藏的地点；右边是刷新 / 设置 / 外观 --- */
 .wx-loc-row { display: flex; align-items: center; gap: 14px; min-height: 32px; }
-/* 地点多到放不下时，胶囊里面可以左右滑动 */
-.wx-loc-bar { flex: 0 1 auto; min-width: 0; padding: 3px; border-radius: 999px; }
-.wx-loc-tabs { display: flex; align-items: center; gap: 2px; overflow-x: auto; scrollbar-width: none; border-radius: 999px; }
+.wx-loc-bar { flex: 0 1 auto; min-width: 0; display: flex; align-items: center; padding: 3px; border-radius: 999px; }
+.wx-loc-all { flex: none; display: inline-flex; align-items: center; gap: 5px; padding: 5px 12px 5px 11px; border: 0; border-radius: 999px; background: none; color: var(--ink-2); font: inherit; font-size: 12.5px; font-weight: 500; cursor: pointer; }
+.wx-loc-all:hover { background: rgb(255 255 255 / .12); color: #fff; }
+.wx-loc-sep { flex: none; width: 1px; height: 14px; margin: 0 4px; background: rgb(255 255 255 / .26); }
+/* 地点多到放不下时可以左右滑（滚轮也行）；哪一边还有没露出来的地点，哪一边就渐隐 */
+.wx-loc-tabs { position: relative; min-width: 0; display: flex; align-items: center; gap: 2px; overflow-x: auto; scrollbar-width: none; border-radius: 999px; }
 .wx-loc-tabs::-webkit-scrollbar { display: none; }
+.wx-loc-tabs[data-more='left'] { -webkit-mask-image: linear-gradient(90deg, transparent, #000 28px); mask-image: linear-gradient(90deg, transparent, #000 28px); }
+.wx-loc-tabs[data-more='right'] { -webkit-mask-image: linear-gradient(90deg, #000 calc(100% - 28px), transparent); mask-image: linear-gradient(90deg, #000 calc(100% - 28px), transparent); }
+.wx-loc-tabs[data-more='both'] { -webkit-mask-image: linear-gradient(90deg, transparent, #000 28px, #000 calc(100% - 28px), transparent); mask-image: linear-gradient(90deg, transparent, #000 28px, #000 calc(100% - 28px), transparent); }
 .wx-loc-tab { flex: none; display: inline-flex; align-items: center; border-radius: 999px; color: var(--ink-2); }
 .wx-loc-tab:hover { background: rgb(255 255 255 / .12); color: #fff; }
 .wx-loc-tab.active { background: rgb(255 255 255 / .94); color: oklch(.34 .09 var(--wx-h)); }
-.wx-loc-pick { padding: 5px 12px; border: 0; border-radius: 999px; background: none; color: inherit; font: inherit; font-size: 12.5px; font-weight: 500; cursor: pointer; }
+.wx-loc-pick { padding: 5px 12px; border: 0; border-radius: 999px; background: none; color: inherit; font: inherit; font-size: 12.5px; font-weight: 500; white-space: nowrap; cursor: pointer; }
 .wx-loc-tab.active .wx-loc-pick { font-weight: 600; }
 .wx-loc-del { width: 20px; height: 20px; margin: 0 6px 0 -8px; padding: 0; display: grid; place-items: center; border: 0; border-radius: 50%; background: none; color: inherit; opacity: .7; cursor: pointer; }
 .wx-loc-del:hover { opacity: 1; background: rgb(255 255 255 / .16); }
 .wx-loc-tab.active .wx-loc-del:hover { background: rgb(0 20 60 / .12); }
-.wx-loc-add { flex: none; display: inline-flex; align-items: center; gap: 5px; margin-left: 4px; padding: 5px 12px; border: 0; border-radius: 999px; background: none; color: var(--ink-2); font: inherit; font-size: 12.5px; font-weight: 500; cursor: pointer; }
-.wx-loc-add:hover { background: rgb(255 255 255 / .12); color: #fff; }
 .wx-loc-meta { flex: none; margin-left: auto; display: flex; align-items: center; gap: 8px; }
 
 /* "外观"按钮点开的小面板，跟其他面板用同一套液态玻璃，拖动条一动它自己也跟着变。
@@ -346,3 +350,114 @@ button.wxc-alert { cursor: pointer; }
 .wxc-day svg { flex: none; }
 .wxc-day strong { font-weight: 600; }
 .wxc-day em { font-style: normal; color: var(--ink-3); }
+
+/* =====================================================================
+   天气页和"全部地点"之间的收放动画（screens/Weather.tsx 的 WeatherScreen）。
+   平时 .wx-stage 和 .wx-stage-box 都不占位置，页面照常排在内容区里；动画时 .wx-stage 变成一个圆角矩形的动画层，
+   在整个应用窗口和某张地点卡片之间收放（位置、大小由脚本逐帧给出），从下到上：
+     .wx-stage-back  这种天气的底色，换掉后面的天空
+     .wx-stage-box   整页内容，摆在跟内容区一样的位置，钉在动画层左上角跟着移动、被边裁掉
+     .wx-stage-card  卡片上的字
+   动画层压在侧栏、标题栏、工具栏下面：动画期间（.desktop 上有 data-weather-zoom）把这三块的层级抬高，边框上的字一直看得见，
+   侧栏的磨砂玻璃透出来的是这层底色
+   ===================================================================== */
+.wx-view, .wx-stage, .wx-stage-box { display: contents; }
+.wx-stage.is-zooming { display: block; position: fixed; z-index: 3; overflow: hidden; pointer-events: none; box-shadow: 0 18px 40px -22px rgb(6 12 30 / .55); }
+.wx-stage.is-zooming .wx-stage-box { display: block; position: absolute; overflow: hidden; box-sizing: border-box; }
+.wx-stage-back { position: absolute; inset: 0; }
+.wx-stage-card { position: absolute; left: 0; top: 0; }
+/* 三层各自单独交给显卡：动画层每帧变位置、变大小时，里面只是整层挪动和裁剪，不用把整页重画一遍 */
+.wx-stage.is-zooming > * { will-change: transform, opacity; }
+.wxl-card.is-bare { box-shadow: none; }
+.desktop[data-weather-zoom] .titlebar { z-index: 2; }
+.desktop[data-weather-zoom] .sidebar,
+.desktop[data-weather-zoom] .toolbar { position: relative; z-index: 4; }
+
+/* =====================================================================
+   "全部地点"页（components/WeatherPlaces.tsx）：铺在窗口的普通背景上，每个收藏的地点一张小卡片，卡片背景是那个地点现在的天空
+   ===================================================================== */
+.wxl { color: var(--text-primary); }
+.wxl.is-busy { pointer-events: none; }
+.wxl-head { display: flex; align-items: center; gap: 12px; min-height: 32px; }
+.wxl-head .btn { display: inline-flex; align-items: center; gap: 5px; }
+.wxl-title { margin: 0 auto 0 4px; display: flex; align-items: baseline; gap: 10px; font-size: 17px; font-weight: 600; white-space: nowrap; color: var(--text-primary); }
+.wxl-title span { font-size: 12px; font-weight: 400; color: var(--text-muted); }
+
+/* 搜索框和结果列表用应用里普通输入框、弹出层的样子 */
+.wxl-search { position: relative; flex: 0 1 340px; min-width: 200px; }
+.wxl-search-box {
+  height: 32px; display: flex; align-items: center; gap: 8px; padding: 0 5px 0 12px;
+  border: 1px solid var(--border); border-radius: 999px; background: var(--bg-card); color: var(--text-muted); cursor: text;
+  transition: border-color .1s;
+}
+.wxl-search-box:focus-within { border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-bg); color: var(--text-secondary); }
+.wxl-search-box > svg { flex: none; }
+.wxl-search input { flex: 1; min-width: 0; height: 100%; padding: 0; border: 0; outline: 0; background: none; color: var(--text-primary); font: inherit; font-size: 13px; }
+.wxl-search input::placeholder { color: var(--text-muted); }
+.wxl-clear { flex: none; width: 22px; height: 22px; display: grid; place-items: center; padding: 0; border: 0; border-radius: 50%; background: var(--bg-hover); color: var(--text-secondary); cursor: pointer; }
+.wxl-clear:hover { background: var(--bg-active); color: var(--text-primary); }
+.wxl-results { position: absolute; z-index: 6; top: calc(100% + 8px); right: 0; width: max(100%, 380px); padding: 6px; border: 1px solid var(--border); border-radius: 14px; background: var(--bg-card); box-shadow: var(--shadow-lg); }
+.wxl-results-head { display: flex; justify-content: space-between; padding: 5px 10px 6px; font-size: 11.5px; color: var(--text-muted); }
+.wxl-results-list { max-height: 330px; overflow-y: auto; scrollbar-width: thin; }
+.wxl-result { width: 100%; display: flex; align-items: center; gap: 12px; padding: 7px 10px; border: 0; border-radius: 10px; background: none; color: var(--text-primary); font: inherit; text-align: left; cursor: pointer; }
+.wxl-result[aria-selected='true'] { background: var(--bg-hover); }
+.wxl-result:disabled { cursor: default; opacity: .6; }
+.wxl-result-copy { flex: 1; min-width: 0; }
+.wxl-result-copy strong { display: block; font-size: 13px; font-weight: 600; }
+.wxl-result-copy small { display: block; margin-top: 1px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 11.5px; color: var(--text-muted); }
+.wxl-result em { flex: none; padding: 2px 10px; border-radius: 999px; background: var(--accent); color: #fff; font-size: 11.5px; font-style: normal; font-weight: 600; }
+.wxl-result em.is-muted { padding: 2px 0; background: none; color: var(--text-muted); font-weight: 400; }
+.wxl-results-empty { padding: 20px 10px; text-align: center; font-size: 12.5px; color: var(--text-muted); }
+.wxl-results-foot { margin-top: 4px; padding: 7px 10px 3px; border-top: 1px solid var(--border-soft); font-size: 11px; color: var(--text-muted); }
+
+/* 卡片按窗口宽度自动排几列，每列至少 280 像素：用户的窗口（约 1220 宽）排 3 列，默认窗口 4 列。
+   卡片小，宽屏上这一页比天气页放得更宽（最宽 1880 像素，最多 6 列），两边不会空出一大片 */
+.wx-page.wxl { max-width: 1880px; }
+.wxl-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); gap: 14px; }
+.wxl-card {
+  --ink-2: rgb(255 255 255 / .8); --warm: oklch(.9 .13 90);
+  position: relative; isolation: isolate; height: 116px; overflow: hidden; border-radius: 20px; color: #fff; box-shadow: 0 12px 28px -18px rgb(10 14 30 / .65);
+}
+/* 边缘一圈细亮线；正在看的地点换成一圈白边 */
+.wxl-card::after { content: ''; position: absolute; inset: 0; z-index: 3; border-radius: inherit; pointer-events: none; box-shadow: inset 0 0 0 1px rgb(255 255 255 / .16), inset 0 1px 0 rgb(255 255 255 / .3); }
+.wxl-card.active::after { box-shadow: inset 0 0 0 2px rgb(255 255 255 / .92); }
+.wxl-sky { position: absolute; inset: 0; z-index: -1; }
+.wxl-pick {
+  position: relative; z-index: 1; width: 100%; height: 100%;
+  display: grid; grid-template-columns: minmax(0, 1fr) auto; grid-template-rows: auto 1fr auto; column-gap: 12px;
+  padding: 12px 16px 12px 17px; border: 0; border-radius: inherit;
+  /* 左边写字的那一侧压暗一点，亮云上的字也看得清 */
+  background: linear-gradient(90deg, rgb(8 14 34 / .2), transparent 60%);
+  color: #fff; font: inherit; text-align: left; cursor: pointer;
+  text-shadow: 0 1px 2px rgb(10 18 40 / .45), 0 0 14px rgb(10 18 40 / .25);
+  transition: padding-right .18s ease;
+}
+.wxl-pick:hover:not(:disabled) { background-color: rgb(255 255 255 / .07); }
+.wxl-pick:focus-visible { outline: 2px solid #fff; outline-offset: -5px; }
+.wxl-pick:disabled { cursor: default; }
+.wxl-name { grid-area: 1 / 1; min-width: 0; }
+.wxl-name strong { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 16px; font-weight: 600; line-height: 1.3; }
+.wxl-name span { display: block; margin-top: 1px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 11.5px; color: var(--ink-2); }
+.wxl-temp { grid-area: 1 / 2 / 3 / 3; justify-self: end; font-size: 42px; font-weight: 300; line-height: .95; letter-spacing: -.04em; }
+.wxl-temp sup { position: relative; top: .1em; margin-left: .03em; font-size: .5em; letter-spacing: 0; vertical-align: top; }
+.wxl-temp .spinner { display: block; width: 18px; height: 18px; margin: 8px 6px 0 0; border-color: rgb(255 255 255 / .3); border-top-color: #fff; }
+.wxl-cond { grid-area: 3 / 1; align-self: end; min-width: 0; display: flex; align-items: center; gap: 5px; overflow: hidden; white-space: nowrap; font-size: 12.5px; }
+.wxl-cond > svg { flex: none; }
+.wxl-cond.is-alert { color: var(--warm); font-weight: 500; }
+.wxl-range { grid-area: 3 / 2; align-self: end; justify-self: end; display: flex; gap: 9px; white-space: nowrap; font-size: 12px; color: var(--ink-2); }
+.wxl-range b { font-weight: 500; color: #fff; }
+/* 编辑时卡片右侧垂直居中放一个红色的删除按钮，气温和最高最低温往左让出位置；默认地点不能删，不让位置 */
+.wxl-card.deletable .wxl-pick { padding-right: 52px; }
+.wxl-del {
+  position: absolute; z-index: 2; top: 50%; right: 14px; width: 24px; height: 24px; margin-top: -12px;
+  display: grid; place-items: center; padding: 0; border: 0; border-radius: 50%;
+  background: oklch(.62 .2 27); color: #fff; box-shadow: 0 2px 8px rgb(60 0 0 / .35); cursor: pointer;
+  animation: wxl-del-in .18s ease-out both;
+}
+.wxl-del:hover { background: oklch(.56 .21 27); }
+.wxl-del:focus-visible { outline: 2px solid #fff; outline-offset: 2px; }
+@keyframes wxl-del-in { from { opacity: 0; transform: scale(.6); } }
+@media (prefers-reduced-motion: reduce) {
+  .wxl-pick { transition: none; }
+  .wxl-del { animation: none; }
+}

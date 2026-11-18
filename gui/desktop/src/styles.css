@@ -1062,102 +1062,6 @@ html, body {
 .weather-page-state-title { margin-bottom: 4px; font-size: 14px; font-weight: 600; }
 .weather-page-state-error > svg { color: var(--danger); flex-shrink: 0; }
 
-/* 收藏地点切换与本地行政区搜索 */
-
-.weather-location-clear {
-  border: 0;
-  color: inherit;
-  background: transparent;
-  font: inherit;
-  cursor: pointer;
-}
-
-.weather-location-modal { width: min(540px, 100%); }
-.weather-location-search-wrap {
-  position: relative;
-  margin: 15px 20px 0;
-}
-.weather-location-search-wrap > svg {
-  position: absolute;
-  z-index: 1;
-  top: 50%;
-  left: 12px;
-  transform: translateY(-50%);
-  color: var(--text-muted);
-  pointer-events: none;
-}
-.weather-location-search { width: 100%; padding-left: 35px; padding-right: 34px; }
-.weather-location-clear {
-  position: absolute;
-  top: 50%;
-  right: 8px;
-  width: 24px;
-  height: 24px;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  transform: translateY(-50%);
-  border-radius: 6px;
-  color: var(--text-muted);
-}
-.weather-location-clear:hover { color: var(--text-primary); background: var(--bg-hover); }
-.weather-location-result-head {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 12px;
-  padding: 13px 20px 7px;
-  color: var(--text-muted);
-  font-size: 10.5px;
-}
-.weather-location-results {
-  min-height: 156px;
-  max-height: min(390px, 48vh);
-  overflow-y: auto;
-  padding: 0 20px 14px;
-}
-.weather-location-result {
-  display: flex;
-  align-items: center;
-  gap: 14px;
-  padding: 11px 0;
-  border-bottom: 1px solid var(--border-soft);
-}
-.weather-location-result:last-child { border-bottom: 0; }
-.weather-location-result-copy { min-width: 0; flex: 1; }
-.weather-location-result-copy > strong {
-  display: block;
-  overflow: hidden;
-  color: var(--text-primary);
-  font-size: 12.5px;
-  font-weight: 600;
-  white-space: nowrap;
-  text-overflow: ellipsis;
-}
-.weather-location-result-copy > span {
-  display: block;
-  overflow: hidden;
-  margin-top: 3px;
-  color: var(--text-muted);
-  font-size: 10.5px;
-  white-space: nowrap;
-  text-overflow: ellipsis;
-}
-.weather-location-result > .btn { flex-shrink: 0; }
-.weather-location-empty {
-  min-height: 156px;
-  display: flex;
-  flex-direction: column;
-  align-items: center;
-  justify-content: center;
-  gap: 6px;
-  color: var(--text-muted);
-  text-align: center;
-}
-.weather-location-empty > strong { color: var(--text-secondary); font-size: 12.5px; }
-.weather-location-empty > span { font-size: 10.5px; }
-.weather-location-modal-foot { color: var(--text-muted); font-size: 10.5px; }
-
 /* 首页天气卡片的外壳，以及加载中、加载失败两种状态（卡片本身的样式在 weather.css） */
 .weather-fusion-shell { min-width: 0; }
 
@@ -1180,14 +1084,6 @@ html, body {
 }
 .weather-empty-title { margin-bottom: 3px; font-size: 12px; font-weight: 500; color: var(--text-primary); }
 .weather-error > svg { color: var(--danger); flex-shrink: 0; }
-
-@media (max-width: 720px) {
-  .weather-location-search-wrap { margin-left: 16px; margin-right: 16px; }
-  .weather-location-result-head { padding-left: 16px; padding-right: 16px; }
-  .weather-location-results { padding-left: 16px; padding-right: 16px; }
-  .weather-location-modal-foot { align-items: flex-start; flex-direction: column; }
-  .weather-location-modal-foot > .btn { align-self: flex-end; }
-}
 
 /* === 墨水屏控制台（按设计稿 墨水屏控制.dc.html 重做） === */
 @keyframes ep-spin { to { transform: rotate(360deg); } }
@@ -1835,7 +1731,8 @@ input[type='date']::-webkit-calendar-picker-indicator { cursor: pointer; opacity
   will-change: opacity;
   transition: opacity .62s cubic-bezier(.22,.61,.36,1);
 }
-.desktop[data-immersive='on'] .weather-theme-stack { opacity: 1; }
+.desktop[data-immersive='on'] .weather-theme-stack,
+.desktop[data-places='closing'] .weather-theme-stack { opacity: 1; }
 
 @keyframes weather-route-content-in { from { opacity: .72; } }
 
@@ -1844,6 +1741,17 @@ input[type='date']::-webkit-calendar-picker-indicator { cursor: pointer; opacity
 .desktop[data-weather-transition='leaving'] .content {
   will-change: opacity;
   animation: weather-route-content-in .62s cubic-bezier(.22,.61,.36,1);
+}
+/* 天气页和"全部地点"互相切换（data-places-switch）时，侧栏、标题栏、工具栏的底色慢慢换；
+   字的颜色在底色换到一半左右时很快翻过去：字和底色一起慢慢变的话，中间会有一段灰字压灰底、几乎看不见。
+   底色的过渡先快后慢，开头 80 毫秒左右就换过一半，所以字在 30 到 130 毫秒之间翻。
+   内容区那时被一层底色盖着，.main 的背景直接换 */
+.desktop[data-places-switch='on'] :where(.titlebar, .toolbar, .sidebar),
+.desktop[data-places-switch='on'] :where(.titlebar, .toolbar, .sidebar) * {
+  transition: background-color .62s cubic-bezier(.22,.61,.36,1),
+    border-color .62s cubic-bezier(.22,.61,.36,1),
+    color .1s linear .03s,
+    box-shadow .62s ease;
 }
 .desktop[data-weather-transition='leaving'] :where(
   .titlebar, .toolbar, .main, .sidebar, .clock, .side-fx, .svc
@@ -1856,6 +1764,8 @@ input[type='date']::-webkit-calendar-picker-indicator { cursor: pointer; opacity
 .desktop[data-immersive='on'] .titlebar,
 .desktop[data-immersive='on'] .toolbar { background: transparent; border-color: rgba(255,255,255,.14); }
 .desktop[data-immersive='on'] .main { background: transparent; }
+/* 从"全部地点"回天气页的路上，边框先换成天气页的样子，内容区还留着普通背景 */
+.desktop[data-places='arriving'] .main { background: var(--bg-base); }
 /* 侧栏是一整片磨砂玻璃：背景模糊后再盖一层颜色（--side，随天空色调变），白色的文字压在亮云上也看得清 */
 .desktop[data-immersive='on'] .sidebar { background: var(--side); -webkit-backdrop-filter: blur(22px) saturate(1.3); backdrop-filter: blur(22px) saturate(1.3); border-right-color: rgba(255,255,255,.16); box-shadow: inset -1px 0 0 rgba(255,255,255,.06); }
 .desktop[data-immersive='on'] .sidebar,

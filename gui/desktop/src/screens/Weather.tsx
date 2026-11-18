@@ -1,9 +1,11 @@
 import * as React from 'react';
-import { useApp } from '../App';
+import { flushSync } from 'react-dom';
+import { useApp, WEATHER_SHELL_TRANSITION_MS } from '../App';
 import { Icon } from '../lib/icons';
 import type { WeatherDailyItem, WeatherResponse } from '../lib/api';
 import { useStartupStore } from '../store/startup';
 import {
+  EMPTY_WEATHER_ENTRY,
   selectActiveWeatherEntry,
   selectActiveWeatherLocation,
   useWeatherStore,
@@ -20,13 +22,11 @@ import {
   weatherTransitionLabel,
   windDirection,
 } from '../lib/weather';
-import {
-  DEFAULT_WEATHER_LOCATION,
-  searchWeatherLocations,
-  type WeatherLocation,
-} from '../lib/weatherLocations';
-import { appAlert, appConfirm } from '../lib/dialog';
+import { DEFAULT_WEATHER_LOCATION, type WeatherLocation } from '../lib/weatherLocations';
+import { appConfirm } from '../lib/dialog';
+import { resolveSkyKind, skyBase, warmSkyTextures, type SkyKind } from '../lib/sky';
 import { GlassPanel, usePanelFall } from '../components/GlassPanel';
+import { PlaceCard, WeatherPlaces } from '../components/WeatherPlaces';
 import {
   HelmetPanel,
   WeatherHourlyChart,
@@ -117,13 +117,6 @@ function WeatherLoading({ location }: { location: WeatherLocation }) {
   );
 }
 
-function sameLocation(a: WeatherLocation, b: WeatherLocation): boolean {
-  const sameCoordinates = a.latitude.toFixed(4) === b.latitude.toFixed(4)
-    && a.longitude.toFixed(4) === b.longitude.toFixed(4);
-  const sameAddress = a.address.replace(/\s+/g, '') === b.address.replace(/\s+/g, '');
-  return sameCoordinates || sameAddress;
-}
-
 /** "外观"按钮和它点开的小面板：调玻璃面板的模糊和底色，改动马上生效并自动保存。
  *  小面板自己也是液态玻璃，拖动条一动它跟着变 */
 function GlassTuneControl() {
@@ -179,74 +172,64 @@ function GlassTuneControl() {
   );
 }
 
-/** 页面最上面一行：左边一条玻璃胶囊里放收藏的地点，右边是刷新、设置、外观三个按钮 */
+/** 滚轮在地点标签条上滚动时改成左右滑动；滑到头了就不拦，滚轮照常滚动页面 */
+function useWheelScrollX(ref: React.RefObject<HTMLElement>) {
+  React.useEffect(() => {
+    const el = ref.current;
+    if (!el) return;
+    let target = el.scrollLeft, frame = 0;
+    // 每一帧往目标位置走剩下距离的四分之一，滚起来是平滑的，连续滚几下也不会卡顿
+    const step = () => {
+      const rest = target - el.scrollLeft;
+      if (Math.abs(rest) < 1) {
+        el.scrollLeft = target;
+        frame = 0;
+        return;
+      }
+      el.scrollLeft += Math.sign(rest) * Math.max(1, Math.abs(rest) * .25);
+      frame = window.requestAnimationFrame(step);
+    };
+    const onWheel = (event: WheelEvent) => {
+      const max = el.scrollWidth - el.clientWidth;
+      if (max <= 0) return;
+      const raw = Math.abs(event.deltaX) > Math.abs(event.deltaY) ? event.deltaX : event.deltaY;
+      // deltaMode 为 1 时滚动量按"行"给，换算成像素
+      const delta = raw * (event.deltaMode === 1 ? 32 : 1);
+      if (!frame) target = el.scrollLeft;
+      const next = Math.max(0, Math.min(max, target + delta));
+      if (next === target) return;
+      event.preventDefault();
+      target = next;
+      if (!frame) frame = window.requestAnimationFrame(step);
+    };
+    // 要拦住页面的上下滚动，只能用原生监听并声明 passive: false
+    el.addEventListener('wheel', onWheel, { passive: false });
+    return () => {
+      el.removeEventListener('wheel', onWheel);
+      window.cancelAnimationFrame(frame);
+    };
+  }, [ref]);
+}
+
+/** 页面最上面一行：左边一条玻璃胶囊，先是"全部"按钮（进"全部地点"页），后面是收藏的地点，每个地点带一个删除按钮；
+ *  右边是刷新、设置、外观三个按钮 */
 function WeatherLocationRow({
   loading,
   onRefresh,
   onOpenSettings,
+  onOpenPlaces,
 }: {
   loading: boolean;
   onRefresh: () => void;
   onOpenSettings: () => void;
+  onOpenPlaces: () => void;
 }) {
   const locations = useWeatherStore(s => s.locations);
   const activeLocationId = useWeatherStore(s => s.activeLocationId);
   const setActiveLocation = useWeatherStore(s => s.setActiveLocation);
-  const addFavorite = useWeatherStore(s => s.addFavorite);
   const removeFavorite = useWeatherStore(s => s.removeFavorite);
-  const [dialogOpen, setDialogOpen] = React.useState(false);
-  const [query, setQuery] = React.useState('');
-  const [addingId, setAddingId] = React.useState<string | null>(null);
-  const addButtonRef = React.useRef<HTMLButtonElement>(null);
-  const dialogRef = React.useRef<HTMLDivElement>(null);
-  const results = React.useMemo(() => searchWeatherLocations(query), [query]);
-
-  const closeDialog = React.useCallback(() => {
-    setDialogOpen(false);
-    setQuery('');
-    setAddingId(null);
-  }, []);
-
-  React.useEffect(() => {
-    if (!dialogOpen) return;
-    const onKey = (event: KeyboardEvent) => {
-      if (event.key === 'Escape') {
-        event.preventDefault();
-        closeDialog();
-        return;
-      }
-      if (event.key !== 'Tab') return;
-      const focusable = Array.from(dialogRef.current?.querySelectorAll<HTMLElement>(
-        'button:not([disabled]), input:not([disabled]), [href], [tabindex]:not([tabindex="-1"])',
-      ) || []);
-      const first = focusable[0];
-      const last = focusable[focusable.length - 1];
-      if (!first || !last) return;
-      if (event.shiftKey && document.activeElement === first) {
-        event.preventDefault();
-        last.focus();
-      } else if (!event.shiftKey && document.activeElement === last) {
-        event.preventDefault();
-        first.focus();
-      }
-    };
-    window.addEventListener('keydown', onKey, true);
-    return () => {
-      window.removeEventListener('keydown', onKey, true);
-      window.requestAnimationFrame(() => addButtonRef.current?.focus());
-    };
-  }, [dialogOpen, closeDialog]);
-
-  const handleAdd = async (location: WeatherLocation) => {
-    setAddingId(location.id);
-    const id = await addFavorite(location);
-    setAddingId(null);
-    if (!id) {
-      await appAlert('最多可收藏 20 个天气地点，请先删除不再使用的地点。', { title: '无法添加地点' });
-      return;
-    }
-    closeDialog();
-  };
+  const tabsRef = React.useRef<HTMLDivElement>(null);
+  useWheelScrollX(tabsRef);
 
   const handleDelete = async (location: WeatherLocation) => {
     const confirmed = await appConfirm(`确定删除收藏地点“${location.name}”吗？`, {
@@ -257,130 +240,89 @@ function WeatherLocationRow({
     if (confirmed) await removeFavorite(location.id);
   };
 
+  // 哪一边还有没露出来的地点，就在哪一边渐隐（样式按 data-more 取值）
+  React.useEffect(() => {
+    const el = tabsRef.current;
+    if (!el) return;
+    const update = () => {
+      const max = el.scrollWidth - el.clientWidth;
+      const left = el.scrollLeft > 1, right = el.scrollLeft < max - 1;
+      el.dataset.more = left && right ? 'both' : left ? 'left' : right ? 'right' : '';
+    };
+    update();
+    el.addEventListener('scroll', update, { passive: true });
+    const observer = new ResizeObserver(update);
+    observer.observe(el);
+    return () => {
+      el.removeEventListener('scroll', update);
+      observer.disconnect();
+    };
+  }, [locations.length]);
+
+  // 选中的地点被挡在外面时，滑到能看见它
+  React.useEffect(() => {
+    const el = tabsRef.current;
+    const tab = el?.querySelector<HTMLElement>('.wx-loc-tab.active');
+    if (!el || !tab) return;
+    const margin = 28;
+    if (tab.offsetLeft < el.scrollLeft + margin) {
+      el.scrollTo({ left: tab.offsetLeft - margin, behavior: 'smooth' });
+    } else if (tab.offsetLeft + tab.offsetWidth > el.scrollLeft + el.clientWidth - margin) {
+      el.scrollTo({ left: tab.offsetLeft + tab.offsetWidth - el.clientWidth + margin, behavior: 'smooth' });
+    }
+  }, [activeLocationId, locations.length]);
+
   return (
-    <>
-      <div className="wx-loc-row">
-        <GlassPanel as="section" className="wx-loc-bar" aria-label="收藏天气地点">
-          <div className="wx-loc-tabs" role="group" aria-label="切换天气地点">
-            {locations.map(location => {
-              const active = location.id === activeLocationId;
-              return (
-                <span className={`wx-loc-tab ${active ? 'active' : ''}`} key={location.id}>
+    <div className="wx-loc-row">
+      <GlassPanel as="section" className="wx-loc-bar" aria-label="收藏天气地点">
+        <button
+          type="button"
+          className="wx-loc-all"
+          title="全部地点：一次看所有地点的天气，也在这里添加、删除地点"
+          onClick={onOpenPlaces}
+        >
+          <Icon.Grid size={13} />全部
+        </button>
+        <i className="wx-loc-sep" aria-hidden="true" />
+        <div className="wx-loc-tabs" ref={tabsRef} role="group" aria-label="切换天气地点">
+          {locations.map(location => {
+            const active = location.id === activeLocationId;
+            return (
+              <span className={`wx-loc-tab${active ? ' active' : ''}`} key={location.id}>
+                <button
+                  type="button"
+                  className="wx-loc-pick"
+                  aria-pressed={active}
+                  title={location.address}
+                  onClick={() => void setActiveLocation(location.id)}
+                >
+                  {location.name}
+                </button>
+                {location.id !== DEFAULT_WEATHER_LOCATION.id && (
                   <button
                     type="button"
-                    className="wx-loc-pick"
-                    aria-pressed={active}
-                    title={location.address}
-                    onClick={() => void setActiveLocation(location.id)}
+                    className="wx-loc-del"
+                    title={`删除收藏：${location.name}`}
+                    aria-label={`删除收藏地点 ${location.name}`}
+                    onClick={() => void handleDelete(location)}
                   >
-                    {location.name}
+                    <Icon.X size={10} />
                   </button>
-                  {location.id !== DEFAULT_WEATHER_LOCATION.id && (
-                    <button
-                      type="button"
-                      className="wx-loc-del"
-                      title={`删除收藏：${location.name}`}
-                      aria-label={`删除收藏地点 ${location.name}`}
-                      onClick={() => void handleDelete(location)}
-                    >
-                      <Icon.X size={10} />
-                    </button>
-                  )}
-                </span>
-              );
-            })}
-            <button ref={addButtonRef} type="button" className="wx-loc-add" onClick={() => setDialogOpen(true)}>
-              <Icon.Plus size={12} />添加地点
-            </button>
-          </div>
-        </GlassPanel>
-        <div className="wx-loc-meta">
-          <button type="button" className="wx-btn" title="刷新当前地点天气" aria-label="刷新当前地点天气" disabled={loading} onClick={onRefresh}>
-            <span className={loading ? 'spin-ic' : ''}><Icon.Refresh size={13} /></span>
-            {loading ? '刷新中' : '刷新'}
-          </button>
-          <button type="button" className="wx-btn" onClick={onOpenSettings}><Icon.Settings size={13} />设置</button>
-          <GlassTuneControl />
+                )}
+              </span>
+            );
+          })}
         </div>
+      </GlassPanel>
+      <div className="wx-loc-meta">
+        <button type="button" className="wx-btn" title="刷新当前地点天气" aria-label="刷新当前地点天气" disabled={loading} onClick={onRefresh}>
+          <span className={loading ? 'spin-ic' : ''}><Icon.Refresh size={13} /></span>
+          {loading ? '刷新中' : '刷新'}
+        </button>
+        <button type="button" className="wx-btn" onClick={onOpenSettings}><Icon.Settings size={13} />设置</button>
+        <GlassTuneControl />
       </div>
-
-      {dialogOpen && (
-        <div className="ep-overlay" onClick={closeDialog}>
-          <div
-            className="ep-modal weather-location-modal"
-            ref={dialogRef}
-            role="dialog"
-            aria-modal="true"
-            aria-labelledby="weather-location-dialog-title"
-            onClick={event => event.stopPropagation()}
-          >
-            <div className="ep-modal-head">
-              <div>
-                <div className="ep-modal-title" id="weather-location-dialog-title">添加收藏地点</div>
-                <div className="ep-modal-sub">本地搜索城市、区县或行政区编码，不需要额外地图密钥</div>
-              </div>
-              <button type="button" className="ep-modal-close" onClick={closeDialog} aria-label="关闭">
-                <Icon.Close size={12} />
-              </button>
-            </div>
-            <div className="weather-location-search-wrap">
-              <Icon.Search size={14} />
-              <input
-                className="input weather-location-search"
-                autoFocus
-                aria-label="搜索天气地点"
-                value={query}
-                maxLength={30}
-                placeholder="搜索城市、区县，例如：杭州、长宁区"
-                onChange={event => setQuery(event.target.value)}
-              />
-              {query && (
-                <button type="button" className="weather-location-clear" onClick={() => setQuery('')} aria-label="清空搜索">
-                  <Icon.X size={11} />
-                </button>
-              )}
-            </div>
-            <div className="weather-location-result-head">
-              <span>{query.trim() ? '搜索结果' : '常用城市'}</span>
-              <span className="mono">显示 {results.length} 个</span>
-            </div>
-            <div className="weather-location-results">
-              {results.map(location => {
-                const favorite = locations.find(item => item.id === location.id || sameLocation(item, location));
-                const active = favorite?.id === activeLocationId;
-                return (
-                  <div className="weather-location-result" key={location.id}>
-                    <div className="weather-location-result-copy">
-                      <strong>{location.name}</strong>
-                      <span title={location.address}>{location.address}</span>
-                    </div>
-                    <button
-                      type="button"
-                      className={`btn btn-sm ${favorite ? '' : 'btn-primary'}`}
-                      disabled={active || addingId === location.id}
-                      onClick={() => void handleAdd(location)}
-                    >
-                      {addingId === location.id ? '添加中…' : active ? '当前地点' : favorite ? '切换' : '收藏并切换'}
-                    </button>
-                  </div>
-                );
-              })}
-              {!results.length && (
-                <div className="weather-location-empty">
-                  <Icon.Search size={20} />
-                  <strong>未找到匹配地点</strong>
-                  <span>请尝试输入城市或区县名称。</span>
-                </div>
-              )}
-            </div>
-            <div className="ep-modal-foot weather-location-modal-foot">
-              <span>最多收藏 20 个地点 · 数据源：彩云官方行政区划表</span>
-              <button type="button" className="btn" onClick={closeDialog}>关闭</button>
-            </div>
-          </div>
-        </div>
-      )}
-    </>
+    </div>
   );
 }
 
@@ -538,13 +480,78 @@ const MetricsPanel = React.memo(function MetricsPanel({ current }: { current: We
 const MemoHourlyChart = React.memo(WeatherHourlyChart);
 const MemoHelmetPanel = React.memo(HelmetPanel);
 
+// 天气页和"全部地点"之间的切换动画。天气页铺满整个应用窗口，所以从窗口四条边开始收、放到整个窗口；
+// 整个过程里字和面板一直都在，只有背景在变（跟 Apple 天气一样）：
+//   1. 换底色：页面（或点中的那张卡片）后面的天空很快换成这种天气的底色（天空最底下那层渐变，不带云、雨、雪），字和面板不动
+//   2. 收放：页面连同底色一起，四条边收到卡片上（或从卡片放开到整个窗口），节奏像不回弹的弹簧，起步慢、中段快、收尾慢；
+//      内容不缩放，钉在左上角跟着移动、被边裁掉，同时原来的内容慢慢换成目标的内容，两边有重叠，中间不会一个字都没有
+//   3. 露出来：底色很快淡掉，露出卡片（或整页）后面的天空
+// 页面和"全部地点"的互换、窗口背景的切换，都在被盖住的时候做，看不出来
+const COVER_MS = 140;
+const MOVE_MS = 480;
+const REVEAL_MS = 220;
+const CARD_RADIUS = 20;
+/** 不回弹的弹簧曲线，按时间取一串点写成 CSS 的 linear() 缓动 */
+const SPRING_EASE = `linear(${Array.from({ length: 33 }, (_, index) => {
+  const w = 8 * index / 32;
+  return index === 32 ? '1' : (1 - (1 + w) * Math.exp(-w)).toFixed(4);
+}).join(', ')})`;
+
+interface Zoom {
+  /** collapse：整页收进"全部地点"里当前地点的卡片；expand：点中的卡片放大成整页 */
+  dir: 'collapse' | 'expand';
+  /** 收进去 / 放出来的那张卡片对应的地点 */
+  id: string;
+  /** 底色用哪种天气的 */
+  kind: SkyKind;
+  phase: 'cover' | 'move' | 'reveal';
+  /** 收拢开始时页面滚到了哪里 */
+  scrollTop: number;
+}
+
+interface Box { left: number; top: number; width: number; height: number }
+
+/** "全部地点"页里某个地点的卡片 */
+function placeCard(id: string): HTMLElement | null {
+  return document.querySelector<HTMLElement>(`.wxl .wxl-card[data-place-id="${CSS.escape(id)}"]`);
+}
+
+/** 整个应用窗口的范围 */
+function windowBox(): Box {
+  const rect = document.querySelector('.win')?.getBoundingClientRect();
+  return rect
+    ? { left: rect.left, top: rect.top, width: rect.width, height: rect.height }
+    : { left: 0, top: 0, width: window.innerWidth, height: window.innerHeight };
+}
+
+const noop = () => {};
+
+function prefersReducedMotion(): boolean {
+  return window.matchMedia?.('(prefers-reduced-motion: reduce)').matches ?? false;
+}
+
 export function WeatherScreen() {
-  const { setScreen, weatherKind } = useApp();
+  const { setScreen, weatherKind, setWeatherPlaces } = useApp();
   const startupStatus = useStartupStore(s => s.status);
   const startupReason = useStartupStore(s => s.reason);
   const location = useWeatherStore(selectActiveWeatherLocation);
+  const activeLocationId = useWeatherStore(s => s.activeLocationId);
+  const setActiveLocation = useWeatherStore(s => s.setActiveLocation);
+  const locations = useWeatherStore(s => s.locations);
+  const entries = useWeatherStore(s => s.entries);
   const { data, loading, error, hasAttempted } = useWeatherStore(selectActiveWeatherEntry);
   const refresh = useWeatherStore(s => s.refresh);
+  const [view, setView] = React.useState<'page' | 'places'>('page');
+  const [zoom, setZoom] = React.useState<Zoom | null>(null);
+  const rootRef = React.useRef<HTMLDivElement>(null);
+  const stageRef = React.useRef<HTMLDivElement>(null);
+  const backRef = React.useRef<HTMLDivElement>(null);
+  const boxRef = React.useRef<HTMLDivElement>(null);
+  const cardFaceRef = React.useRef<HTMLDivElement>(null);
+  /** 放大时点中的那张卡片的位置（点下去的那一刻量好） */
+  const cardBoxRef = React.useRef<Box | null>(null);
+  /** 放大时整屏天空什么时候在边框后面淡入完 */
+  const skyReadyAtRef = React.useRef(0);
   usePanelFall(weatherKind);
 
   React.useEffect(() => {
@@ -552,19 +559,238 @@ export function WeatherScreen() {
     if (startupStatus === 'ready' && !data && !hasAttempted && !loading) void refresh(false);
   }, [startupStatus, data, hasAttempted, loading, refresh]);
 
+  // 离开天气页时不停在"全部地点"，下次进来还是整屏天空
+  React.useEffect(() => () => setWeatherPlaces('off'), [setWeatherPlaces]);
+
+  React.useEffect(() => warmSkyTextures(), []);
+
   const onRefresh = React.useCallback(() => void refresh(true), [refresh]);
   const onOpenSettings = React.useCallback(() => setScreen('settings'), [setScreen]);
-  const locationRow = <WeatherLocationRow loading={loading} onRefresh={onRefresh} onOpenSettings={onOpenSettings} />;
 
-  if (!data && (loading || (!hasAttempted && startupStatus !== 'failed'))) return (
-    <div className="wx-page">
-      {locationRow}
-      <WeatherLoading location={location} />
-    </div>
-  );
+  const openPlaces = React.useCallback(() => {
+    if (zoom) return;
+    const content = rootRef.current?.parentElement;
+    if (content && !prefersReducedMotion()) {
+      setZoom({ dir: 'collapse', id: activeLocationId, kind: weatherKind, phase: 'cover', scrollTop: content.scrollTop });
+      return;
+    }
+    setWeatherPlaces('on');
+    setView('places');
+    if (content) content.scrollTop = 0;
+  }, [zoom, activeLocationId, weatherKind, setWeatherPlaces]);
 
-  if (!data) {
-    return (
+  const openLocation = React.useCallback(async (id: string) => {
+    if (zoom) return;
+    const rect = placeCard(id)?.getBoundingClientRect();
+    await setActiveLocation(id);
+    // 底色跟 App 选天空的算法一致：有这个地点的天气就按它算，没有就沿用现在的
+    const skycon = useWeatherStore.getState().entries[id]?.data?.realtime.skycon;
+    const kind = skycon ? resolveSkyKind(skycon, new Date()) : weatherKind;
+    const content = rootRef.current?.parentElement;
+    if (content && rect && !prefersReducedMotion()) {
+      cardBoxRef.current = { left: rect.left, top: rect.top, width: rect.width, height: rect.height };
+      skyReadyAtRef.current = performance.now() + WEATHER_SHELL_TRANSITION_MS;
+      setWeatherPlaces('closing');
+      setZoom({ dir: 'expand', id, kind, phase: 'cover', scrollTop: 0 });
+      return;
+    }
+    setWeatherPlaces('off');
+    setView('page');
+    if (content) content.scrollTop = 0;
+  }, [zoom, setActiveLocation, weatherKind, setWeatherPlaces]);
+
+  // 动画期间把侧栏、标题栏、工具栏抬到动画层上面（样式见 weather.css 的 data-weather-zoom），边框上的字一直看得见
+  const zooming = zoom !== null;
+  React.useLayoutEffect(() => {
+    if (!zooming) return;
+    const desktop = document.querySelector<HTMLElement>('.desktop');
+    desktop?.setAttribute('data-weather-zoom', '');
+    return () => desktop?.removeAttribute('data-weather-zoom');
+  }, [zooming]);
+
+  // 动画开始时：动画层铺到起点（收拢是整个窗口，放大是那张卡片），页面放进去、摆在跟内容区一样的位置；动画结束时全部复原
+  React.useLayoutEffect(() => {
+    if (!zooming) return;
+    const stage = stageRef.current, box = boxRef.current, content = rootRef.current?.parentElement;
+    if (!stage || !box || !content) return;
+    const whole = windowBox();
+    const area = content.getBoundingClientRect();
+    Object.assign(box.style, {
+      left: `${area.left - whole.left}px`,
+      top: `${area.top - whole.top}px`,
+      width: `${content.clientWidth}px`,
+      height: `${content.clientHeight}px`,
+      padding: getComputedStyle(content).padding,
+    });
+    return () => {
+      stage.removeAttribute('style');
+      box.removeAttribute('style');
+    };
+  }, [zooming]);
+
+  React.useLayoutEffect(() => {
+    if (!zoom) return;
+    const stage = stageRef.current, back = backRef.current, box = boxRef.current, content = rootRef.current?.parentElement;
+    const cardFace = cardFaceRef.current;
+    if (!stage || !back || !box || !content) {
+      setZoom(null);
+      return;
+    }
+    const collapse = zoom.dir === 'collapse';
+    let stopped = false, frame = 0;
+    const animations: Animation[] = [];
+    const place = (target: Box, radius: number) => Object.assign(stage.style, {
+      left: `${target.left}px`, top: `${target.top}px`, width: `${target.width}px`, height: `${target.height}px`, borderRadius: `${radius}px`,
+    });
+    const keyframe = (target: Box, radius: number): Keyframe => ({
+      left: `${target.left}px`, top: `${target.top}px`, width: `${target.width}px`, height: `${target.height}px`, borderRadius: `${radius}px`,
+    });
+    /** 透明度动画：from 到 to，在整段时长的 start 到 end 之间完成 */
+    const fade = (el: HTMLElement | null, from: number, to: number, start: number, end: number, duration: number) => {
+      if (!el) return;
+      animations.push(el.animate({ opacity: [from, from, to, to], offset: [0, start, end, 1] }, { duration, easing: 'linear' }));
+      el.style.opacity = String(to);
+    };
+    const whenDone = (animation: Animation, next: () => void) => {
+      animation.finished.then(() => { if (!stopped) next(); }, () => {});
+    };
+    // 新出现的卡片、面板在这两帧里把要算的都算完，再开始动，不会卡顿、跳帧
+    const afterTwoFrames = (next: () => void) => {
+      frame = window.requestAnimationFrame(() => { frame = window.requestAnimationFrame(next); });
+    };
+
+    if (zoom.phase === 'cover') {
+      const whole = windowBox();
+      if (collapse) {
+        place(whole, 0);
+        box.scrollTop = zoom.scrollTop;
+        box.style.opacity = '1';
+        if (cardFace) cardFace.style.opacity = '0';
+      } else {
+        place(cardBoxRef.current ?? whole, CARD_RADIUS);
+        box.style.opacity = '0';
+        if (cardFace) {
+          cardFace.style.width = `${(cardBoxRef.current ?? whole).width}px`;
+          cardFace.style.opacity = '1';
+        }
+      }
+      // 后面的天空换成底色，前面的字和面板不动
+      const cover = back.animate({ opacity: [0, 1] }, { duration: COVER_MS, easing: 'ease-out' });
+      animations.push(cover);
+      back.style.opacity = '1';
+      whenDone(cover, () => {
+        if (collapse) {
+          // 窗口背景这时被底色盖着：换成"全部地点"，窗口换回普通背景
+          flushSync(() => {
+            setWeatherPlaces('on');
+            setView('places');
+            setZoom({ ...zoom, phase: 'move' });
+          });
+        } else {
+          // 边框跟着换成天气页的样子：等底色铺到边框下面时，磨砂玻璃透出来的正好是它。
+          // 在开始放大前换，换样式的那一下落在动画开始前的两帧里
+          flushSync(() => {
+            setWeatherPlaces('arriving');
+            setZoom({ ...zoom, phase: 'move' });
+          });
+        }
+      });
+    } else if (zoom.phase === 'move') {
+      const whole = windowBox();
+      let from: [Box, number], to: [Box, number];
+      if (collapse) {
+        content.scrollTop = 0;
+        const card = placeCard(zoom.id);
+        if (!card) {
+          setZoom({ ...zoom, phase: 'reveal' });
+          return;
+        }
+        // 当前地点的卡片排在下面看不到时，先把它滚进来
+        const area = content.getBoundingClientRect();
+        const hidden = card.getBoundingClientRect().bottom - (area.top + content.clientHeight) + 24;
+        if (hidden > 0) content.scrollTop = hidden;
+        const rect = card.getBoundingClientRect();
+        from = [whole, 0];
+        to = [{ left: rect.left, top: rect.top, width: rect.width, height: rect.height }, CARD_RADIUS];
+        if (cardFace) cardFace.style.width = `${rect.width}px`;
+      } else {
+        from = [cardBoxRef.current ?? whole, CARD_RADIUS];
+        to = [whole, 0];
+      }
+      place(...from);
+      afterTwoFrames(() => {
+        if (stopped) return;
+        const move = stage.animate([keyframe(...from), keyframe(...to)], { duration: MOVE_MS, easing: SPRING_EASE });
+        animations.push(move);
+        place(...to);
+        // 原来的内容慢慢淡出，目标的内容早一点开始淡入，两边重叠，字不会断
+        if (collapse) {
+          fade(box, 1, 0, 0, .6, MOVE_MS);
+          fade(cardFace, 0, 1, .1, .5, MOVE_MS);
+        } else {
+          fade(cardFace, 1, 0, 0, .6, MOVE_MS);
+          fade(box, 0, 1, 0, .4, MOVE_MS);
+        }
+        whenDone(move, () => {
+          if (collapse) {
+            setZoom({ ...zoom, phase: 'reveal' });
+            return;
+          }
+          // 底色铺满了整个窗口：换回天气页，窗口换回整屏天空（天空已经在边框后面淡入好了）
+          flushSync(() => {
+            setView('page');
+            setWeatherPlaces('off');
+            setZoom({ ...zoom, phase: 'reveal' });
+          });
+        });
+      });
+    } else {
+      afterTwoFrames(async () => {
+        if (!collapse) {
+          const wait = skyReadyAtRef.current - performance.now();
+          if (wait > 0) await new Promise(resolve => window.setTimeout(resolve, wait));
+        }
+        if (stopped) return;
+        // 底色淡掉，露出后面的天空：收拢时是真卡片（上面的字跟底色里那份重合），放大时是整屏天空
+        fade(back, 1, 0, 0, 1, REVEAL_MS);
+        if (collapse) fade(cardFace, 1, 0, 0, 1, REVEAL_MS);
+        whenDone(animations[animations.length - 1], () => {
+          if (!collapse) content.scrollTop = 0;
+          flushSync(() => setZoom(null));
+          const focused = document.activeElement;
+          if (!focused || focused === document.body) {
+            const next = collapse ? placeCard(zoom.id)?.querySelector<HTMLElement>('.wxl-pick') : document.querySelector<HTMLElement>('.wx-loc-all');
+            next?.focus({ preventScroll: true });
+          }
+        });
+      });
+    }
+
+    return () => {
+      stopped = true;
+      window.cancelAnimationFrame(frame);
+      animations.forEach(animation => animation.cancel());
+    };
+  }, [zoom, setWeatherPlaces]);
+
+  // 收拢的整个过程里页面还在（在动画层里收起来）；放大一开始就把新地点的页面放进动画层。
+  // 放大时"全部地点"留到底色铺满整个窗口为止，最后露出天空那一步它已经撤掉，不会从后面透出来
+  const showPage = view === 'page' || zoom !== null;
+  const showPlaces = view === 'places' || (zoom?.dir === 'expand' && zoom.phase !== 'reveal');
+  const locationRow = <WeatherLocationRow loading={loading} onRefresh={onRefresh} onOpenSettings={onOpenSettings} onOpenPlaces={openPlaces} />;
+
+  let page: React.ReactNode = null;
+  if (!showPage) {
+    page = null;
+  } else if (!data && (loading || (!hasAttempted && startupStatus !== 'failed'))) {
+    page = (
+      <div className="wx-page">
+        {locationRow}
+        <WeatherLoading location={location} />
+      </div>
+    );
+  } else if (!data) {
+    page = (
       <div className="wx-page">
         {locationRow}
         <div className="card weather-page-state weather-page-state-error" role="alert">
@@ -580,61 +806,95 @@ export function WeatherScreen() {
         </div>
       </div>
     );
+  } else {
+    page = (
+      <div className="wx-page">
+        {locationRow}
+        {error && (
+          <div className="weather-page-inline-error" role="alert">
+            <Icon.AlertTriangle size={14} />
+            <span>刷新失败：{error}</span>
+          </div>
+        )}
+
+        <section className="wx-hero" aria-label="现在的天气">
+          <WeatherHero data={data} />
+          <MemoHelmetPanel data={data} />
+        </section>
+
+        {(data.alerts.length > 0 || data.alerts_available !== true) && (
+          <section className="wx-alerts" aria-label="天气预警">
+            {data.alerts.length ? data.alerts.map(alert => (
+              <GlassPanel className="wx-alert" key={alert.id}>
+                <Icon.AlertTriangle size={18} className="wx-alert-ico" />
+                <div>
+                  <h3>{alert.title}</h3>
+                  <p>{alert.description}</p>
+                  <small>
+                    {[alert.status, alert.location, alert.source, alert.published_at ? weatherUpdateTime(alert.published_at, true) : '']
+                      .filter(Boolean).join(' · ')}
+                  </small>
+                </div>
+              </GlassPanel>
+            )) : (
+              <GlassPanel className="wx-alert is-unavailable">
+                <Icon.Info size={18} />
+                <div>
+                  <h3>预警数据暂不可用</h3>
+                  <p>暂未确认当前地点的气象预警状态，请稍后刷新。</p>
+                </div>
+              </GlassPanel>
+            )}
+          </section>
+        )}
+
+        <GlassPanel as="section" className="wx-hours">
+          <div className="wx-hours-head">
+            <h2 className="wx-title">24 小时</h2>
+            <div className="wx-hours-legend"><span><i className="line" />气温</span><span><i className="bar" />降水概率</span></div>
+          </div>
+          <MemoHourlyChart items={data.hourly} variant="page" />
+        </GlassPanel>
+
+        <div className="wx-duo">
+          <WeekPanel daily={data.daily} />
+          <MetricsPanel current={data.realtime} />
+        </div>
+      </div>
+    );
   }
 
+  const zoomLocation = zoom ? locations.find(item => item.id === zoom.id) : undefined;
+
+  // .wx-view 不占位置，内容区就是它的上一级。.wx-stage 和 .wx-stage-box 平时也不占位置，页面照常排在内容区里；
+  // 动画时 .wx-stage 变成动画层（样式见 weather.css）：最底下一层底色，上面是整页内容，再上面是卡片上的字。
+  // 页面一直在 .wx-stage-box 里，从"排在内容区里"变成"在动画层里"时不会被重新创建，玻璃面板不用重算
   return (
-    <div className="wx-page">
-      {locationRow}
-      {error && (
-        <div className="weather-page-inline-error" role="alert">
-          <Icon.AlertTriangle size={14} />
-          <span>刷新失败：{error}</span>
-        </div>
-      )}
-
-      <section className="wx-hero" aria-label="现在的天气">
-        <WeatherHero data={data} />
-        <MemoHelmetPanel data={data} />
-      </section>
-
-      {(data.alerts.length > 0 || data.alerts_available !== true) && (
-        <section className="wx-alerts" aria-label="天气预警">
-          {data.alerts.length ? data.alerts.map(alert => (
-            <GlassPanel className="wx-alert" key={alert.id}>
-              <Icon.AlertTriangle size={18} className="wx-alert-ico" />
-              <div>
-                <h3>{alert.title}</h3>
-                <p>{alert.description}</p>
-                <small>
-                  {[alert.status, alert.location, alert.source, alert.published_at ? weatherUpdateTime(alert.published_at, true) : '']
-                    .filter(Boolean).join(' · ')}
-                </small>
-              </div>
-            </GlassPanel>
-          )) : (
-            <GlassPanel className="wx-alert is-unavailable">
-              <Icon.Info size={18} />
-              <div>
-                <h3>预警数据暂不可用</h3>
-                <p>暂未确认当前地点的气象预警状态，请稍后刷新。</p>
-              </div>
-            </GlassPanel>
-          )}
-        </section>
-      )}
-
-      <GlassPanel as="section" className="wx-hours">
-        <div className="wx-hours-head">
-          <h2 className="wx-title">24 小时</h2>
-          <div className="wx-hours-legend"><span><i className="line" />气温</span><span><i className="bar" />降水概率</span></div>
-        </div>
-        <MemoHourlyChart items={data.hourly} variant="page" />
-      </GlassPanel>
-
-      <div className="wx-duo">
-        <WeekPanel daily={data.daily} />
-        <MetricsPanel current={data.realtime} />
+    <div className="wx-view" ref={rootRef}>
+      <div className={`wx-stage${zoom ? ' is-zooming' : ''}`} ref={stageRef} aria-hidden={zoom ? true : undefined}>
+        {zoom && <div className="wx-stage-back" ref={backRef} style={{ background: skyBase(zoom.kind) }} />}
+        <div className="wx-stage-box" ref={boxRef}>{page}</div>
+        {zoom && zoomLocation && (
+          <div className="wx-stage-card" ref={cardFaceRef}>
+            <PlaceCard
+              bare
+              location={zoomLocation}
+              entry={entries[zoomLocation.id] || EMPTY_WEATHER_ENTRY}
+              active={zoomLocation.id === activeLocationId}
+              editing={false}
+              now={new Date()}
+              onPick={noop}
+              onDelete={noop}
+            />
+          </div>
+        )}
       </div>
+      {showPlaces && (
+        <WeatherPlaces
+          busy={zoom !== null}
+          onOpen={openLocation}
+        />
+      )}
     </div>
   );
 }

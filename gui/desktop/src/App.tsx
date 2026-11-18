@@ -61,7 +61,16 @@ interface AppContextValue {
   clock: Date;
   /** 当前选中地点的天气对应哪一种天空，天气页的整屏背景和面板上的雨雪效果都按它来 */
   weatherKind: SkyKind;
+  /** 天气页是不是正在显示"全部地点"，见 WeatherPlacesMode */
+  weatherPlaces: WeatherPlacesMode;
+  setWeatherPlaces: (mode: WeatherPlacesMode) => void;
 }
+
+/** off：普通天气页，整个窗口铺在天空上；on：正在看"全部地点"，窗口是普通背景。
+ *  从"全部地点"回天气页的路上还有两步：
+ *  closing：窗口还是普通背景，整屏天空已经在边框后面先淡入，回到天气页时直接就是满的；
+ *  arriving：侧栏、标题栏、工具栏先换成天气页的样子（透出后面的天空），内容区还是普通背景 */
+export type WeatherPlacesMode = 'off' | 'on' | 'closing' | 'arriving';
 
 const AppCtx = React.createContext<AppContextValue | null>(null);
 
@@ -120,7 +129,10 @@ const SCREEN_SUB: Record<ScreenId, string> = {
 
 type WeatherShellPhase = 'off' | 'entering' | 'on' | 'leaving';
 
-const WEATHER_SHELL_TRANSITION_MS = 620;
+/** 整屏天空淡入淡出、窗口边框换颜色用的时长 */
+export const WEATHER_SHELL_TRANSITION_MS = 620;
+/** 天气页和"全部地点"互相切换后，过多久再收尾（比收放动画整个做完长一点） */
+const PLACES_SETTLE_MS = 1400;
 
 /** 天气页的整屏背景。只有进入天气页（含进出的过渡期间）才把天空放进来，平时不占显存 */
 const WeatherThemeBackdrop = React.memo(function WeatherThemeBackdrop({ kind, active }: { kind: SkyKind; active: boolean }) {
@@ -245,21 +257,45 @@ export function App() {
   const [opState, setOpState] = React.useState<OpState>({ running: false, type: null, perUser: {} });
   const weatherEntry = useWeatherStore(selectActiveWeatherEntry);
   const weatherSkycon = weatherEntry.data?.realtime.skycon;
-  const [weatherKind, setWeatherKind] = React.useState<SkyKind>(() => (
-    resolveSkyKind(weatherSkycon, new Date())
-  ));
   const glassBlur = useWeatherGlassStore(s => s.blur);
   const glassTint = useWeatherGlassStore(s => s.tint);
 
-  // 天气代码变了、或者钟点变了（白天和夜晚用的天空不一样），重新决定用哪一种天空；还没拿到数据时保持原样
+  // 天气代码变了、或者钟点变了（白天和夜晚用的天空不一样），重新决定用哪一种天空；还没拿到数据时保持原样。
+  // 在渲染时直接算出来：切换地点的同一次渲染里整屏天空就是新地点的，不会先露出上一个地点的天空
   const clockHour = clock.getHours();
-  React.useEffect(() => {
-    if (!weatherSkycon) return;
-    const nextKind = resolveSkyKind(weatherSkycon, new Date());
-    setWeatherKind(current => current === nextKind ? current : nextKind);
-  }, [weatherSkycon, clockHour]);
+  const lastWeatherKind = React.useRef<SkyKind | null>(null);
+  const weatherKind = React.useMemo<SkyKind>(() => (
+    weatherSkycon || !lastWeatherKind.current
+      ? resolveSkyKind(weatherSkycon, new Date())
+      : lastWeatherKind.current
+  // clockHour 只用来在整点重算（白天、夜晚的天空不同）
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  ), [weatherSkycon, clockHour]);
+  lastWeatherKind.current = weatherKind;
 
   React.useEffect(() => { void useWeatherGlassStore.getState().hydrate(); }, []);
+
+  // 天气页里切到"全部地点"时，窗口换回普通背景；换的那一小段时间里侧栏、标题栏、工具栏的颜色慢慢过渡（placesSwitching），
+  // 整屏天空淡出完再把它拿掉，平时不占显存
+  const [weatherPlaces, setWeatherPlacesState] = React.useState<WeatherPlacesMode>('off');
+  const [placesSwitching, setPlacesSwitching] = React.useState(false);
+  const weatherPlacesRef = React.useRef<WeatherPlacesMode>('off');
+  const placesTimer = React.useRef<number | null>(null);
+  const setWeatherPlaces = React.useCallback((mode: WeatherPlacesMode) => {
+    if (weatherPlacesRef.current === mode) return;
+    weatherPlacesRef.current = mode;
+    setWeatherPlacesState(mode);
+    if (placesTimer.current !== null) window.clearTimeout(placesTimer.current);
+    setPlacesSwitching(true);
+    // 等天气页的收放动画整个做完再收尾：收尾时要撤掉整屏天空、整个窗口重新算一遍样式，赶在动画中间会卡一下
+    placesTimer.current = window.setTimeout(() => {
+      setPlacesSwitching(false);
+      placesTimer.current = null;
+    }, PLACES_SETTLE_MS);
+  }, []);
+  React.useEffect(() => () => {
+    if (placesTimer.current !== null) window.clearTimeout(placesTimer.current);
+  }, []);
 
   const clearWeatherNavigationTransition = React.useCallback(() => {
     if (weatherNavigationTimer.current !== null) {
@@ -336,12 +372,15 @@ export function App() {
     sysStatus,
     clock,
     weatherKind,
+    weatherPlaces,
+    setWeatherPlaces,
   };
 
   const ScreenCmp = SCREENS[screen];
   const screenTitle = NAV.find(n => n.id === screen)?.label ?? '仪表盘';
   const screenSub = SCREEN_SUB[screen];
-  const weatherShellVisible = weatherShellPhase === 'entering' || weatherShellPhase === 'on';
+  const weatherShellVisible = (weatherShellPhase === 'entering' || weatherShellPhase === 'on')
+    && (weatherPlaces === 'off' || weatherPlaces === 'arriving');
 
   return (
     <AppCtx.Provider value={ctxValue}>
@@ -350,10 +389,12 @@ export function App() {
         data-tone={skyTone(weatherKind)}
         data-immersive={weatherShellVisible ? 'on' : 'off'}
         data-weather-transition={weatherShellPhase}
+        data-places={weatherPlaces === 'off' ? undefined : weatherPlaces}
+        data-places-switch={placesSwitching ? 'on' : undefined}
         style={{ '--glass-blur': `${glassBlur}px`, '--glass-k': glassTint / 100 } as React.CSSProperties}
       >
         <div className="win">
-          <WeatherThemeBackdrop kind={weatherKind} active={weatherShellPhase !== 'off'} />
+          <WeatherThemeBackdrop kind={weatherKind} active={weatherShellPhase !== 'off' && (weatherPlaces !== 'on' || placesSwitching)} />
           <TitleBar />
           <div className="shell">
             <Sidebar

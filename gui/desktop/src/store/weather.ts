@@ -3,6 +3,7 @@ import type { WeatherResponse } from '../lib/api';
 import {
   getCachedWeather,
   loadWeatherData,
+  WEATHER_SESSION_TTL,
   weatherErrorMessage,
 } from '../lib/weather';
 import {
@@ -12,7 +13,9 @@ import {
 
 const WEATHER_SETTINGS_KEY = 'aas.weather.locations.v1';
 const WEATHER_SETTINGS_VERSION = 1;
-const MAX_WEATHER_LOCATIONS = 20;
+export const MAX_WEATHER_LOCATIONS = 20;
+/** 一次补拉多个地点时，同时最多拉几个 */
+const STALE_REFRESH_CONCURRENCY = 3;
 
 export interface WeatherEntry {
   data: WeatherResponse | null;
@@ -46,6 +49,8 @@ export interface WeatherState {
   refreshLocation: (locationId: string, force?: boolean) => Promise<void>;
   refreshAfterCurrent: (force?: boolean) => void;
   refreshLocationAfterCurrent: (locationId: string, force?: boolean) => void;
+  /** 把还没有数据、或数据已超过 10 分钟的收藏地点都重新拉一遍 */
+  refreshStale: () => Promise<void>;
   setActiveLocation: (locationId: string) => Promise<void>;
   addFavorite: (location: WeatherLocation) => Promise<string | null>;
   removeFavorite: (locationId: string) => Promise<boolean>;
@@ -293,6 +298,20 @@ export const useWeatherStore = create<WeatherState>((set, get) => {
 
     refreshLocationAfterCurrent(locationId, force = false) {
       void runRefreshAfterCurrent(locationId, force);
+    },
+
+    async refreshStale() {
+      await get().hydrate();
+      const now = Date.now();
+      const queue = get().locations.map(item => item.id).filter(id => {
+        const entry = get().entries[id] || EMPTY_WEATHER_ENTRY;
+        return !entry.loading && (!entry.lastFetched || now - entry.lastFetched >= WEATHER_SESSION_TTL);
+      });
+      // 收藏最多 20 个地点，排队拉，免得一下子给后端发出 20 个请求
+      const worker = async () => {
+        for (let id = queue.shift(); id; id = queue.shift()) await runRefresh(id, false);
+      };
+      await Promise.all(Array.from({ length: Math.min(STALE_REFRESH_CONCURRENCY, queue.length) }, worker));
     },
 
     async setActiveLocation(locationId) {

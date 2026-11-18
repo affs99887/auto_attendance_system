@@ -175,6 +175,22 @@ function starField(w: number, h: number): HTMLCanvasElement {
   }
   return c;
 }
+// 同样大小的星空图是一样的：画过一次就留着，下次照着复制一张（复制比重画快得多，"全部地点"里十几张卡片同时出现时不会卡）
+const STAR_CACHE_MAX = 8;
+const starCache = new Map<string, HTMLCanvasElement>();
+function starFieldCopy(w: number, h: number): HTMLCanvasElement {
+  const key = `${w}x${h}`;
+  let source = starCache.get(key);
+  if (!source) {
+    source = starField(w, h);
+    if (starCache.size >= STAR_CACHE_MAX) starCache.delete(starCache.keys().next().value as string);
+    starCache.set(key, source);
+  }
+  const copy = canvas(source.width, source.height);
+  copy.getContext('2d')!.drawImage(source, 0, 0);
+  return copy;
+}
+
 /** 单独闪烁的亮星：每颗有自己的快慢和先后，不会一起亮一起暗 */
 function twinklers(n: number): string {
   const r = prng(47), out: string[] = [];
@@ -260,6 +276,26 @@ const SKIES: Record<SkyKind, SkyDef> = {
 };
 
 export const skyTone = (kind: SkyKind): SkyTone => SKIES[kind].tone;
+/** 这种天气的底色：天空最底下那一层渐变，不带云、雨、雪、星星 */
+export const skyBase = (kind: SkyKind): string => SKIES[kind].base;
+
+/** 趁浏览器空闲把雨丝、雪花图都先画好。每张图第一次画要几十毫秒，
+ *  留到"全部地点"里一批雨雪卡片同时出现时再画，会正好卡在收放动画中间 */
+export function warmSkyTextures(): () => void {
+  const jobs: Array<() => void> = [
+    ...(Object.keys(RAINS) as Array<keyof typeof RAINS>).map(name => () => { cached('rain:' + name, () => rainTex(RAINS[name])); }),
+    ...(Object.keys(SNOWS) as Array<keyof typeof SNOWS>).map(name => () => { cached('snow:' + name, () => snowTex(SNOWS[name])); }),
+  ];
+  let handle = 0;
+  const next = () => {
+    const job = jobs.shift();
+    if (!job) return;
+    job();
+    handle = window.requestIdleCallback(next, { timeout: 2000 });
+  };
+  handle = window.requestIdleCallback(next, { timeout: 2000 });
+  return () => window.cancelIdleCallback(handle);
+}
 /** 这种天气落到面板上的是雨还是雪，雨有多大 */
 export function skyFall(kind: SkyKind): { mode: SkyFall; level: number } {
   const def = SKIES[kind];
@@ -347,7 +383,7 @@ export function mountSky(host: HTMLElement, kind: SkyKind, opts: SkyOptions = {}
   el.dataset.kind = kind;
   el.innerHTML = out.join('');
   const slot = el.querySelector('[data-stars]');
-  if (slot) { const stars = starField(w, h); stars.className = 'wx-sky-stars'; slot.replaceWith(stars); }
+  if (slot) { const stars = starFieldCopy(w, h); stars.className = 'wx-sky-stars'; slot.replaceWith(stars); }
   host.appendChild(el);
   return el;
 }
