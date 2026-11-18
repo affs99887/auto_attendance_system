@@ -23,8 +23,10 @@ import { ModeQuickToggle } from './components/ModeQuickToggle';
 import { SystemBanners } from './components/SystemBanners';
 import { ServiceControls } from './components/ServiceControls';
 import { SidebarFxWidget } from './components/SidebarFxWidget';
-import { skyInfo } from './lib/weather';
+import { WeatherSky } from './components/WeatherSky';
+import { resolveSkyKind, skyTone, type SkyKind } from './lib/sky';
 import { selectActiveWeatherEntry, useWeatherStore } from './store/weather';
+import { useWeatherGlassStore } from './store/weatherGlass';
 import { useSystemStore } from './store/system';
 
 type ScreenComponent = React.ComponentType;
@@ -57,6 +59,8 @@ interface AppContextValue {
   setOpState: React.Dispatch<React.SetStateAction<OpState>>;
   sysStatus: SysStatus;
   clock: Date;
+  /** 当前选中地点的天气对应哪一种天空，天气页的整屏背景和面板上的雨雪效果都按它来 */
+  weatherKind: SkyKind;
 }
 
 const AppCtx = React.createContext<AppContextValue | null>(null);
@@ -114,128 +118,15 @@ const SCREEN_SUB: Record<ScreenId, string> = {
   about: 'Telegram 命令、系统组件与版本信息',
 };
 
-type WeatherThemeKind = 'sun' | 'rain' | 'night' | 'cloud' | 'thunder';
 type WeatherShellPhase = 'off' | 'entering' | 'on' | 'leaving';
 
-const WEATHER_THEME_CROSSFADE_MS = 720;
 const WEATHER_SHELL_TRANSITION_MS = 620;
 
-function resolveWeatherTheme(skycon: string | null | undefined, now: Date): WeatherThemeKind {
-  if (!skycon) return now.getHours() >= 19 || now.getHours() < 6 ? 'night' : 'sun';
-  const info = skyInfo(skycon);
-  if (info.icon === 'thunder') return 'thunder';
-  if (info.tone === 'rain' || info.tone === 'snow') return 'rain';
-  if (info.tone === 'night') return 'night';
-  if (info.tone === 'cloud' || info.tone === 'haze' || info.tone === 'wind') return 'cloud';
-  return 'sun';
-}
-
-function WeatherThemeLayer({
-  weather,
-  phase,
-}: {
-  weather: WeatherThemeKind;
-  phase: 'current' | 'previous';
-}) {
-  const rainy = weather === 'rain' || weather === 'thunder';
-  const cloudy = weather === 'cloud' || weather === 'thunder';
-  return (
-    <div className={`weather-theme-field is-${phase}`} data-weather={weather}>
-      <div className="weather-theme-vignette" />
-      {weather === 'sun' && (
-        <>
-          <span className="weather-theme-halo" />
-          {[0, 1, 2, 3, 4, 5, 6, 7, 8, 9].map(index => (
-            <span
-              key={`sun-mote-${index}`}
-              className="weather-theme-mote"
-              style={{
-                left: `${(index * 31 + 9) % 96}%`,
-                top: `${28 + ((index * 19) % 68)}%`,
-                animationDelay: `${-index * .9}s`,
-                animationDuration: `${10 + (index % 5) * 1.6}s`,
-              }}
-            />
-          ))}
-        </>
-      )}
-      {weather === 'night' && (
-        <>
-          <span className="weather-theme-moon" />
-          {Array.from({ length: 36 }, (_, index) => (
-            <span
-              key={`night-star-${index}`}
-              className="weather-theme-star"
-              style={{
-                left: `${(index * 37 + 5) % 97}%`,
-                top: `${(index * 23 + 7) % 78}%`,
-                width: `${1 + (index % 3) * .65}px`,
-                height: `${1 + (index % 3) * .65}px`,
-                animationDelay: `${-index * .17}s`,
-                animationDuration: `${2.2 + (index % 6) * .42}s`,
-              }}
-            />
-          ))}
-        </>
-      )}
-      {cloudy && [0, 1, 2, 3, 4, 5].map(index => (
-        <span
-          key={`theme-cloud-${index}`}
-          className="weather-theme-cloud"
-          style={{
-            left: `${[-7, 12, 31, 52, 69, 84][index]}%`,
-            top: `${[4, 32, 11, 48, 23, 58][index]}%`,
-            width: `${250 + (index % 3) * 92}px`,
-            height: `${120 + (index % 3) * 34}px`,
-            animationDelay: `${-index * 1.8}s`,
-            animationDuration: `${13 + index * 1.3}s`,
-          }}
-        />
-      ))}
-      {rainy && Array.from({ length: weather === 'thunder' ? 38 : 30 }, (_, index) => (
-        <span
-          key={`theme-rain-${index}`}
-          className="weather-theme-drop"
-          style={{
-            left: `${(index * 29 + 3) % 100}%`,
-            height: `${42 + (index % 7) * 8}px`,
-            opacity: .24 + (index % 5) * .07,
-            animationDelay: `${-(index % 13) * .08}s`,
-            animationDuration: `${weather === 'thunder' ? .42 + (index % 5) * .055 : .58 + (index % 6) * .06}s`,
-          }}
-        />
-      ))}
-      {weather === 'thunder' && <span className="weather-theme-flash" />}
-    </div>
-  );
-}
-
-const WeatherThemeBackdrop = React.memo(function WeatherThemeBackdrop({ weather }: { weather: WeatherThemeKind }) {
-  const [current, setCurrent] = React.useState(weather);
-  const [previous, setPrevious] = React.useState<WeatherThemeKind | null>(null);
-  const cleanupTimer = React.useRef<number | null>(null);
-
-  React.useLayoutEffect(() => {
-    if (weather === current) return;
-    if (cleanupTimer.current !== null) window.clearTimeout(cleanupTimer.current);
-    setPrevious(current);
-    setCurrent(weather);
-    cleanupTimer.current = window.setTimeout(() => {
-      setPrevious(null);
-      cleanupTimer.current = null;
-    }, WEATHER_THEME_CROSSFADE_MS);
-  }, [current, weather]);
-
-  React.useEffect(() => () => {
-    if (cleanupTimer.current !== null) window.clearTimeout(cleanupTimer.current);
-  }, []);
-
+/** 天气页的整屏背景。只有进入天气页（含进出的过渡期间）才把天空放进来，平时不占显存 */
+const WeatherThemeBackdrop = React.memo(function WeatherThemeBackdrop({ kind, active }: { kind: SkyKind; active: boolean }) {
   return (
     <div className="weather-theme-stack" aria-hidden="true">
-      {previous && previous !== current && (
-        <WeatherThemeLayer key={previous} weather={previous} phase="previous" />
-      )}
-      <WeatherThemeLayer key={current} weather={current} phase="current" />
+      {active && <WeatherSky kind={kind} className="weather-theme-sky" />}
     </div>
   );
 });
@@ -354,15 +245,21 @@ export function App() {
   const [opState, setOpState] = React.useState<OpState>({ running: false, type: null, perUser: {} });
   const weatherEntry = useWeatherStore(selectActiveWeatherEntry);
   const weatherSkycon = weatherEntry.data?.realtime.skycon;
-  const [weatherTheme, setWeatherTheme] = React.useState<WeatherThemeKind>(() => (
-    resolveWeatherTheme(weatherSkycon, new Date())
+  const [weatherKind, setWeatherKind] = React.useState<SkyKind>(() => (
+    resolveSkyKind(weatherSkycon, new Date())
   ));
+  const glassBlur = useWeatherGlassStore(s => s.blur);
+  const glassTint = useWeatherGlassStore(s => s.tint);
 
+  // 天气代码变了、或者钟点变了（白天和夜晚用的天空不一样），重新决定用哪一种天空；还没拿到数据时保持原样
+  const clockHour = clock.getHours();
   React.useEffect(() => {
     if (!weatherSkycon) return;
-    const nextTheme = resolveWeatherTheme(weatherSkycon, new Date());
-    setWeatherTheme(current => current === nextTheme ? current : nextTheme);
-  }, [weatherSkycon]);
+    const nextKind = resolveSkyKind(weatherSkycon, new Date());
+    setWeatherKind(current => current === nextKind ? current : nextKind);
+  }, [weatherSkycon, clockHour]);
+
+  React.useEffect(() => { void useWeatherGlassStore.getState().hydrate(); }, []);
 
   const clearWeatherNavigationTransition = React.useCallback(() => {
     if (weatherNavigationTimer.current !== null) {
@@ -438,6 +335,7 @@ export function App() {
     opState, setOpState,
     sysStatus,
     clock,
+    weatherKind,
   };
 
   const ScreenCmp = SCREENS[screen];
@@ -449,12 +347,13 @@ export function App() {
     <AppCtx.Provider value={ctxValue}>
       <div
         className="desktop"
-        data-weather={weatherTheme}
+        data-tone={skyTone(weatherKind)}
         data-immersive={weatherShellVisible ? 'on' : 'off'}
         data-weather-transition={weatherShellPhase}
+        style={{ '--glass-blur': `${glassBlur}px`, '--glass-k': glassTint / 100 } as React.CSSProperties}
       >
         <div className="win">
-          <WeatherThemeBackdrop weather={weatherTheme} />
+          <WeatherThemeBackdrop kind={weatherKind} active={weatherShellPhase !== 'off'} />
           <TitleBar />
           <div className="shell">
             <Sidebar

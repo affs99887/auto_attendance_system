@@ -18,6 +18,7 @@
     "dist:dir": "npm run build && electron-builder --dir"
   },
   "dependencies": {
+    "@avenra/liquid-glass": "1.2.0",
     "@types/react-window": "^1.8.8",
     "react": "^18.3.1",
     "react-dom": "^18.3.1",

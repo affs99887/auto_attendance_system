@@ -4,6 +4,7 @@ import { createRoot } from 'react-dom/client';
 import { App } from './App';
 import { useBackendBootstrap } from './store/bootstrap';
 import './styles.css';
+import './weather.css';
 import './electron-overrides.css';
 
 // 运行在 Electron 里时打标记，让 electron-overrides.css 生效（去掉模拟桌面边框）

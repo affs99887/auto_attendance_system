@@ -14,7 +14,7 @@ import {
 import { DEFAULT_WEATHER_LOCATION } from '../lib/weatherLocations';
 import { api } from '../lib/api';
 import {
-  WeatherOverviewCard,
+  WeatherHomeCard,
 } from '../components/WeatherPanel';
 import { FxSection } from '../components/ExchangeRatePanel';
 import { useAiNewsStore, CATEGORY_BY_SLUG, relTime } from '../store/aiNews';
@@ -454,9 +454,8 @@ function WeatherCard({
               <Icon.AlertTriangle size={13} />刷新失败，当前展示上次成功的数据
             </div>
           )}
-          <WeatherOverviewCard
+          <WeatherHomeCard
             data={data}
-            size="m"
             loading={loading}
             onRefresh={() => void refreshLocation(DEFAULT_WEATHER_LOCATION.id, true)}
             onOpenDetails={onOpenWeather}

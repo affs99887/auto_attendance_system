@@ -123,6 +123,13 @@ export const Icon = {
   ),
   Check: makeIcon(<path d="M3.5 8.5l3 3 6-7" />),
   X: makeIcon(<path d="M4 4l8 8M12 4l-8 8" />),
+  Sliders: makeIcon(
+    <>
+      <path d="M2 4.5h6.5M12 4.5h2M2 11.5h2M7.5 11.5H14" />
+      <circle cx="10.2" cy="4.5" r="1.8" />
+      <circle cx="5.8" cy="11.5" r="1.8" />
+    </>,
+  ),
   ChevronDown: makeIcon(<path d="M3 6l5 4 5-4" />),
   ChevronRight: makeIcon(<path d="M6 3l4 5-4 5" />),
   ChevronLeft: makeIcon(<path d="M10 3L6 8l4 5" />),

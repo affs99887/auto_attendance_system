@@ -124,13 +124,6 @@ export function windDirection(degrees: number | null): string {
   return `${labels[Math.round((((degrees % 360) + 360) % 360) / 45) % 8]}风`;
 }
 
-export function windScale(speed: number | null): string {
-  if (speed === null || !Number.isFinite(speed)) return '—';
-  const thresholds = [1, 6, 12, 20, 29, 39, 50, 62, 75, 89, 103, 118];
-  const level = thresholds.findIndex(limit => speed < limit);
-  return `${level === -1 ? 12 : level}级`;
-}
-
 export function weatherTransitionLabel(
   currentSkycon: string | null | undefined,
   hourly: WeatherHourlyItem[],
@@ -575,12 +568,4 @@ export function weatherHourLabel(datetime: string, index: number): string {
 
 export function roundWeather(value: number | null, suffix = ''): string {
   return value === null || !Number.isFinite(value) ? '—' : `${Math.round(value)}${suffix}`;
-}
-
-export function aqiTone(value: number | null): 'neutral' | 'success' | 'info' | 'warning' | 'danger' {
-  if (value === null || !Number.isFinite(value)) return 'neutral';
-  if (value <= 50) return 'success';
-  if (value <= 100) return 'info';
-  if (value <= 150) return 'warning';
-  return 'danger';
 }

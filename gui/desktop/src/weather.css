@@ -1,0 +1,348 @@
+/* 天气相关的样式：天空背景、液态玻璃面板、天气页、首页的天气卡片。
+   天气页打开时整个窗口都铺在一片天空上（.desktop[data-immersive='on']），页面上的面板是液态玻璃。 */
+
+/* --glass-blur 是玻璃面板的模糊程度，--glass-k 是面板底色的浓淡倍数（1 是原样）：
+   两个值由天气页"外观"里的拖动条决定，App.tsx 把它们写在 .desktop 上。
+   data-tone 是当前天空的色调；--wx-h 是这个色调对应的色相，选中的地点标签用它配文字颜色；--side 是侧栏那片磨砂玻璃上盖的颜色 */
+.desktop { --wx-h: 250; --side: oklch(.34 .09 256 / .34); }
+.desktop[data-tone='grey'] { --wx-h: 252; --side: oklch(.3 .02 255 / .3); }
+.desktop[data-tone='storm'] { --wx-h: 258; --side: oklch(.22 .035 262 / .3); }
+.desktop[data-tone='night'] { --wx-h: 272; --side: rgb(255 255 255 / .05); }
+.desktop[data-tone='warm'] { --wx-h: 70; --side: oklch(.32 .035 70 / .3); }
+
+/* =====================================================================
+   天空背景（由 lib/sky.ts 生成图层，这里管每一层怎么摆、怎么动）
+   ===================================================================== */
+.weather-theme-sky { position: absolute; inset: 0; }
+.wx-sky { position: absolute; inset: 0; overflow: hidden; pointer-events: none; contain: strict; }
+/* 换天气时新天空叠在旧的上面淡入 */
+.wx-sky.is-entering { animation: wx-sky-in .72s ease both; }
+.wx-sky > *, .wx-sky-wrap > *, .wx-sky-fall-wrap > *, .wx-sky-sway > *, .wx-sky-night > * { position: absolute; pointer-events: none; }
+.wx-sky-fill, .wx-sky-night { inset: 0; }
+.wx-sky-stars { display: block; inset: 0; width: 100%; height: 100%; }
+.wx-sky-star {
+  width: var(--s); height: var(--s); margin: calc(var(--s) / -2) 0 0 calc(var(--s) / -2); border-radius: 50%;
+  background: radial-gradient(circle, #fff 0 26%, rgb(var(--c) / .5) 44%, rgb(var(--c) / 0) 72%);
+  animation: wx-sky-twinkle var(--dur) ease-in-out var(--delay) infinite alternate;
+}
+.wx-sky-meteor { width: 150px; height: 1.5px; border-radius: 1px; opacity: 0; background: linear-gradient(90deg, #fff, rgb(190 214 255 / .5) 30%, transparent); animation: wx-sky-meteor var(--dur) linear var(--delay) infinite; }
+.wx-sky-orb { transform-origin: 0 0; }
+.wx-sky-rays {
+  width: 1900px; height: 1900px; margin: -950px 0 0 -950px; border-radius: 50%;
+  background: repeating-conic-gradient(from 8deg, rgb(255 248 228 / 0) 0deg, rgb(255 248 228 / .1) 5deg, rgb(255 248 228 / 0) 13deg, rgb(255 248 228 / 0) 23deg),
+              repeating-conic-gradient(from 0deg, rgb(255 255 255 / 0) 0deg, rgb(255 255 255 / .07) 3deg, rgb(255 255 255 / 0) 7deg, rgb(255 255 255 / 0) 37deg);
+  -webkit-mask-image: radial-gradient(circle, #000 0, rgb(0 0 0 / .55) 14%, transparent 52%); mask-image: radial-gradient(circle, #000 0, rgb(0 0 0 / .55) 14%, transparent 52%);
+  animation: wx-sky-spin 320s linear infinite;
+}
+.wx-sky-sun {
+  width: 48px; height: 48px; margin: -24px 0 0 -24px; border-radius: 50%;
+  background: radial-gradient(circle, #fff 0 46%, rgb(255 251 236 / .92) 62%, rgb(255 246 218 / 0) 100%);
+  box-shadow: 0 0 26px 10px rgb(255 248 226 / .7), 0 0 90px 40px rgb(255 240 200 / .32), 0 0 220px 110px rgb(255 236 190 / .14);
+}
+.wx-sky-moon {
+  width: 76px; height: 76px; margin: -38px 0 0 -38px; border-radius: 50%; background-size: 100% 100%;
+  box-shadow: 0 0 14px 1px rgb(226 234 255 / .55), 0 0 46px 10px rgb(176 198 255 / .3), 0 0 130px 46px rgb(150 176 255 / .13);
+}
+.wx-sky-wrap { inset: 0; }
+.wx-sky-wrap.fade { -webkit-mask-image: var(--calm); mask-image: var(--calm); }
+.wx-sky-cloud { left: 0; width: calc(100% + var(--tile)); background-repeat: repeat-x; background-size: var(--tile) 100%; will-change: transform; animation: wx-sky-drift var(--dur) linear var(--delay) infinite; }
+.wx-sky-fall-wrap { inset: -30% -12%; transform: rotate(var(--tilt)); }
+.wx-sky-fall { left: 0; right: 0; bottom: 0; top: calc(var(--th) * -1); background-repeat: repeat; will-change: transform; animation: wx-sky-fall var(--dur) linear var(--delay) infinite; }
+.wx-sky-sway { inset: -6%; animation: wx-sky-sway var(--dur) ease-in-out infinite alternate; }
+.wx-sky-flash { inset: 0; opacity: 0; }
+.wx-sky-flash.f1 { background: radial-gradient(560px 300px at 64% 10%, rgb(226 232 255 / .95), rgb(190 204 255 / .35) 45%, transparent 75%), rgb(150 170 230 / .14); animation: wx-sky-flash 7.3s linear infinite; }
+.wx-sky-flash.f2 { background: radial-gradient(460px 260px at 24% 6%, rgb(226 232 255 / .9), rgb(190 204 255 / .3) 45%, transparent 75%), rgb(150 170 230 / .1); animation: wx-sky-flash 11.9s linear -4s infinite; }
+@keyframes wx-sky-in { from { opacity: 0; } }
+@keyframes wx-sky-drift { to { transform: translate3d(calc(var(--tile) * -1), 0, 0); } }
+@keyframes wx-sky-fall { to { transform: translate3d(0, var(--th), 0); } }
+@keyframes wx-sky-sway { from { transform: translateX(-22px); } to { transform: translateX(22px); } }
+@keyframes wx-sky-spin { to { transform: rotate(360deg); } }
+@keyframes wx-sky-twinkle { from { opacity: .12; transform: scale(.7); } to { opacity: 1; transform: scale(1); } }
+/* 流星：绝大部分时间看不见，每隔一阵从右上往左下划过一次 */
+@keyframes wx-sky-meteor { 0%, 94% { opacity: 0; transform: rotate(-28deg) translateX(0); } 94.6% { opacity: 1; } 98% { opacity: 0; transform: rotate(-28deg) translateX(-460px); } 100% { opacity: 0; transform: rotate(-28deg) translateX(-460px); } }
+@keyframes wx-sky-flash { 0%, 91.5%, 100% { opacity: 0; } 92% { opacity: 1; } 93% { opacity: .15; } 94.2% { opacity: .8; } 97% { opacity: 0; } }
+@media (prefers-reduced-motion: reduce) { .wx-sky * { animation: none !important; } }
+
+/* =====================================================================
+   液态玻璃面板（components/GlassPanel.tsx）。从下到上一共三层，都垫在内容下面：
+   ::before        把面板后面的背景模糊掉（模糊多少由 --glass-blur 定）
+   .wx-glass-lens  让背景在面板边缘一圈被弯折，并加上边缘高光
+   ::after         一层很淡的底色（--glass）、边缘的亮线和面板下方的投影
+   ===================================================================== */
+.wx-glass { position: relative; isolation: isolate; border-radius: 22px; }
+.wx-glass::before { content: ''; position: absolute; inset: 0; z-index: -1; border-radius: inherit; pointer-events: none; -webkit-backdrop-filter: blur(var(--glass-blur)) saturate(1.25); backdrop-filter: blur(var(--glass-blur)) saturate(1.25); }
+.wx-glass-lens { position: absolute; inset: 0; z-index: -1; border-radius: inherit; pointer-events: none; }
+/* 边缘高光：一张按面板大小算好的图（--wx-spec，GlassPanel.tsx 写进来），叠在弯折过的背景上面 */
+.wx-glass-lens::after { content: ''; position: absolute; inset: 0; border-radius: inherit; background: var(--wx-spec, none) 0 0 / 100% 100% no-repeat; }
+.wx-glass::after {
+  content: ''; position: absolute; inset: 0; z-index: -1; border-radius: inherit; pointer-events: none;
+  background: linear-gradient(165deg, rgb(255 255 255 / .15), rgb(255 255 255 / .02) 38%, rgb(255 255 255 / .06)), var(--glass);
+  box-shadow: inset 0 0 0 1px rgb(255 255 255 / .13), inset 0 1px 0 rgb(255 255 255 / .38), inset 0 -1px 0 rgb(255 255 255 / .1), 0 16px 36px -16px rgb(4 12 36 / .5);
+}
+/* 面板自带的两张画布，下雨、下雪时 lib/panelFx.ts 往上画：一张横在上沿（上沿之上 46 像素、之下 64 像素），一张盖住整个玻璃面 */
+.wx-fx { position: absolute; left: 0; width: 100%; z-index: 2; pointer-events: none; }
+.wx-fx-top { top: -46px; height: 110px; }
+.wx-fx-face { top: 0; height: 100%; }
+
+/* 小按钮只做磨砂（背景模糊 + 一层底色 + 顶上一道亮线），不做边缘弯折 */
+.wx-btn {
+  display: inline-flex; align-items: center; gap: 6px; padding: 5px 11px;
+  border: 1px solid rgb(255 255 255 / .2); border-radius: 999px; background: var(--glass);
+  -webkit-backdrop-filter: blur(12px) saturate(1.3); backdrop-filter: blur(12px) saturate(1.3);
+  box-shadow: inset 0 1px 0 rgb(255 255 255 / .28);
+  color: #fff; font: inherit; font-size: 12px; font-weight: 500; cursor: pointer; white-space: nowrap;
+}
+.wx-btn:hover:not(:disabled) { background: color-mix(in oklab, var(--glass), #fff 16%); border-color: rgb(255 255 255 / .36); }
+.wx-btn:disabled { cursor: default; opacity: .7; }
+.wx-btn .spin-ic, .wx-btn > span { display: inline-flex; }
+
+/* =====================================================================
+   天气页（screens/Weather.tsx）
+   ===================================================================== */
+.wx-page, .wxc {
+  /* 三档文字深浅 + 分隔线 */
+  --ink-2: rgb(255 255 255 / .8);
+  --ink-3: rgb(255 255 255 / .68);
+  --line: rgb(255 255 255 / .13);
+  /* 玻璃面板上盖的一层很淡的颜色：白天用比天空深一档的同色，夜里用很淡的白，保证白色的文字在哪种天气上都看得清。
+     --glass-c 是颜色，--glass-a 是原本的浓度，再乘上"外观"里调的倍数 --glass-k 才是最后盖上去的颜色 --glass */
+  --glass-c: oklch(.3 .09 256); --glass-a: .3;
+  --glass: color-mix(in oklab, var(--glass-c) calc(var(--glass-a) * var(--glass-k) * 100%), transparent);
+  --track: rgb(4 18 46 / .26);
+  /* 跟雨有关的标记统一用这个浅青色；头盔提醒里"有雨"的标签和预警图标用暖黄 */
+  --rain: oklch(.88 .085 222);
+  --warm: oklch(.9 .13 90);
+  color: #fff;
+  font-variant-numeric: tabular-nums;
+}
+.desktop[data-tone='grey'] .wx-page, .wxc[data-tone='grey'] { --glass-c: oklch(.27 .02 255); --glass-a: .26; --track: rgb(10 16 28 / .28); }
+.desktop[data-tone='storm'] .wx-page, .wxc[data-tone='storm'] { --glass-c: oklch(.2 .035 262); --glass-a: .28; --track: rgb(6 12 30 / .3); }
+.desktop[data-tone='night'] .wx-page, .wxc[data-tone='night'] { --glass-c: #fff; --glass-a: .04; --track: rgb(255 255 255 / .1); }
+.desktop[data-tone='warm'] .wx-page, .wxc[data-tone='warm'] { --glass-c: oklch(.3 .035 70); --glass-a: .26; --track: rgb(40 28 10 / .26); }
+
+.wx-page { display: flex; flex-direction: column; gap: 14px; max-width: 1400px; margin: -6px auto -2px; }
+.wx-title { margin: 0; font-size: 13px; font-weight: 600; }
+.wx-empty { padding: 18px 12px; font-size: 13px; color: var(--ink-3); }
+
+/* --- 第一行：左边一条玻璃胶囊放收藏的地点，右边是刷新 / 设置 / 外观 --- */
+.wx-loc-row { display: flex; align-items: center; gap: 14px; min-height: 32px; }
+/* 地点多到放不下时，胶囊里面可以左右滑动 */
+.wx-loc-bar { flex: 0 1 auto; min-width: 0; padding: 3px; border-radius: 999px; }
+.wx-loc-tabs { display: flex; align-items: center; gap: 2px; overflow-x: auto; scrollbar-width: none; border-radius: 999px; }
+.wx-loc-tabs::-webkit-scrollbar { display: none; }
+.wx-loc-tab { flex: none; display: inline-flex; align-items: center; border-radius: 999px; color: var(--ink-2); }
+.wx-loc-tab:hover { background: rgb(255 255 255 / .12); color: #fff; }
+.wx-loc-tab.active { background: rgb(255 255 255 / .94); color: oklch(.34 .09 var(--wx-h)); }
+.wx-loc-pick { padding: 5px 12px; border: 0; border-radius: 999px; background: none; color: inherit; font: inherit; font-size: 12.5px; font-weight: 500; cursor: pointer; }
+.wx-loc-tab.active .wx-loc-pick { font-weight: 600; }
+.wx-loc-del { width: 20px; height: 20px; margin: 0 6px 0 -8px; padding: 0; display: grid; place-items: center; border: 0; border-radius: 50%; background: none; color: inherit; opacity: .7; cursor: pointer; }
+.wx-loc-del:hover { opacity: 1; background: rgb(255 255 255 / .16); }
+.wx-loc-tab.active .wx-loc-del:hover { background: rgb(0 20 60 / .12); }
+.wx-loc-add { flex: none; display: inline-flex; align-items: center; gap: 5px; margin-left: 4px; padding: 5px 12px; border: 0; border-radius: 999px; background: none; color: var(--ink-2); font: inherit; font-size: 12.5px; font-weight: 500; cursor: pointer; }
+.wx-loc-add:hover { background: rgb(255 255 255 / .12); color: #fff; }
+.wx-loc-meta { flex: none; margin-left: auto; display: flex; align-items: center; gap: 8px; }
+
+/* "外观"按钮点开的小面板，跟其他面板用同一套液态玻璃，拖动条一动它自己也跟着变。
+   它浮在别的面板上面，后面常常有文字：模糊最少保留 10 像素，拖到 0 时小面板里的字也还看得清 */
+.wx-tune { position: relative; }
+.wx-glass-pop { position: absolute; z-index: 6; top: calc(100% + 10px); right: 0; width: 300px; padding: 13px 16px 12px; border-radius: 18px; text-shadow: 0 1px 2px rgb(10 18 40 / .35); }
+.wx-glass-pop::before { -webkit-backdrop-filter: blur(max(var(--glass-blur), 10px)) saturate(1.25); backdrop-filter: blur(max(var(--glass-blur), 10px)) saturate(1.25); }
+.wx-glass-pop h3 { margin: 0 0 8px; font-size: 12.5px; font-weight: 600; }
+.wx-pop-row { display: grid; grid-template-columns: 30px minmax(0, 1fr) 42px; align-items: center; gap: 10px; height: 28px; font-size: 12px; color: var(--ink-2); }
+.wx-pop-row input { width: 100%; margin: 0; accent-color: #fff; cursor: pointer; }
+.wx-pop-row output { text-align: right; color: #fff; font: 500 12px var(--font-mono); }
+.wx-pop-foot { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-top: 8px; padding-top: 10px; border-top: 1px solid var(--line); font-size: 11.5px; color: var(--ink-3); }
+.wx-pop-foot button { padding: 3px 10px; border: 1px solid rgb(255 255 255 / .22); border-radius: 999px; background: rgb(255 255 255 / .1); color: #fff; font: inherit; font-size: 11.5px; cursor: pointer; white-space: nowrap; }
+.wx-pop-foot button:hover { background: rgb(255 255 255 / .2); }
+
+/* --- 顶部展示区：左边直接把现在的天气写在天空上（不加底框），右边是头盔提醒 ---
+   大号气温和天气文字的字号跟着窗口宽度变（clamp 的三个值是 最小 / 随窗口宽度 / 最大）：窗口窄的时候字小一些，不会把一行挤成两行 */
+.wx-hero { display: grid; grid-template-columns: minmax(0, 1fr) minmax(320px, min(42%, 460px)); gap: 28px; align-items: end; padding: 4px 2px 2px 6px; }
+.wx-hero-now { min-width: 0; text-shadow: 0 1px 2px rgb(10 18 40 / .3), 0 0 22px rgb(10 18 40 / .22); }
+.wx-hero-addr { display: flex; align-items: baseline; flex-wrap: wrap; gap: 2px 14px; }
+.wx-hero-addr strong { font-size: 14px; font-weight: 500; letter-spacing: .01em; }
+.wx-hero-addr span { font-size: 12px; color: var(--ink-3); }
+.wx-hero-main { margin-top: 8px; display: flex; align-items: flex-end; gap: clamp(18px, 1.9vw, 30px); }
+.wx-hero-temp { flex: none; font-size: clamp(104px, 9.2vw, 164px); font-weight: 300; line-height: .8; letter-spacing: -.055em; margin-left: -4px; padding-bottom: 5px; }
+.wx-hero-temp sup { font-size: .34em; font-weight: 300; line-height: 1; letter-spacing: 0; vertical-align: top; position: relative; top: .16em; margin-left: .06em; }
+.wx-hero-copy { min-width: 0; padding-bottom: 6px; }
+.wx-hero-cond { display: flex; align-items: center; gap: 9px; font-size: clamp(18px, 1.5vw, 24px); font-weight: 500; line-height: 1.2; letter-spacing: .01em; }
+/* 图标大小跟着字号走，以这里为准（盖过组件上写的 size） */
+.wx-hero-cond svg { flex: none; width: 1.2em; height: 1.2em; }
+.wx-hero-sub { margin-top: 5px; display: flex; flex-wrap: wrap; gap: 2px 16px; font-size: 13px; color: var(--ink-2); }
+.wx-hero-say { margin: 12px 0 0; padding-top: 11px; border-top: 1px solid var(--line); font-size: clamp(14px, 1.1vw, 16px); font-weight: 500; line-height: 1.45; text-wrap: pretty; }
+.wx-hero-say2 { margin: 3px 0 0; font-size: 12.5px; line-height: 1.5; color: var(--ink-2); text-wrap: pretty; }
+
+/* 头盔提醒 */
+.wx-helmet { padding: 14px 16px 12px; }
+.wx-helmet-head { display: flex; align-items: flex-start; gap: 11px; }
+.wx-helmet-ico { flex: none; width: 34px; height: 34px; display: grid; place-items: center; border-radius: 10px; background: rgb(255 255 255 / .16); }
+.wx-helmet-copy { min-width: 0; flex: 1; }
+.wx-helmet-title { display: flex; align-items: center; flex-wrap: wrap; gap: 5px 9px; }
+.wx-helmet h2 { margin: 0; font-size: 14.5px; font-weight: 600; line-height: 1.35; }
+.wx-helmet-pill { padding: 2px 9px; border-radius: 999px; background: var(--warm); color: oklch(.3 .07 260); font-size: 11.5px; font-weight: 600; white-space: nowrap; }
+.wx-helmet.is-dry .wx-helmet-pill { background: oklch(.9 .12 145); color: oklch(.28 .07 155); }
+.wx-helmet.is-unknown .wx-helmet-pill { background: rgb(255 255 255 / .78); color: oklch(.3 .03 255); }
+.wx-helmet-detail { margin: 3px 0 0; font-size: 12px; line-height: 1.55; color: var(--ink-2); text-wrap: pretty; }
+.wx-helmet-line { margin-top: 12px; }
+.wx-helmet-line-head { display: flex; align-items: baseline; justify-content: space-between; margin-bottom: 6px; font-size: 12px; color: var(--ink-3); }
+.wx-helmet-line-head b { font-weight: 600; color: #fff; }
+/* 提醒时段的小格子：--n 是一共几格，--s 是这一格雨的强弱（0 ~ 1），越强颜色越实 */
+.wx-helmet-cells { display: grid; grid-template-columns: repeat(var(--n), minmax(0, 1fr)); gap: 3px; }
+.wx-helmet-cells > span { height: 16px; display: grid; place-items: center; border-radius: 4px; background: rgb(255 255 255 / .15); color: var(--ink-2); font-size: 12px; font-weight: 500; }
+.wx-helmet-cells > span.wet { background: color-mix(in oklab, var(--rain) calc(var(--s) * 100%), rgb(255 255 255 / .15)); color: oklch(.28 .06 250); font-weight: 600; }
+.wx-helmet-cells > span.uncovered { background: transparent; box-shadow: inset 0 0 0 1px rgb(255 255 255 / .3); opacity: .8; }
+.wx-helmet-cells.days > span { height: 28px; }
+.wx-helmet-axis { display: flex; justify-content: space-between; margin-top: 5px; font-size: 11px; color: var(--ink-3); }
+
+/* --- 预警：跟其他面板用同一套液态玻璃，只有前面的图标用暖黄色提醒 --- */
+.wx-alerts { display: flex; flex-direction: column; gap: 10px; }
+.wx-alert { display: flex; gap: 11px; padding: 11px 16px; }
+.wx-alert > svg { flex: none; margin-top: 1px; }
+.wx-alert-ico { color: var(--warm); }
+.wx-alert h3 { margin: 0; font-size: 13.5px; font-weight: 600; }
+.wx-alert p { margin: 3px 0 0; font-size: 12.5px; line-height: 1.6; color: var(--ink-2); }
+.wx-alert small { display: block; margin-top: 3px; font-size: 11.5px; color: var(--ink-3); }
+
+/* --- 24 小时 --- */
+.wx-hours { padding: 12px 0 4px; }
+.wx-hours-head { display: flex; align-items: center; justify-content: space-between; padding: 0 18px; }
+.wx-hours-legend { display: flex; gap: 16px; font-size: 12px; color: var(--ink-3); }
+.wx-hours-legend span { display: inline-flex; align-items: center; gap: 6px; }
+.wx-hours-legend i { display: inline-block; }
+.wx-hours-legend i.line { width: 18px; height: 2px; border-radius: 1px; background: #fff; }
+.wx-hours-legend i.bar { width: 6px; height: 12px; border-radius: 3px; background: var(--rain); }
+.wx-hours .wx-chart { margin-top: 8px; }
+/* 逐小时图（天气页 24 小时、首页卡片 12 小时共用） */
+.wx-chart { position: relative; width: 100%; }
+.wx-chart svg { display: block; width: 100%; }
+.wx-chart text { font-family: inherit; fill: #fff; }
+.wx-chart-empty { padding: 30px 20px; font-size: 13px; color: var(--ink-3); text-align: center; }
+.wx-c-temp { font-size: 12px; font-weight: 500; text-anchor: middle; }
+.wx-chart text.wx-c-rain { font-size: 10.5px; font-weight: 600; text-anchor: middle; fill: var(--rain); }
+.wx-c-hour { font-size: 11px; text-anchor: middle; fill-opacity: .62; }
+.wx-c-hour.strong { font-weight: 600; fill-opacity: 1; }
+.wx-c-bar { fill: #fff; fill-opacity: .22; }
+.wx-c-bar.wet { fill: var(--rain); fill-opacity: 1; }
+.wx-chart-tip { position: absolute; z-index: 3; pointer-events: none; padding: 7px 11px; border-radius: 9px; background: rgb(12 18 38 / .9); box-shadow: 0 6px 18px -6px rgb(0 0 0 / .5); font-size: 12px; line-height: 1.5; white-space: nowrap; transform: translate(-50%, -100%); }
+.wx-chart-tip b { display: block; font-weight: 600; }
+.wx-chart-tip span { opacity: .78; }
+
+/* --- 最下面一行：左边未来几天，右边 8 项实况 --- */
+.wx-duo { display: grid; grid-template-columns: minmax(0, 1.18fr) minmax(0, 1fr); gap: 14px; }
+/* 左右两块面板一样高：每天一行最矮 32 像素，面板比这更高时各行平分多出来的高度 */
+.wx-week { display: flex; flex-direction: column; padding: 12px 8px 8px; }
+.wx-week .wx-title { padding: 0 10px 5px; }
+.wx-drow { flex: 1 0 32px; display: grid; grid-template-columns: 38px 40px minmax(84px, 1.1fr) 50px 30px minmax(64px, 2fr) 30px; align-items: center; gap: 0 9px; padding: 0 10px; border-radius: 9px; font-size: 12.5px; }
+.wx-drow:hover { background: rgb(255 255 255 / .07); }
+.wx-drow + .wx-drow { box-shadow: 0 -1px 0 var(--line); }
+.wx-drow:hover, .wx-drow:hover + .wx-drow { box-shadow: none; }
+.wx-d-name { font-weight: 500; }
+.wx-drow.is-today .wx-d-name { font-weight: 700; }
+.wx-d-date { font-size: 11.5px; color: var(--ink-3); }
+.wx-d-sky { display: flex; align-items: center; gap: 7px; min-width: 0; white-space: nowrap; }
+.wx-d-sky svg { flex: none; }
+.wx-d-rain { display: inline-flex; align-items: center; gap: 4px; font-size: 11.5px; color: var(--ink-3); }
+.wx-d-rain.wet { color: var(--rain); font-weight: 600; }
+.wx-d-lo { text-align: right; color: var(--ink-2); }
+.wx-d-hi { font-weight: 600; }
+.wx-d-bar { position: relative; height: 6px; border-radius: 3px; background: var(--track); }
+.wx-d-bar i { position: absolute; top: 0; bottom: 0; border-radius: 3px; }
+
+.wx-metrics { padding: 12px 18px 6px; display: flex; flex-direction: column; }
+/* 一共两列。每一项里：名称和说明在左、数值在右；面板窄到一列放不下这三样时（见下面的 @container），改成 名称 / 数值 / 说明 从上到下三行 */
+.wx-metrics-grid { flex: 1; container: wx-metrics / inline-size; display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 0 24px; margin-top: 2px; }
+.wx-metric { min-width: 0; display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: center; align-content: center; gap: 0 10px; padding: 6px 0; border-top: 1px solid var(--line); }
+.wx-metric:nth-child(-n + 2) { border-top: 0; }
+.wx-metric-label { font-size: 12px; line-height: 1.3; color: var(--ink-3); white-space: nowrap; }
+.wx-metric-note { grid-column: 1; font-size: 11.5px; line-height: 1.35; color: var(--ink-2); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.wx-metric-value { grid-column: 2; grid-row: 1 / span 2; display: flex; align-items: baseline; gap: 0 5px; line-height: 1.25; white-space: nowrap; }
+.wx-metric-value b { font-size: 18px; font-weight: 500; letter-spacing: -.02em; }
+.wx-metric-value b.word { font-size: 14px; letter-spacing: 0; }
+.wx-metric-value i { font-size: 11.5px; font-style: normal; color: var(--ink-3); }
+@container wx-metrics (max-width: 540px) {
+  .wx-metric { grid-template-columns: minmax(0, 1fr); }
+  .wx-metric-value { grid-column: 1; grid-row: auto; margin: 1px 0; }
+}
+.wx-wind-arrow { align-self: center; width: 14px; height: 14px; }
+/* --tone 是空气质量等级对应的颜色 */
+.wx-aqi-dot { align-self: center; width: 8px; height: 8px; border-radius: 50%; background: var(--tone); }
+.wx-aqi-scale { position: relative; height: 4px; margin: 5px 0 1px; display: flex; gap: 2px; max-width: 150px; }
+.wx-aqi-scale > span { height: 100%; border-radius: 2px; opacity: .75; }
+.wx-aqi-scale > em { position: absolute; top: -3px; width: 10px; height: 10px; margin-left: -5px; border: 2px solid #fff; border-radius: 50%; background: var(--tone); }
+
+/* --- 天气数据还没回来时的占位（Weather.tsx 的 WeatherLoading）：排版跟正式页面一样，内容的位置先放淡色块 ---
+   .wx-bone 是一条淡色块；.wx-skel 包着的一组色块一起慢慢地明暗变化（动画加在外层，一块面板只动一层） */
+.wx-loading-tip { display: inline-flex; align-items: center; gap: 7px; }
+.wx-loading-tip .spinner { width: 11px; height: 11px; border-color: rgb(255 255 255 / .3); border-top-color: #fff; }
+.wx-bone { display: block; border-radius: 6px; background: rgb(255 255 255 / .2); }
+.wx-skel { pointer-events: none; animation: wx-skel-pulse 1.3s ease-in-out infinite alternate; }
+/* 大号气温的占位：宽高按字号算（em），跟着窗口宽度一起变 */
+.wx-skel-temp { width: 1.12em; height: .72em; border-radius: .1em; }
+.wx-skel-rows { flex: 1; display: flex; flex-direction: column; }
+/* 逐小时图的占位，全部用背景画，一共 24 列：上面一排圆点是天气图标，中间一条线是气温，下面一排短条是钟点。高度和外边距跟正式的图一致 */
+.wx-skel-chart {
+  height: 184px; margin: 8px 8px 0;
+  background:
+    radial-gradient(circle 7px at 50% 14px, rgb(255 255 255 / .22) 98%, transparent) 0 0 / calc(100% / 24) 28px repeat-x,
+    linear-gradient(rgb(255 255 255 / .26), rgb(255 255 255 / .26)) 50% 78px / calc(100% - 100% / 24) 2px no-repeat,
+    linear-gradient(90deg, transparent 22%, rgb(255 255 255 / .18) 22% 78%, transparent 78%) 0 166px / calc(100% / 24) 7px repeat-x;
+}
+@keyframes wx-skel-pulse { from { opacity: 1; } to { opacity: .45; } }
+@media (prefers-reduced-motion: reduce) { .wx-skel { animation: none; } }
+
+/* =====================================================================
+   首页的天气卡片（WeatherPanel.tsx 的 WeatherHomeCard）：整张卡片是一小片天空；
+   左边把现在的天气直接写在天空上，右边一块玻璃面板放 12 小时图和未来 5 天
+   ===================================================================== */
+.wxc {
+  position: relative; isolation: isolate; overflow: hidden;
+  height: 248px; display: grid; grid-template-columns: 340px minmax(0, 1fr);
+  border-radius: var(--radius-lg, 10px); background: #1c2a4a;
+}
+.wxc-sky { position: absolute; inset: 0; z-index: -2; }
+.wxc-now { min-width: 0; display: flex; flex-direction: column; padding: 13px 16px 12px 18px; text-shadow: 0 1px 2px rgb(10 18 40 / .3), 0 0 18px rgb(10 18 40 / .2); }
+/* 右边留出 58 像素不写字：太阳、月亮画在左栏的右上角（WeatherPanel.tsx 的 HOME_SKY） */
+.wxc-addr { display: flex; align-items: baseline; gap: 9px; padding-right: 58px; font-size: 12px; font-weight: 500; white-space: nowrap; }
+.wxc-addr strong { min-width: 0; overflow: hidden; text-overflow: ellipsis; font-weight: 500; }
+.wxc-addr span { flex: none; font-size: 11px; font-weight: 400; color: var(--ink-3); }
+.wxc-main { margin-top: 10px; display: flex; align-items: flex-end; gap: 13px; }
+.wxc-temp { flex: none; margin-left: -2px; font-size: 60px; font-weight: 300; line-height: .8; letter-spacing: -.05em; }
+.wxc-temp sup { position: relative; top: .14em; margin-left: .05em; font-size: .36em; line-height: 1; letter-spacing: 0; vertical-align: top; }
+.wxc-copy { min-width: 0; padding-bottom: 0; }
+.wxc-cond { display: flex; align-items: center; gap: 6px; font-size: 14px; font-weight: 500; white-space: nowrap; }
+.wxc-cond svg { flex: none; }
+.wxc-sub { margin-top: 2px; display: flex; gap: 9px; font-size: 11.5px; color: var(--ink-2); white-space: nowrap; }
+.wxc-say { margin: 10px 0 0; display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2; overflow: hidden; font-size: 12.5px; font-weight: 500; line-height: 1.45; }
+.wxc-alert { margin-top: 7px; display: flex; align-items: center; gap: 7px; padding: 5px 10px; border: 0; border-radius: 12px; background: none; color: inherit; font: inherit; font-size: 12px; font-weight: 600; text-shadow: none; text-align: left; }
+button.wxc-alert { cursor: pointer; }
+.wxc-alert svg { flex: none; }
+.wxc-alert span { flex: 1; min-width: 0; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
+.wxc-alert em { flex: none; font-style: normal; color: var(--ink-2); }
+.wxc-alert.is-unavailable { font-weight: 500; color: var(--ink-2); }
+.wxc-helmet { margin-top: auto; display: flex; align-items: center; gap: 10px; padding: 8px 11px 7px 9px; border-radius: 14px; text-shadow: none; }
+.wxc-helmet .wx-helmet-ico { width: 32px; height: 32px; border-radius: 9px; }
+.wxc-helmet-copy { flex: 1; min-width: 0; }
+.wxc-helmet-copy > b { display: block; margin-bottom: 5px; font-size: 12px; font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.wxc-helmet .wx-helmet-cells > span { height: 7px; border-radius: 2px; }
+.wxc-helmet .wx-helmet-axis { margin-top: 3px; font-size: 10.5px; }
+.wxc-side { min-width: 0; margin: 10px 10px 10px 0; display: flex; flex-direction: column; border-radius: 18px; }
+.wxc-side-head { display: flex; align-items: center; justify-content: space-between; padding: 8px 8px 0 16px; }
+.wxc-side-head h3 { margin: 0; font-size: 12px; font-weight: 600; }
+.wxc-actions { display: flex; gap: 6px; }
+.wxc-actions .wx-btn { padding: 3px 9px; font-size: 11.5px; }
+.wxc-actions .wx-btn.ico { padding: 3px 6px; }
+.wxc-plot { flex: 1; min-height: 0; display: flex; align-items: center; }
+/* 每天一列，各列一样宽。面板窄到一列放不下一天的内容时（见下面的 @container），只留前 4 天 */
+.wxc-days { container: wxc-days / inline-size; display: grid; grid-auto-flow: column; grid-auto-columns: minmax(0, 1fr); border-top: 1px solid var(--line); }
+.wxc-days-empty { height: 36px; display: grid; place-items: center; border-top: 1px solid var(--line); font-size: 12px; color: var(--ink-3); }
+.wxc-day { height: 36px; display: flex; align-items: center; justify-content: center; gap: 5px; font-size: 12px; white-space: nowrap; }
+@container wxc-days (max-width: 600px) {
+  .wxc-day:nth-child(n + 5) { display: none; }
+}
+.wxc-day + .wxc-day { box-shadow: -1px 0 0 var(--line); }
+.wxc-day b { font-weight: 500; }
+.wxc-day.is-today b { font-weight: 700; }
+.wxc-day svg { flex: none; }
+.wxc-day strong { font-weight: 600; }
+.wxc-day em { font-style: normal; color: var(--ink-3); }
