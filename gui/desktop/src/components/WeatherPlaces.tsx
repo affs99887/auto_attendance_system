@@ -9,7 +9,7 @@ import {
   searchWeatherLocations,
   type WeatherLocation,
 } from '../lib/weatherLocations';
-import { resolveSkyKind, skyTone, type SkyOptions } from '../lib/sky';
+import { resolveSkyKind, type SkyOptions } from '../lib/sky';
 import { appAlert, appConfirm } from '../lib/dialog';
 import {
   EMPTY_WEATHER_ENTRY,
@@ -17,7 +17,7 @@ import {
   useWeatherStore,
   type WeatherEntry,
 } from '../store/weather';
-import { WeatherSky } from './WeatherSky';
+import { useSunLight, WeatherSky } from './WeatherSky';
 import { useNow } from './WeatherPanel';
 
 // 卡片很矮：云层放大 3 倍，只露出靠上的一段；太阳、月亮放在卡片右上角外面，卡片里只看得到它的光。
@@ -71,8 +71,9 @@ export const PlaceCard = React.memo(function PlaceCard({
   onDelete: (location: WeatherLocation) => void;
 }) {
   const data = entry.data;
-  // 还没拿到数据时先用阴天的天空垫着
-  const kind = resolveSkyKind(data?.realtime.skycon ?? 'CLOUDY', now);
+  // 天色按这个地点自己的时间算：别的地方可能已经天黑、或者还没天亮。还没拿到数据时先用阴天的天空垫着
+  const sun = useSunLight(location.latitude, location.longitude, now);
+  const kind = resolveSkyKind(data?.realtime.skycon ?? 'CLOUDY', sun);
   const today = data?.daily[0];
   const alert = data?.alerts[0];
   const isDefault = location.id === DEFAULT_WEATHER_LOCATION.id;
@@ -89,10 +90,9 @@ export const PlaceCard = React.memo(function PlaceCard({
   return (
     <div
       className={`wxl-card${active ? ' active' : ''}${deletable ? ' deletable' : ''}${bare ? ' is-bare' : ''}`}
-      data-tone={skyTone(kind)}
       data-place-id={location.id}
     >
-      {!bare && <WeatherSky kind={kind} options={CARD_SKY} className="wxl-sky" />}
+      {!bare && <WeatherSky kind={kind} sun={sun} options={CARD_SKY} className="wxl-sky" />}
       <button
         type="button"
         className="wxl-pick"

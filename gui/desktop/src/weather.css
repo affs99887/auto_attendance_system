@@ -3,12 +3,9 @@
 
 /* --glass-blur 是玻璃面板的模糊程度，--glass-k 是面板底色的浓淡倍数（1 是原样）：
    两个值由天气页"外观"里的拖动条决定，App.tsx 把它们写在 .desktop 上。
-   data-tone 是当前天空的色调；--wx-h 是这个色调对应的色相，选中的地点标签用它配文字颜色；--side 是侧栏那片磨砂玻璃上盖的颜色 */
+   跟着天空颜色变的几个值也由 App.tsx 写在 .desktop 上（lib/sky.ts 的 skyToneStyle 按天气和时段算）：
+   --wx-h 是天空的色相，选中的地点标签用它配文字颜色；--side 是侧栏那片磨砂玻璃上盖的颜色。下面是还没算出来时的默认值 */
 .desktop { --wx-h: 250; --side: oklch(.34 .09 256 / .34); }
-.desktop[data-tone='grey'] { --wx-h: 252; --side: oklch(.3 .02 255 / .3); }
-.desktop[data-tone='storm'] { --wx-h: 258; --side: oklch(.22 .035 262 / .3); }
-.desktop[data-tone='night'] { --wx-h: 272; --side: rgb(255 255 255 / .05); }
-.desktop[data-tone='warm'] { --wx-h: 70; --side: oklch(.32 .035 70 / .3); }
 
 /* =====================================================================
    天空背景（由 lib/sky.ts 生成图层，这里管每一层怎么摆、怎么动）
@@ -19,6 +16,8 @@
 .wx-sky.is-entering { animation: wx-sky-in .72s ease both; }
 .wx-sky > *, .wx-sky-wrap > *, .wx-sky-fall-wrap > *, .wx-sky-sway > *, .wx-sky-night > * { position: absolute; pointer-events: none; }
 .wx-sky-fill, .wx-sky-night { inset: 0; }
+/* 放给云上色的滤镜，本身不占位置 */
+.wx-sky-defs { width: 0; height: 0; overflow: hidden; }
 .wx-sky-stars { display: block; inset: 0; width: 100%; height: 100%; }
 .wx-sky-star {
   width: var(--s); height: var(--s); margin: calc(var(--s) / -2) 0 0 calc(var(--s) / -2); border-radius: 50%;
@@ -34,10 +33,11 @@
   -webkit-mask-image: radial-gradient(circle, #000 0, rgb(0 0 0 / .55) 14%, transparent 52%); mask-image: radial-gradient(circle, #000 0, rgb(0 0 0 / .55) 14%, transparent 52%);
   animation: wx-sky-spin 320s linear infinite;
 }
+/* 太阳的几圈颜色由 lib/sky.ts 按时段写进来：中午是白的，日出日落前后偏金黄、橙红 */
 .wx-sky-sun {
   width: 48px; height: 48px; margin: -24px 0 0 -24px; border-radius: 50%;
-  background: radial-gradient(circle, #fff 0 46%, rgb(255 251 236 / .92) 62%, rgb(255 246 218 / 0) 100%);
-  box-shadow: 0 0 26px 10px rgb(255 248 226 / .7), 0 0 90px 40px rgb(255 240 200 / .32), 0 0 220px 110px rgb(255 236 190 / .14);
+  background: radial-gradient(circle, rgb(var(--sun-core, 255 255 255)) 0 46%, rgb(var(--sun-rim, 255 251 236) / .92) 62%, rgb(var(--sun-edge, 255 246 218) / 0) 100%);
+  box-shadow: 0 0 26px 10px rgb(var(--sun-halo1, 255 248 226) / .7), 0 0 90px 40px rgb(var(--sun-halo2, 255 240 200) / .32), 0 0 220px 110px rgb(var(--sun-halo3, 255 236 190) / .14);
 }
 .wx-sky-moon {
   width: 76px; height: 76px; margin: -38px 0 0 -38px; border-radius: 50%; background-size: 100% 100%;
@@ -110,21 +110,18 @@
   --ink-2: rgb(255 255 255 / .8);
   --ink-3: rgb(255 255 255 / .68);
   --line: rgb(255 255 255 / .13);
-  /* 玻璃面板上盖的一层很淡的颜色：白天用比天空深一档的同色，夜里用很淡的白，保证白色的文字在哪种天气上都看得清。
-     --glass-c 是颜色，--glass-a 是原本的浓度，再乘上"外观"里调的倍数 --glass-k 才是最后盖上去的颜色 --glass */
-  --glass-c: oklch(.3 .09 256); --glass-a: .3;
+  /* 玻璃面板上盖的一层很淡的颜色：白天用比天空深一档的同色，日出日落前后偏紫红，夜里用很淡的白，保证白色的文字在哪种天气、哪个时段都看得清。
+     --glass-c 是颜色，--glass-a 是原本的浓度，再乘上"外观"里调的倍数 --glass-k 才是最后盖上去的颜色 --glass。
+     颜色和浓度由 lib/sky.ts 的 skyToneStyle 算好，写在 .desktop（天气页）或 .wxc（首页卡片）上，这里是还没算出来时的默认值 */
+  --glass-c: var(--sky-glass-c, oklch(.3 .09 256)); --glass-a: var(--sky-glass-a, .3);
   --glass: color-mix(in oklab, var(--glass-c) calc(var(--glass-a) * var(--glass-k) * 100%), transparent);
-  --track: rgb(4 18 46 / .26);
+  --track: var(--sky-track, rgb(4 18 46 / .26));
   /* 跟雨有关的标记统一用这个浅青色；头盔提醒里"有雨"的标签和预警图标用暖黄 */
   --rain: oklch(.88 .085 222);
   --warm: oklch(.9 .13 90);
   color: #fff;
   font-variant-numeric: tabular-nums;
 }
-.desktop[data-tone='grey'] .wx-page, .wxc[data-tone='grey'] { --glass-c: oklch(.27 .02 255); --glass-a: .26; --track: rgb(10 16 28 / .28); }
-.desktop[data-tone='storm'] .wx-page, .wxc[data-tone='storm'] { --glass-c: oklch(.2 .035 262); --glass-a: .28; --track: rgb(6 12 30 / .3); }
-.desktop[data-tone='night'] .wx-page, .wxc[data-tone='night'] { --glass-c: #fff; --glass-a: .04; --track: rgb(255 255 255 / .1); }
-.desktop[data-tone='warm'] .wx-page, .wxc[data-tone='warm'] { --glass-c: oklch(.3 .035 70); --glass-a: .26; --track: rgb(40 28 10 / .26); }
 
 .wx-page { display: flex; flex-direction: column; gap: 14px; max-width: 1400px; margin: -6px auto -2px; }
 .wx-title { margin: 0; font-size: 13px; font-weight: 600; }

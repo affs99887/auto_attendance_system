@@ -23,9 +23,10 @@ import { ModeQuickToggle } from './components/ModeQuickToggle';
 import { SystemBanners } from './components/SystemBanners';
 import { ServiceControls } from './components/ServiceControls';
 import { SidebarFxWidget } from './components/SidebarFxWidget';
-import { WeatherSky } from './components/WeatherSky';
-import { resolveSkyKind, skyTone, type SkyKind } from './lib/sky';
-import { selectActiveWeatherEntry, useWeatherStore } from './store/weather';
+import { useSunLight, WeatherSky } from './components/WeatherSky';
+import { resolveSkyKind, skyToneStyle, type SkyKind } from './lib/sky';
+import type { SunLight } from './lib/sun';
+import { selectActiveWeatherEntry, selectActiveWeatherLocation, useWeatherStore } from './store/weather';
 import { useWeatherGlassStore } from './store/weatherGlass';
 import { useSystemStore } from './store/system';
 
@@ -61,6 +62,8 @@ interface AppContextValue {
   clock: Date;
   /** 当前选中地点的天气对应哪一种天空，天气页的整屏背景和面板上的雨雪效果都按它来 */
   weatherKind: SkyKind;
+  /** 当前选中地点此刻的太阳位置，天空按它换时段的颜色 */
+  weatherSun: SunLight;
   /** 天气页是不是正在显示"全部地点"，见 WeatherPlacesMode */
   weatherPlaces: WeatherPlacesMode;
   setWeatherPlaces: (mode: WeatherPlacesMode) => void;
@@ -135,10 +138,10 @@ export const WEATHER_SHELL_TRANSITION_MS = 620;
 const PLACES_SETTLE_MS = 1400;
 
 /** 天气页的整屏背景。只有进入天气页（含进出的过渡期间）才把天空放进来，平时不占显存 */
-const WeatherThemeBackdrop = React.memo(function WeatherThemeBackdrop({ kind, active }: { kind: SkyKind; active: boolean }) {
+const WeatherThemeBackdrop = React.memo(function WeatherThemeBackdrop({ kind, sun, active }: { kind: SkyKind; sun: SunLight; active: boolean }) {
   return (
     <div className="weather-theme-stack" aria-hidden="true">
-      {active && <WeatherSky kind={kind} className="weather-theme-sky" />}
+      {active && <WeatherSky kind={kind} sun={sun} className="weather-theme-sky" />}
     </div>
   );
 });
@@ -256,22 +259,18 @@ export function App() {
   const setHeadless = (v: boolean) => { void setMode({ selenium_headless: v }); };
   const [opState, setOpState] = React.useState<OpState>({ running: false, type: null, perUser: {} });
   const weatherEntry = useWeatherStore(selectActiveWeatherEntry);
+  const weatherLocation = useWeatherStore(selectActiveWeatherLocation);
   const weatherSkycon = weatherEntry.data?.realtime.skycon;
   const glassBlur = useWeatherGlassStore(s => s.blur);
   const glassTint = useWeatherGlassStore(s => s.tint);
 
-  // 天气代码变了、或者钟点变了（白天和夜晚用的天空不一样），重新决定用哪一种天空；还没拿到数据时保持原样。
+  // 天气代码变了、或者太阳位置变了（夜里和白天用的云图不一样），重新决定用哪一种天空；这个地点还没拿到数据时沿用上一次的天气。
   // 在渲染时直接算出来：切换地点的同一次渲染里整屏天空就是新地点的，不会先露出上一个地点的天空
-  const clockHour = clock.getHours();
-  const lastWeatherKind = React.useRef<SkyKind | null>(null);
-  const weatherKind = React.useMemo<SkyKind>(() => (
-    weatherSkycon || !lastWeatherKind.current
-      ? resolveSkyKind(weatherSkycon, new Date())
-      : lastWeatherKind.current
-  // clockHour 只用来在整点重算（白天、夜晚的天空不同）
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  ), [weatherSkycon, clockHour]);
-  lastWeatherKind.current = weatherKind;
+  const weatherSun = useSunLight(weatherLocation.latitude, weatherLocation.longitude, clock);
+  const lastSkycon = React.useRef<string | null>(null);
+  if (weatherSkycon) lastSkycon.current = weatherSkycon;
+  const weatherKind = resolveSkyKind(weatherSkycon || lastSkycon.current, weatherSun);
+  const toneStyle = React.useMemo(() => skyToneStyle(weatherKind, weatherSun), [weatherKind, weatherSun]);
 
   React.useEffect(() => { void useWeatherGlassStore.getState().hydrate(); }, []);
 
@@ -372,6 +371,7 @@ export function App() {
     sysStatus,
     clock,
     weatherKind,
+    weatherSun,
     weatherPlaces,
     setWeatherPlaces,
   };
@@ -386,15 +386,14 @@ export function App() {
     <AppCtx.Provider value={ctxValue}>
       <div
         className="desktop"
-        data-tone={skyTone(weatherKind)}
         data-immersive={weatherShellVisible ? 'on' : 'off'}
         data-weather-transition={weatherShellPhase}
         data-places={weatherPlaces === 'off' ? undefined : weatherPlaces}
         data-places-switch={placesSwitching ? 'on' : undefined}
-        style={{ '--glass-blur': `${glassBlur}px`, '--glass-k': glassTint / 100 } as React.CSSProperties}
+        style={{ ...toneStyle, '--glass-blur': `${glassBlur}px`, '--glass-k': glassTint / 100 } as React.CSSProperties}
       >
         <div className="win">
-          <WeatherThemeBackdrop kind={weatherKind} active={weatherShellPhase !== 'off' && (weatherPlaces !== 'on' || placesSwitching)} />
+          <WeatherThemeBackdrop kind={weatherKind} sun={weatherSun} active={weatherShellPhase !== 'off' && (weatherPlaces !== 'on' || placesSwitching)} />
           <TitleBar />
           <div className="shell">
             <Sidebar

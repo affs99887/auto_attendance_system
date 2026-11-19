@@ -12,9 +12,9 @@ import {
   type HelmetRainAdvice,
   type WeatherIconKind,
 } from '../lib/weather';
-import { resolveSkyKind, skyTone, type SkyOptions } from '../lib/sky';
+import { resolveSkyKind, skyToneStyle, type SkyOptions } from '../lib/sky';
 import { GlassPanel, usePanelFall } from './GlassPanel';
-import { WeatherSky } from './WeatherSky';
+import { useSunLight, WeatherSky } from './WeatherSky';
 
 type SvgProps = Omit<React.SVGProps<SVGSVGElement>, 'children'>;
 
@@ -399,7 +399,9 @@ export function WeatherHomeCard({
   onOpenDetails?: () => void;
 }) {
   const now = useNow(60_000);
-  const kind = resolveSkyKind(data.realtime.skycon, now);
+  const sun = useSunLight(data.location.latitude, data.location.longitude, now);
+  const kind = resolveSkyKind(data.realtime.skycon, sun);
+  const toneStyle = React.useMemo(() => skyToneStyle(kind, sun), [kind, sun]);
   usePanelFall(kind);
 
   const current = data.realtime;
@@ -419,8 +421,8 @@ export function WeatherHomeCard({
   );
 
   return (
-    <section className="wxc" data-tone={skyTone(kind)} aria-busy={loading}>
-      <WeatherSky kind={kind} options={HOME_SKY} className="wxc-sky" />
+    <section className="wxc" style={toneStyle as React.CSSProperties} aria-busy={loading}>
+      <WeatherSky kind={kind} sun={sun} options={HOME_SKY} className="wxc-sky" />
 
       <div className="wxc-now">
         <div className="wxc-addr">

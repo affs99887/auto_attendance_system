@@ -25,6 +25,7 @@ import {
 import { DEFAULT_WEATHER_LOCATION, type WeatherLocation } from '../lib/weatherLocations';
 import { appConfirm } from '../lib/dialog';
 import { resolveSkyKind, skyBase, warmSkyTextures, type SkyKind } from '../lib/sky';
+import { sunAt, type SunLight } from '../lib/sun';
 import { GlassPanel, usePanelFall } from '../components/GlassPanel';
 import { PlaceCard, WeatherPlaces } from '../components/WeatherPlaces';
 import {
@@ -505,8 +506,9 @@ interface Zoom {
   dir: 'collapse' | 'expand';
   /** 收进去 / 放出来的那张卡片对应的地点 */
   id: string;
-  /** 底色用哪种天气的 */
+  /** 底色用哪种天气、哪个时段的 */
   kind: SkyKind;
+  sun: SunLight;
   phase: 'cover' | 'move' | 'reveal';
   /** 收拢开始时页面滚到了哪里 */
   scrollTop: number;
@@ -534,7 +536,7 @@ function prefersReducedMotion(): boolean {
 }
 
 export function WeatherScreen() {
-  const { setScreen, weatherKind, setWeatherPlaces } = useApp();
+  const { setScreen, weatherKind, weatherSun, setWeatherPlaces } = useApp();
   const startupStatus = useStartupStore(s => s.status);
   const startupReason = useStartupStore(s => s.reason);
   const location = useWeatherStore(selectActiveWeatherLocation);
@@ -574,33 +576,36 @@ export function WeatherScreen() {
     if (zoom) return;
     const content = rootRef.current?.parentElement;
     if (content && !prefersReducedMotion()) {
-      setZoom({ dir: 'collapse', id: activeLocationId, kind: weatherKind, phase: 'cover', scrollTop: content.scrollTop });
+      setZoom({ dir: 'collapse', id: activeLocationId, kind: weatherKind, sun: weatherSun, phase: 'cover', scrollTop: content.scrollTop });
       return;
     }
     setWeatherPlaces('on');
     setView('places');
     if (content) content.scrollTop = 0;
-  }, [zoom, activeLocationId, weatherKind, setWeatherPlaces]);
+  }, [zoom, activeLocationId, weatherKind, weatherSun, setWeatherPlaces]);
 
   const openLocation = React.useCallback(async (id: string) => {
     if (zoom) return;
     const rect = placeCard(id)?.getBoundingClientRect();
     await setActiveLocation(id);
-    // 底色跟 App 选天空的算法一致：有这个地点的天气就按它算，没有就沿用现在的
-    const skycon = useWeatherStore.getState().entries[id]?.data?.realtime.skycon;
-    const kind = skycon ? resolveSkyKind(skycon, new Date()) : weatherKind;
+    // 底色跟 App 选天空的算法一致：按这个地点此刻的太阳位置和它的天气算，还没有它的天气就沿用现在的
+    const state = useWeatherStore.getState();
+    const target = state.locations.find(item => item.id === id);
+    const sun = target ? sunAt(target.latitude, target.longitude, new Date()) : weatherSun;
+    const skycon = state.entries[id]?.data?.realtime.skycon;
+    const kind = skycon ? resolveSkyKind(skycon, sun) : weatherKind;
     const content = rootRef.current?.parentElement;
     if (content && rect && !prefersReducedMotion()) {
       cardBoxRef.current = { left: rect.left, top: rect.top, width: rect.width, height: rect.height };
       skyReadyAtRef.current = performance.now() + WEATHER_SHELL_TRANSITION_MS;
       setWeatherPlaces('closing');
-      setZoom({ dir: 'expand', id, kind, phase: 'cover', scrollTop: 0 });
+      setZoom({ dir: 'expand', id, kind, sun, phase: 'cover', scrollTop: 0 });
       return;
     }
     setWeatherPlaces('off');
     setView('page');
     if (content) content.scrollTop = 0;
-  }, [zoom, setActiveLocation, weatherKind, setWeatherPlaces]);
+  }, [zoom, setActiveLocation, weatherKind, weatherSun, setWeatherPlaces]);
 
   // 动画期间把侧栏、标题栏、工具栏抬到动画层上面（样式见 weather.css 的 data-weather-zoom），边框上的字一直看得见
   const zooming = zoom !== null;
@@ -875,7 +880,7 @@ export function WeatherScreen() {
   return (
     <div className="wx-view" ref={rootRef}>
       <div className={`wx-stage${zoom ? ' is-zooming' : ''}`} ref={stageRef} aria-hidden={zoom ? true : undefined}>
-        {zoom && <div className="wx-stage-back" ref={backRef} style={{ background: skyBase(zoom.kind) }} />}
+        {zoom && <div className="wx-stage-back" ref={backRef} style={{ background: skyBase(zoom.kind, zoom.sun) }} />}
         <div className="wx-stage-box" ref={boxRef}>{page}</div>
         {zoom && zoomLocation && (
           <div className="wx-stage-card" ref={cardFaceRef}>
