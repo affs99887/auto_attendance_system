@@ -259,16 +259,19 @@ function WeatherLocationRow({
     };
   }, [locations.length]);
 
-  // 选中的地点被挡在外面时，滑到能看见它
+  // 选中的地点被挡在外面时，滑到能看见它。页面刚出来时直接摆好不滑：一进来标签条就在动，看着像页面跳了一下
+  const tabsPlaced = React.useRef(false);
   React.useEffect(() => {
     const el = tabsRef.current;
     const tab = el?.querySelector<HTMLElement>('.wx-loc-tab.active');
     if (!el || !tab) return;
+    const behavior: ScrollBehavior = tabsPlaced.current ? 'smooth' : 'auto';
+    tabsPlaced.current = true;
     const margin = 28;
     if (tab.offsetLeft < el.scrollLeft + margin) {
-      el.scrollTo({ left: tab.offsetLeft - margin, behavior: 'smooth' });
+      el.scrollTo({ left: tab.offsetLeft - margin, behavior });
     } else if (tab.offsetLeft + tab.offsetWidth > el.scrollLeft + el.clientWidth - margin) {
-      el.scrollTo({ left: tab.offsetLeft + tab.offsetWidth - el.clientWidth + margin, behavior: 'smooth' });
+      el.scrollTo({ left: tab.offsetLeft + tab.offsetWidth - el.clientWidth + margin, behavior });
     }
   }, [activeLocationId, locations.length]);
 
@@ -317,7 +320,7 @@ function WeatherLocationRow({
       <div className="wx-loc-meta">
         <button type="button" className="wx-btn" title="刷新当前地点天气" aria-label="刷新当前地点天气" disabled={loading} onClick={onRefresh}>
           <span className={loading ? 'spin-ic' : ''}><Icon.Refresh size={13} /></span>
-          {loading ? '刷新中' : '刷新'}
+          <span className="wx-btn-swap" data-on={loading ? 'busy' : 'idle'}><span>刷新</span><span>刷新中</span></span>
         </button>
         <button type="button" className="wx-btn" onClick={onOpenSettings}><Icon.Settings size={13} />设置</button>
         <GlassTuneControl />

@@ -95,6 +95,12 @@
 .wx-btn:hover:not(:disabled) { background: color-mix(in oklab, var(--glass), #fff 16%); border-color: rgb(255 255 255 / .36); }
 .wx-btn:disabled { cursor: default; opacity: .7; }
 .wx-btn .spin-ic, .wx-btn > span { display: inline-flex; }
+/* 按钮上的字在两种说法之间换（刷新 / 刷新中）：两种叠在同一格里只显示一种，按钮宽度按长的那种留好，
+   换字时旁边的地点标签条和按钮都不挪 */
+.wx-btn > .wx-btn-swap { display: inline-grid; }
+.wx-btn-swap > span { grid-area: 1 / 1; }
+.wx-btn-swap[data-on='idle'] > span:last-child,
+.wx-btn-swap[data-on='busy'] > span:first-child { visibility: hidden; }
 
 /* =====================================================================
    天气页（screens/Weather.tsx）
@@ -366,9 +372,13 @@ button.wxc-alert { cursor: pointer; }
 .wx-stage.is-zooming .wx-stage-box { display: block; position: absolute; overflow: hidden; box-sizing: border-box; }
 .wx-stage-back { position: absolute; inset: 0; }
 .wx-stage-card { position: absolute; left: 0; top: 0; }
-/* 三层各自单独交给显卡：动画层每帧变位置、变大小时，里面只是整层挪动和裁剪，不用把整页重画一遍 */
-.wx-stage.is-zooming > * { will-change: transform, opacity; }
+/* 三层各自单独交给显卡：动画层每帧变位置、变大小时，里面只是整层挪动和裁剪，不用把整页重画一遍。
+   不写 will-change: opacity：带着它，页面里的磨砂玻璃面板取不到后面的天空、没有模糊，动画一结束才突然糊上，整页像跳了一下 */
+.wx-stage.is-zooming > * { will-change: transform; }
+/* 动画层里的卡片只留字，阴影、边线、左侧压暗都不画：动画层比卡片大时，这些会成为一个卡片大小的框跟着移动 */
 .wxl-card.is-bare { box-shadow: none; }
+.wxl-card.is-bare::after { content: none; }
+.wxl-card.is-bare .wxl-pick { background: none; }
 .desktop[data-weather-zoom] .titlebar { z-index: 2; }
 .desktop[data-weather-zoom] .sidebar,
 .desktop[data-weather-zoom] .toolbar { position: relative; z-index: 4; }

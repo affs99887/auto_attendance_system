@@ -1733,6 +1733,9 @@ input[type='date']::-webkit-calendar-picker-indicator { cursor: pointer; opacity
 }
 .desktop[data-immersive='on'] .weather-theme-stack,
 .desktop[data-places='closing'] .weather-theme-stack { opacity: 1; }
+/* 从"全部地点"往天气页放大的头一段（closing），边框和内容区还是不透明的普通背景、把天空整个挡着，天空直接铺好不淡入：
+   边框接着换成磨砂玻璃时，透出来的就是完整的天空；要是天空还在淡入，透出来的是半透明天空压着浅色窗口底，白色的字看不清 */
+.desktop[data-places='closing'] .weather-theme-stack { transition: none; }
 
 @keyframes weather-route-content-in { from { opacity: .72; } }
 
@@ -1742,17 +1745,31 @@ input[type='date']::-webkit-calendar-picker-indicator { cursor: pointer; opacity
   will-change: opacity;
   animation: weather-route-content-in .62s cubic-bezier(.22,.61,.36,1);
 }
-/* 天气页和"全部地点"互相切换（data-places-switch）时，侧栏、标题栏、工具栏的底色慢慢换；
-   字的颜色在底色换到一半左右时很快翻过去：字和底色一起慢慢变的话，中间会有一段灰字压灰底、几乎看不见。
-   底色的过渡先快后慢，开头 80 毫秒左右就换过一半，所以字在 30 到 130 毫秒之间翻。
-   内容区那时被一层底色盖着，.main 的背景直接换 */
+/* 天气页和"全部地点"互相切换（data-places-switch）时，侧栏、标题栏、工具栏的底色慢慢换（先快后慢）。
+   内容区的背景（.main、.content）不加过渡：换的那一刻要么被动画层的底色盖着，要么换前换后看起来一样 */
 .desktop[data-places-switch='on'] :where(.titlebar, .toolbar, .sidebar),
 .desktop[data-places-switch='on'] :where(.titlebar, .toolbar, .sidebar) * {
   transition: background-color .62s cubic-bezier(.22,.61,.36,1),
     border-color .62s cubic-bezier(.22,.61,.36,1),
-    color .1s linear .03s,
     box-shadow .62s ease;
 }
+/* 字的颜色不渐变，等底色变到深浅居中时一下子翻过去：渐变的话中间有一段灰字压灰底，几乎看不见。
+   换回普通背景（data-places='on'）时底色变浅得快，字早点翻；换成天气背景（arriving）时晚点翻，时间见 --ink-flip。
+   只给自己定了字色的元素加：跟着上一级走字色的（导航项里的文字、图标）要是也带着过渡，会等上一级翻完才开始翻，晚一大截 */
+.desktop[data-places-switch='on'] :where(
+  .titlebar-app, .titlebar-title, .tb-ver, .win-btn, .toolbar-title, .toolbar-sub, .clock, .toolbar .btn,
+  .side-label, .side-item, .side-ico, .side-badge, .side-fx, .side-fx-title, .side-fx-title svg, .side-fx-foot,
+  .side-fx-empty, .side-fx-refresh, .side-fx-tabs .tab-btn, .svc, .svc-head-main, .svc-head-sub, .svc-act
+) {
+  transition: background-color .62s cubic-bezier(.22,.61,.36,1),
+    border-color .62s cubic-bezier(.22,.61,.36,1),
+    box-shadow .62s ease,
+    color 0s linear var(--ink-flip, 0s);
+}
+.desktop[data-places='on'] { --ink-flip: 70ms; }
+.desktop[data-places='arriving'] { --ink-flip: 200ms; }
+/* 收进"全部地点"时动画层的上边很快扫过工具栏，它后面一下子变成浅色的内容区背景，所以工具栏的字比侧栏、标题栏早一点翻 */
+.desktop[data-places='on'] .toolbar { --ink-flip: 60ms; }
 .desktop[data-weather-transition='leaving'] :where(
   .titlebar, .toolbar, .main, .sidebar, .clock, .side-fx, .svc
 ) {
@@ -1764,8 +1781,9 @@ input[type='date']::-webkit-calendar-picker-indicator { cursor: pointer; opacity
 .desktop[data-immersive='on'] .titlebar,
 .desktop[data-immersive='on'] .toolbar { background: transparent; border-color: rgba(255,255,255,.14); }
 .desktop[data-immersive='on'] .main { background: transparent; }
-/* 从"全部地点"回天气页的路上，边框先换成天气页的样子，内容区还留着普通背景 */
-.desktop[data-places='arriving'] .main { background: var(--bg-base); }
+/* 从"全部地点"回天气页的路上，边框先换成天气页的样子，内容区还留着普通背景。
+   背景放在 .content 上不放在 .main 上：工具栏也在 .main 里，它后面要透出天空 */
+.desktop[data-places='arriving'] .content { background: var(--bg-base); }
 /* 侧栏是一整片磨砂玻璃：背景模糊后再盖一层颜色（--side，随天空色调变），白色的文字压在亮云上也看得清 */
 .desktop[data-immersive='on'] .sidebar { background: var(--side); -webkit-backdrop-filter: blur(22px) saturate(1.3); backdrop-filter: blur(22px) saturate(1.3); border-right-color: rgba(255,255,255,.16); box-shadow: inset -1px 0 0 rgba(255,255,255,.06); }
 .desktop[data-immersive='on'] .sidebar,
