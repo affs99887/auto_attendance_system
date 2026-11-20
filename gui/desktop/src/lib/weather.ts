@@ -254,15 +254,10 @@ function windowTimeLabel(epoch: number): string {
   return `${date.getUTCMonth() + 1}/${date.getUTCDate()} ${String(date.getUTCHours()).padStart(2, '0')}:00`;
 }
 
-function buildRestRainAdvice(
-  hourly: WeatherHourlyItem[],
-  daily: WeatherDailyItem[],
-  periods: WeatherRestPeriod[],
-  now: Date,
-  current?: Pick<WeatherResponse['realtime'], 'skycon' | 'precipitation_intensity'>,
-): RestRainAdvice | null {
+/** 此刻正在提醒的放假时段：从 display_start（没给时取降雨判定起点往前 17 小时）到 window_end */
+function findActiveRestPeriod(periods: WeatherRestPeriod[], now: Date) {
   const nowEpoch = now.getTime();
-  const active = periods
+  return periods
     .map(period => {
       const start = new Date(period.window_start).getTime();
       const explicitDisplayStart = period.display_start
@@ -284,6 +279,25 @@ function buildRestRainAdvice(
       && nowEpoch >= displayStart
       && nowEpoch < end
     ));
+}
+
+/**
+ * 此刻是否在放假提醒时段里（这时头盔卡片按放假前后的样子显示）。
+ * 休息日安排各地点都一样，任一地点的天气数据里有就能判断，天气还没回来的地点也能用别的地点的数据
+ */
+export function isRestReminderNow(responses: Array<WeatherResponse | null>, now = new Date()): boolean {
+  return responses.some(data => Boolean(data?.rest_periods && findActiveRestPeriod(data.rest_periods, now)));
+}
+
+function buildRestRainAdvice(
+  hourly: WeatherHourlyItem[],
+  daily: WeatherDailyItem[],
+  periods: WeatherRestPeriod[],
+  now: Date,
+  current?: Pick<WeatherResponse['realtime'], 'skycon' | 'precipitation_intensity'>,
+): RestRainAdvice | null {
+  const nowEpoch = now.getTime();
+  const active = findActiveRestPeriod(periods, now);
   if (!active) return null;
 
   const effectiveStart = Math.max(nowEpoch, active.start);

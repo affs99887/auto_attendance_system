@@ -16,6 +16,7 @@ import {
   useWeatherGlassStore,
 } from '../store/weatherGlass';
 import {
+  isRestReminderNow,
   roundWeather,
   skyInfo,
   weatherDayLabel,
@@ -44,8 +45,11 @@ function metricValue(value: number | null, suffix = '', digits = 0): string {
 const SKELETON_DAYS = [0, 1, 2, 3, 4, 5, 6];
 const SKELETON_METRICS = [0, 1, 2, 3, 4, 5, 6, 7];
 
-/** 天气数据还没回来时的占位：排版跟正式页面一样，文字和图表的位置先放淡淡的色块，数据一到页面不会跳动 */
-function WeatherLoading({ location }: { location: WeatherLocation }) {
+/**
+ * 天气数据还没回来时的占位：排版跟正式页面一样，文字和图表的位置先放淡淡的色块，数据一到页面不会跳动。
+ * rest 为 true 时头盔卡片照放假前后的样子画：标签单独一行、说明两行、格子更高，整张卡片比平时高
+ */
+function WeatherLoading({ location, rest }: { location: WeatherLocation; rest: boolean }) {
   return (
     <>
       <section className="wx-hero" role="status" aria-live="polite" aria-busy="true">
@@ -70,10 +74,12 @@ function WeatherLoading({ location }: { location: WeatherLocation }) {
               <i className="wx-bone wx-helmet-ico" />
               <div className="wx-helmet-copy">
                 <i className="wx-bone" style={{ width: '56%', height: 15, marginTop: 2 }} />
+                {rest && <i className="wx-bone" style={{ width: '40%', height: 15, marginTop: 9 }} />}
                 <i className="wx-bone" style={{ width: '82%', height: 11, marginTop: 9 }} />
+                {rest && <i className="wx-bone" style={{ width: '64%', height: 11, marginTop: 8 }} />}
               </div>
             </div>
-            <i className="wx-bone" style={{ height: 16, marginTop: 40 }} />
+            <i className="wx-bone" style={{ height: rest ? 28 : 16, marginTop: 40 }} />
             <i className="wx-bone" style={{ height: 9, marginTop: 8, opacity: .5 }} />
           </div>
         </GlassPanel>
@@ -794,7 +800,7 @@ export function WeatherScreen() {
     page = (
       <div className="wx-page">
         {locationRow}
-        <WeatherLoading location={location} />
+        <WeatherLoading location={location} rest={isRestReminderNow(Object.values(entries).map(entry => entry.data))} />
       </div>
     );
   } else if (!data) {

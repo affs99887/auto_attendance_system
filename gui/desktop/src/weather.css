@@ -163,9 +163,11 @@
 .wx-pop-foot button:hover { background: rgb(255 255 255 / .2); }
 
 /* --- 顶部展示区：左边直接把现在的天气写在天空上（不加底框），右边是头盔提醒 ---
-   大号气温和天气文字的字号跟着窗口宽度变（clamp 的三个值是 最小 / 随窗口宽度 / 最大）：窗口窄的时候字小一些，不会把一行挤成两行 */
-.wx-hero { display: grid; grid-template-columns: minmax(0, 1fr) minmax(320px, min(42%, 460px)); gap: 28px; align-items: end; padding: 4px 2px 2px 6px; }
-.wx-hero-now { min-width: 0; text-shadow: 0 1px 2px rgb(10 18 40 / .3), 0 0 22px rgb(10 18 40 / .22); }
+   大号气温和天气文字的字号跟着窗口宽度变（clamp 的三个值是 最小 / 随窗口宽度 / 最大）：窗口窄的时候字小一些，不会把一行挤成两行
+   左右两块都靠上放：头盔卡片从放假前一天起多显示几天的雨情、会变高，左边的位置不跟着变 */
+.wx-hero { display: grid; grid-template-columns: minmax(0, 1fr) minmax(320px, min(42%, 460px)); gap: 28px; align-items: start; padding: 4px 2px 2px 6px; }
+/* 上面留的 14px 跟头盔卡片的上内边距一样，地址那行和卡片标题在同一高度 */
+.wx-hero-now { min-width: 0; padding-top: 14px; text-shadow: 0 1px 2px rgb(10 18 40 / .3), 0 0 22px rgb(10 18 40 / .22); }
 .wx-hero-addr { display: flex; align-items: baseline; flex-wrap: wrap; gap: 2px 14px; }
 .wx-hero-addr strong { font-size: 14px; font-weight: 500; letter-spacing: .01em; }
 .wx-hero-addr span { font-size: 12px; color: var(--ink-3); }
@@ -284,8 +286,9 @@
 .wx-loading-tip .spinner { width: 11px; height: 11px; border-color: rgb(255 255 255 / .3); border-top-color: #fff; }
 .wx-bone { display: block; border-radius: 6px; background: rgb(255 255 255 / .2); }
 .wx-skel { pointer-events: none; animation: wx-skel-pulse 1.3s ease-in-out infinite alternate; }
-/* 大号气温的占位：宽高按字号算（em），跟着窗口宽度一起变 */
-.wx-skel-temp { width: 1.12em; height: .72em; border-radius: .1em; }
+/* 大号气温的占位：宽高按字号算（em），跟着窗口宽度一起变。
+   上面空出 .08em，整块一共 .8em 高，跟加载完的数字那一行（行高 .8）一样高，数据到了这一块不会把下面的面板往下推 */
+.wx-skel-temp { width: 1.12em; height: .72em; margin-top: .08em; border-radius: .1em; }
 .wx-skel-rows { flex: 1; display: flex; flex-direction: column; }
 /* 逐小时图的占位，全部用背景画，一共 24 列：上面一排圆点是天气图标，中间一条线是气温，下面一排短条是钟点。高度和外边距跟正式的图一致 */
 .wx-skel-chart {
